@@ -17,6 +17,7 @@ final class DisplayCaptureController: NSObject {
 
     private var stream: SCStream?
     private var displayByID: [CGDirectDisplayID: SCDisplay] = [:]
+    private var activeRuntimeConfig: CaptureRuntimeConfig?
 
     private let sampleQueue = DispatchQueue(label: "capture-shell.samples", qos: .userInitiated)
 
@@ -28,6 +29,11 @@ final class DisplayCaptureController: NSObject {
         self.permissionManager = permissionManager
         self.timingLogger = timingLogger
         self.pipeline = pipeline
+    }
+
+    @MainActor
+    func setActiveRuntimeConfig(_ config: CaptureRuntimeConfig?) {
+        activeRuntimeConfig = config
     }
 
     func requestScreenRecordingPermission() -> Bool {
@@ -100,7 +106,7 @@ final class DisplayCaptureController: NSObject {
             self.stream = stream
 
             onCaptureStateChanged?(true)
-            onStatus?("Capturing display \(displayID). Frame timing logs are streaming to stdout.")
+            onStatus?("Capturing display \(displayID). \(runtimeConfigStatus(for: displayID))")
         } catch {
             onStatus?("Failed to start capture: \(error.localizedDescription)")
             onCaptureStateChanged?(false)
@@ -147,5 +153,19 @@ extension DisplayCaptureController: SCStreamDelegate {
         self.stream = nil
         onCaptureStateChanged?(false)
         onStatus?(message)
+    }
+}
+
+private extension DisplayCaptureController {
+    func runtimeConfigStatus(for displayID: CGDirectDisplayID) -> String {
+        guard let activeRuntimeConfig else {
+            return "No runtime ROI config is active yet."
+        }
+
+        guard activeRuntimeConfig.displayID == UInt32(displayID) else {
+            return "Runtime ROI config belongs to display \(activeRuntimeConfig.displayID); current capture display is \(displayID)."
+        }
+
+        return "Using runtime regions: \(activeRuntimeConfig.runtimeSummary)"
     }
 }
