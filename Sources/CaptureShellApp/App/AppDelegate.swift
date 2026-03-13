@@ -6,7 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let captureController = DisplayCaptureController(
         permissionManager: ScreenRecordingPermissionManager(),
         timingLogger: FrameTimingLogger(),
-        pipeline: NoOpFramePipeline()
+        pipeline: LowLatencyOCRFramePipeline()
     )
 
     private let runtimeConfigStore = RuntimeConfigStore()

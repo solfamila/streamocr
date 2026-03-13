@@ -18,6 +18,7 @@ final class DisplayCaptureController: NSObject {
     private var stream: SCStream?
     private var displayByID: [CGDirectDisplayID: SCDisplay] = [:]
     private var activeRuntimeConfig: CaptureRuntimeConfig?
+    private let runtimeConfigQueue = DispatchQueue(label: "capture-shell.runtime-config", attributes: .concurrent)
 
     private let sampleQueue = DispatchQueue(label: "capture-shell.samples", qos: .userInitiated)
 
@@ -33,7 +34,9 @@ final class DisplayCaptureController: NSObject {
 
     @MainActor
     func setActiveRuntimeConfig(_ config: CaptureRuntimeConfig?) {
-        activeRuntimeConfig = config
+        runtimeConfigQueue.sync(flags: .barrier) {
+            activeRuntimeConfig = config
+        }
     }
 
     func requestScreenRecordingPermission() -> Bool {
@@ -90,6 +93,7 @@ final class DisplayCaptureController: NSObject {
 
         do {
             timingLogger.reset()
+            pipeline.reset()
 
             let filter = SCContentFilter(display: display, excludingWindows: [])
             let config = SCStreamConfiguration()
@@ -127,6 +131,7 @@ final class DisplayCaptureController: NSObject {
         }
 
         self.stream = nil
+        pipeline.reset()
         onCaptureStateChanged?(false)
         onStatus?("Capture stopped.")
     }
@@ -140,7 +145,7 @@ extension DisplayCaptureController: SCStreamOutput {
         }
 
         timingLogger.log(sampleBuffer: sampleBuffer)
-        pipeline.process(sampleBuffer)
+        pipeline.process(sampleBuffer, runtimeConfig: activeRuntimeConfigSnapshot())
     }
 }
 
@@ -151,14 +156,21 @@ extension DisplayCaptureController: SCStreamDelegate {
             return
         }
         self.stream = nil
+        pipeline.reset()
         onCaptureStateChanged?(false)
         onStatus?(message)
     }
 }
 
 private extension DisplayCaptureController {
+    func activeRuntimeConfigSnapshot() -> CaptureRuntimeConfig? {
+        runtimeConfigQueue.sync {
+            activeRuntimeConfig
+        }
+    }
+
     func runtimeConfigStatus(for displayID: CGDirectDisplayID) -> String {
-        guard let activeRuntimeConfig else {
+        guard let activeRuntimeConfig = activeRuntimeConfigSnapshot() else {
             return "No runtime ROI config is active yet."
         }
 

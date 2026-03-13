@@ -18,10 +18,13 @@ let package = Package(
             name: "CaptureShellApp",
             linkerSettings: [
                 .linkedFramework("AppKit"),
+                .linkedFramework("CoreImage"),
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("CoreMedia"),
                 .linkedFramework("CoreVideo"),
-                .linkedFramework("ScreenCaptureKit")
+                .linkedFramework("Metal"),
+                .linkedFramework("ScreenCaptureKit"),
+                .linkedFramework("Vision")
             ]
         ),
         .testTarget(
