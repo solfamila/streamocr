@@ -1,3 +1,4 @@
+import AppKit
 import CoreImage
 import CoreMedia
 import CoreVideo
@@ -77,8 +78,117 @@ enum OCRFingerprintPolicy {
     }
 }
 
+enum ManualCellIntegerPolicy {
+    static func parseInteger(_ normalizedText: String) -> Int? {
+        let trimmed = normalizedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+
+        let compact = trimmed.replacingOccurrences(of: ",", with: "")
+        guard !compact.isEmpty else {
+            return nil
+        }
+
+        var start = compact.startIndex
+        if compact[start] == "+" || compact[start] == "-" {
+            start = compact.index(after: start)
+        }
+
+        guard start < compact.endIndex else {
+            return nil
+        }
+
+        guard compact[start...].allSatisfy(\.isNumber) else {
+            return nil
+        }
+
+        return Int(compact)
+    }
+}
+
+struct ManualCellTriggerEvaluation {
+    let normalizedText: String
+    let integerValue: Int?
+    let isZeroOrEmpty: Bool
+    let isDuplicate: Bool
+    let shouldSendBuy: Bool
+    let shouldBeep: Bool
+    let wasArmed: Bool
+    let isArmedAfter: Bool
+}
+
+struct ManualSymbolTriggerEvaluation {
+    let normalizedSymbol: String
+    let isDuplicate: Bool
+    let shouldSendSubscribe: Bool
+    let shouldBeep: Bool
+}
+
+final class TradingTriggerStateMachine {
+    private var manualCellIsArmed = true
+    private var lastManualCellText: String?
+    private var lastManualSymbol: String?
+
+    func reset() {
+        manualCellIsArmed = true
+        lastManualCellText = nil
+        lastManualSymbol = nil
+    }
+
+    func clearManualSymbolState() {
+        lastManualSymbol = nil
+    }
+
+    func evaluateManualCell(normalizedText: String) -> ManualCellTriggerEvaluation {
+        let integerValue = ManualCellIntegerPolicy.parseInteger(normalizedText)
+        let isZeroOrEmpty = integerValue == nil || integerValue == 0
+        let isDuplicate = normalizedText == lastManualCellText
+        let wasArmed = manualCellIsArmed
+        let shouldSendBuy = manualCellIsArmed && !isZeroOrEmpty
+
+        if isZeroOrEmpty {
+            manualCellIsArmed = true
+        } else if shouldSendBuy {
+            manualCellIsArmed = false
+        }
+
+        if !isDuplicate {
+            lastManualCellText = normalizedText
+        }
+
+        return ManualCellTriggerEvaluation(
+            normalizedText: normalizedText,
+            integerValue: integerValue,
+            isZeroOrEmpty: isZeroOrEmpty,
+            isDuplicate: isDuplicate,
+            shouldSendBuy: shouldSendBuy,
+            shouldBeep: !isDuplicate,
+            wasArmed: wasArmed,
+            isArmedAfter: manualCellIsArmed
+        )
+    }
+
+    func evaluateManualSymbol(normalizedText: String) -> ManualSymbolTriggerEvaluation {
+        let normalizedSymbol = TradingWebSocketContract.normalizeSymbol(normalizedText)
+        let isDuplicate = normalizedSymbol == lastManualSymbol
+
+        if !isDuplicate {
+            lastManualSymbol = normalizedSymbol
+        }
+
+        return ManualSymbolTriggerEvaluation(
+            normalizedSymbol: normalizedSymbol,
+            isDuplicate: isDuplicate,
+            shouldSendSubscribe: !normalizedSymbol.isEmpty && !isDuplicate,
+            shouldBeep: !isDuplicate
+        )
+    }
+}
+
 private struct OCRRecognitionResult {
-    let text: String
+    let rawText: String
+    let normalizedText: String
     let confidence: Double
 }
 
@@ -93,14 +203,25 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
     private let usesMetal: Bool
     private let unchangedLogCadence: Int
     private let requestByRegion: [OCRRegionKind: VNRecognizeTextRequest]
+    private let webSocketClient: LocalTradingWebSocketClient
+    private let beep: @Sendable () -> Void
     private let stateLock = NSLock()
+    private let triggerStateMachine = TradingTriggerStateMachine()
 
     private var frameCount = 0
     private var didLogBackend = false
     private var lastFingerprintByRegion: [OCRRegionKind: UInt64] = [:]
     private var unchangedStreakByRegion: [OCRRegionKind: Int] = [:]
 
-    init(unchangedLogCadence: Int = 30) {
+    init(
+        unchangedLogCadence: Int = 30,
+        webSocketClient: LocalTradingWebSocketClient = LocalTradingWebSocketClient(),
+        beep: @escaping @Sendable () -> Void = {
+            DispatchQueue.main.async {
+                NSSound.beep()
+            }
+        }
+    ) {
         if let device = MTLCreateSystemDefaultDevice() {
             ciContext = CIContext(
                 mtlDevice: device,
@@ -117,6 +238,8 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             .manualCell: Self.makeRequest(),
             .manualSymbolCell: Self.makeRequest()
         ]
+        self.webSocketClient = webSocketClient
+        self.beep = beep
     }
 
     func reset() {
@@ -127,6 +250,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         didLogBackend = false
         lastFingerprintByRegion.removeAll(keepingCapacity: true)
         unchangedStreakByRegion.removeAll(keepingCapacity: true)
+        triggerStateMachine.reset()
     }
 
     func process(_ sampleBuffer: CMSampleBuffer, runtimeConfig: CaptureRuntimeConfig?) {
@@ -155,6 +279,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         if runtimeConfig.manualSymbolCellROI == nil {
             lastFingerprintByRegion.removeValue(forKey: .manualSymbolCell)
             unchangedStreakByRegion.removeValue(forKey: .manualSymbolCell)
+            triggerStateMachine.clearManualSymbolState()
         }
 
         processRegion(.manualCell, sourcePixelBuffer: sourcePixelBuffer, runtimeConfig: runtimeConfig)
@@ -219,14 +344,18 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         let ocrMilliseconds = elapsedMilliseconds(since: ocrStart)
         let totalMilliseconds = elapsedMilliseconds(since: totalStart)
 
-        let escapedText = recognition.text.replacingOccurrences(of: "\"", with: "\\\"")
+        let escapedNormalizedText = escapedForLog(recognition.normalizedText)
+        let escapedRawText = escapedForLog(recognition.rawText)
         print(
             "[ocr] frame=\(frameCount) region=\(region.rawValue) gate=changed skip_ocr=false " +
                 "fingerprint=\(fingerprintHex(fingerprint)) crop_ms=\(format(preprocessResult.cropMilliseconds)) " +
                 "metal_ms=\(format(preprocessResult.metalMilliseconds)) fingerprint_ms=\(format(fingerprintMilliseconds)) " +
                 "ocr_ms=\(format(ocrMilliseconds)) total_ms=\(format(totalMilliseconds)) " +
-                "text=\"\(escapedText)\" confidence=\(format(recognition.confidence, precision: 3))"
+                "raw_text=\"\(escapedRawText)\" normalized_text=\"\(escapedNormalizedText)\" " +
+                "confidence=\(format(recognition.confidence, precision: 3))"
         )
+
+        handleTriggerBehavior(for: region, recognition: recognition)
     }
 
     private func preprocess(sourcePixelBuffer: CVPixelBuffer, roi: PixelRect) -> OCRPreprocessResult? {
@@ -290,7 +419,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
 
     private func recognizeText(in pixelBuffer: CVPixelBuffer, region: OCRRegionKind) -> OCRRecognitionResult {
         guard let request = requestByRegion[region] else {
-            return OCRRecognitionResult(text: "", confidence: 0)
+            return OCRRecognitionResult(rawText: "", normalizedText: "", confidence: 0)
         }
 
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
@@ -302,15 +431,83 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
                 let topObservation = observations.first,
                 let topCandidate = topObservation.topCandidates(1).first
             else {
-                return OCRRecognitionResult(text: "", confidence: 0)
+                return OCRRecognitionResult(rawText: "", normalizedText: "", confidence: 0)
             }
 
-            let normalizedText = OCRNormalizationPolicy.normalize(topCandidate.string, for: region)
-            return OCRRecognitionResult(text: normalizedText, confidence: Double(topCandidate.confidence))
+            let rawText = topCandidate.string
+            let normalizedText = OCRNormalizationPolicy.normalize(rawText, for: region)
+            return OCRRecognitionResult(
+                rawText: rawText,
+                normalizedText: normalizedText,
+                confidence: Double(topCandidate.confidence)
+            )
         } catch {
             print("[ocr] frame=\(frameCount) region=\(region.rawValue) gate=ocr_error message=\(error.localizedDescription)")
-            return OCRRecognitionResult(text: "", confidence: 0)
+            return OCRRecognitionResult(rawText: "", normalizedText: "", confidence: 0)
         }
+    }
+
+    private func handleTriggerBehavior(for region: OCRRegionKind, recognition: OCRRecognitionResult) {
+        switch region {
+        case .manualCell:
+            handleManualCellBehavior(recognition: recognition)
+        case .manualSymbolCell:
+            handleManualSymbolBehavior(recognition: recognition)
+        }
+    }
+
+    private func handleManualCellBehavior(recognition: OCRRecognitionResult) {
+        let evaluation = triggerStateMachine.evaluateManualCell(normalizedText: recognition.normalizedText)
+        let action: String
+
+        if evaluation.shouldSendBuy {
+            action = "buy_sent"
+            webSocketClient.send(TradingWebSocketContract.buyMessage, event: "BUY")
+        } else if evaluation.isZeroOrEmpty {
+            action = "armed"
+        } else if evaluation.isDuplicate {
+            action = "duplicate_suppressed"
+        } else {
+            action = "already_triggered_waiting_for_rearm"
+        }
+
+        if evaluation.shouldBeep {
+            beep()
+        }
+
+        print(
+            "[trigger] frame=\(frameCount) region=\(OCRRegionKind.manualCell.rawValue) action=\(action) " +
+                "raw_text=\"\(escapedForLog(recognition.rawText))\" normalized_text=\"\(escapedForLog(evaluation.normalizedText))\" " +
+                "confidence=\(format(recognition.confidence, precision: 3)) parsed_int=\(evaluation.integerValue.map(String.init) ?? "nil") " +
+                "zero_or_empty=\(evaluation.isZeroOrEmpty) duplicate=\(evaluation.isDuplicate) " +
+                "armed_before=\(evaluation.wasArmed) armed_after=\(evaluation.isArmedAfter)"
+        )
+    }
+
+    private func handleManualSymbolBehavior(recognition: OCRRecognitionResult) {
+        let evaluation = triggerStateMachine.evaluateManualSymbol(normalizedText: recognition.normalizedText)
+        let action: String
+
+        if evaluation.shouldSendSubscribe {
+            action = "subscribe_sent"
+            let message = TradingWebSocketContract.subscribeMessage(symbol: evaluation.normalizedSymbol)
+            webSocketClient.send(message, event: "SUBSCRIBE")
+        } else if evaluation.isDuplicate {
+            action = "duplicate_suppressed"
+        } else {
+            action = "symbol_empty_no_subscribe"
+        }
+
+        if evaluation.shouldBeep {
+            beep()
+        }
+
+        print(
+            "[trigger] frame=\(frameCount) region=\(OCRRegionKind.manualSymbolCell.rawValue) action=\(action) " +
+                "raw_text=\"\(escapedForLog(recognition.rawText))\" normalized_text=\"\(escapedForLog(recognition.normalizedText))\" " +
+                "symbol=\"\(escapedForLog(evaluation.normalizedSymbol))\" confidence=\(format(recognition.confidence, precision: 3)) " +
+                "duplicate=\(evaluation.isDuplicate)"
+        )
     }
 
     private static func makeRequest() -> VNRecognizeTextRequest {
@@ -356,5 +553,9 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
 
     private func fingerprintHex(_ fingerprint: UInt64) -> String {
         String(format: "%016llx", fingerprint)
+    }
+
+    private func escapedForLog(_ text: String) -> String {
+        text.replacingOccurrences(of: "\"", with: "\\\"")
     }
 }

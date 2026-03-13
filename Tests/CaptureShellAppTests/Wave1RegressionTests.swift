@@ -15,6 +15,13 @@ struct TradingWebSocketContractTests {
             TradingWebSocketContract.subscribeMessage(symbol: "  msft\n") == #"{"subscribe":"MSFT"}"#
         )
     }
+
+    @Test
+    func subscribeMessageKeepsLettersOnly() {
+        #expect(
+            TradingWebSocketContract.subscribeMessage(symbol: " m s-f.t 1 ") == #"{"subscribe":"MSFT"}"#
+        )
+    }
 }
 
 struct FrameTimingPolicyTests {
@@ -62,6 +69,78 @@ struct OCRNormalizationPolicyTests {
     func manualSymbolNormalizationUppercasesAndTrims() {
         let normalized = OCRNormalizationPolicy.normalize("  ms ft \n", for: .manualSymbolCell)
         #expect(normalized == "MS FT")
+    }
+}
+
+struct TradingTriggerStateMachineTests {
+    @Test
+    func manualCellFiresOnlyOnceUntilRearmed() {
+        let stateMachine = TradingTriggerStateMachine()
+
+        let first = stateMachine.evaluateManualCell(normalizedText: "")
+        #expect(!first.shouldSendBuy)
+        #expect(first.isArmedAfter)
+
+        let second = stateMachine.evaluateManualCell(normalizedText: "0")
+        #expect(!second.shouldSendBuy)
+        #expect(second.isArmedAfter)
+
+        let third = stateMachine.evaluateManualCell(normalizedText: "42")
+        #expect(third.shouldSendBuy)
+        #expect(!third.isArmedAfter)
+
+        let fourth = stateMachine.evaluateManualCell(normalizedText: "42")
+        #expect(!fourth.shouldSendBuy)
+        #expect(fourth.isDuplicate)
+        #expect(!fourth.isArmedAfter)
+
+        let fifth = stateMachine.evaluateManualCell(normalizedText: "99")
+        #expect(!fifth.shouldSendBuy)
+        #expect(!fifth.isArmedAfter)
+
+        let sixth = stateMachine.evaluateManualCell(normalizedText: "")
+        #expect(!sixth.shouldSendBuy)
+        #expect(sixth.isArmedAfter)
+
+        let seventh = stateMachine.evaluateManualCell(normalizedText: "7")
+        #expect(seventh.shouldSendBuy)
+        #expect(!seventh.isArmedAfter)
+    }
+
+    @Test
+    func manualCellTreatsNonIntegerAsEmptyForArming() {
+        let stateMachine = TradingTriggerStateMachine()
+
+        _ = stateMachine.evaluateManualCell(normalizedText: "11")
+        let nonInteger = stateMachine.evaluateManualCell(normalizedText: "ABCD")
+        #expect(nonInteger.isZeroOrEmpty)
+        #expect(nonInteger.isArmedAfter)
+
+        let retrigger = stateMachine.evaluateManualCell(normalizedText: "5")
+        #expect(retrigger.shouldSendBuy)
+    }
+
+    @Test
+    func manualSymbolSubscribesOnlyWhenNormalizedSymbolChanges() {
+        let stateMachine = TradingTriggerStateMachine()
+
+        let first = stateMachine.evaluateManualSymbol(normalizedText: "ms ft")
+        #expect(first.shouldSendSubscribe)
+        #expect(first.normalizedSymbol == "MSFT")
+
+        let second = stateMachine.evaluateManualSymbol(normalizedText: "m.s-f t")
+        #expect(!second.shouldSendSubscribe)
+        #expect(second.isDuplicate)
+        #expect(second.normalizedSymbol == "MSFT")
+
+        let third = stateMachine.evaluateManualSymbol(normalizedText: "aapl")
+        #expect(third.shouldSendSubscribe)
+        #expect(third.normalizedSymbol == "AAPL")
+
+        let fourth = stateMachine.evaluateManualSymbol(normalizedText: "")
+        #expect(!fourth.shouldSendSubscribe)
+        #expect(fourth.normalizedSymbol.isEmpty)
+        #expect(!fourth.isDuplicate)
     }
 }
 
