@@ -203,10 +203,15 @@ struct TriggerPipelineVerificationHarnessTests {
         private let lock = NSLock()
         private(set) var messages: [String] = []
 
-        func send(_ payload: String, event _: String) {
+        func send(
+            _ payload: String,
+            event _: String,
+            completion: @escaping @Sendable (Result<Void, any Error>) -> Void
+        ) {
             lock.lock()
             messages.append(payload)
             lock.unlock()
+            completion(.success(()))
         }
     }
 }

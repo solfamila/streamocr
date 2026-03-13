@@ -198,6 +198,17 @@ private struct OCRPreprocessResult {
     let metalMilliseconds: Double
 }
 
+private struct TriggerStageTimings {
+    let frameIngressTimestamp: CFAbsoluteTime
+    let regionStartTimestamp: CFAbsoluteTime
+    let ocrDetectedTimestamp: CFAbsoluteTime
+    let cropMilliseconds: Double
+    let metalMilliseconds: Double
+    let fingerprintMilliseconds: Double
+    let gatingMilliseconds: Double
+    let ocrMilliseconds: Double
+}
+
 final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
     private let ciContext: CIContext
     private let usesMetal: Bool
@@ -258,6 +269,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         defer { stateLock.unlock() }
 
         frameCount += 1
+        let frameIngressTimestamp = CFAbsoluteTimeGetCurrent()
 
         guard let runtimeConfig else {
             if frameCount == 1 || frameCount.isMultiple(of: 120) {
@@ -282,17 +294,28 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             triggerStateMachine.clearManualSymbolState()
         }
 
-        processRegion(.manualCell, sourcePixelBuffer: sourcePixelBuffer, runtimeConfig: runtimeConfig)
+        processRegion(
+            .manualCell,
+            sourcePixelBuffer: sourcePixelBuffer,
+            runtimeConfig: runtimeConfig,
+            frameIngressTimestamp: frameIngressTimestamp
+        )
 
         if runtimeConfig.manualSymbolCellROI != nil {
-            processRegion(.manualSymbolCell, sourcePixelBuffer: sourcePixelBuffer, runtimeConfig: runtimeConfig)
+            processRegion(
+                .manualSymbolCell,
+                sourcePixelBuffer: sourcePixelBuffer,
+                runtimeConfig: runtimeConfig,
+                frameIngressTimestamp: frameIngressTimestamp
+            )
         }
     }
 
     private func processRegion(
         _ region: OCRRegionKind,
         sourcePixelBuffer: CVPixelBuffer,
-        runtimeConfig: CaptureRuntimeConfig
+        runtimeConfig: CaptureRuntimeConfig,
+        frameIngressTimestamp: CFAbsoluteTime
     ) {
         guard let configuredROI = region.roi(from: runtimeConfig) else {
             return
@@ -308,7 +331,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             return
         }
 
-        let totalStart = CFAbsoluteTimeGetCurrent()
+        let regionStartTimestamp = CFAbsoluteTimeGetCurrent()
 
         guard let preprocessResult = preprocess(sourcePixelBuffer: sourcePixelBuffer, roi: roi) else {
             print("[ocr] frame=\(frameCount) region=\(region.rawValue) gate=preprocess_failed roi=\(roi.summary)")
@@ -319,17 +342,20 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         let fingerprint = OCRFingerprintPolicy.fingerprint(pixelBuffer: preprocessResult.pixelBuffer)
         let fingerprintMilliseconds = elapsedMilliseconds(since: fingerprintStart)
 
+        let gatingStart = CFAbsoluteTimeGetCurrent()
         let previousFingerprint = lastFingerprintByRegion[region]
         if previousFingerprint == fingerprint {
             let streak = (unchangedStreakByRegion[region] ?? 0) + 1
             unchangedStreakByRegion[region] = streak
+            let gatingMilliseconds = elapsedMilliseconds(since: gatingStart)
 
             if streak == 1 || streak.isMultiple(of: unchangedLogCadence) {
-                let totalMilliseconds = elapsedMilliseconds(since: totalStart)
+                let totalMilliseconds = elapsedMilliseconds(since: regionStartTimestamp)
                 print(
                     "[ocr] frame=\(frameCount) region=\(region.rawValue) gate=unchanged skip_ocr=true streak=\(streak) " +
                         "fingerprint=\(fingerprintHex(fingerprint)) crop_ms=\(format(preprocessResult.cropMilliseconds)) " +
                         "metal_ms=\(format(preprocessResult.metalMilliseconds)) fingerprint_ms=\(format(fingerprintMilliseconds)) " +
+                        "gating_ms=\(format(gatingMilliseconds)) " +
                         "total_ms=\(format(totalMilliseconds))"
                 )
             }
@@ -338,24 +364,40 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
 
         lastFingerprintByRegion[region] = fingerprint
         unchangedStreakByRegion[region] = 0
+        let gatingMilliseconds = elapsedMilliseconds(since: gatingStart)
 
         let ocrStart = CFAbsoluteTimeGetCurrent()
         let recognition = recognizeText(in: preprocessResult.pixelBuffer, region: region)
         let ocrMilliseconds = elapsedMilliseconds(since: ocrStart)
-        let totalMilliseconds = elapsedMilliseconds(since: totalStart)
+        let ocrDetectedTimestamp = CFAbsoluteTimeGetCurrent()
+        let totalMilliseconds = elapsedMilliseconds(since: regionStartTimestamp)
 
         let escapedNormalizedText = escapedForLog(recognition.normalizedText)
         let escapedRawText = escapedForLog(recognition.rawText)
         print(
-            "[ocr] frame=\(frameCount) region=\(region.rawValue) gate=changed skip_ocr=false " +
+                "[ocr] frame=\(frameCount) region=\(region.rawValue) gate=changed skip_ocr=false " +
                 "fingerprint=\(fingerprintHex(fingerprint)) crop_ms=\(format(preprocessResult.cropMilliseconds)) " +
                 "metal_ms=\(format(preprocessResult.metalMilliseconds)) fingerprint_ms=\(format(fingerprintMilliseconds)) " +
+                "gating_ms=\(format(gatingMilliseconds)) " +
                 "ocr_ms=\(format(ocrMilliseconds)) total_ms=\(format(totalMilliseconds)) " +
                 "raw_text=\"\(escapedRawText)\" normalized_text=\"\(escapedNormalizedText)\" " +
                 "confidence=\(format(recognition.confidence, precision: 3))"
         )
 
-        handleTriggerBehavior(for: region, recognition: recognition)
+        handleTriggerBehavior(
+            for: region,
+            recognition: recognition,
+            timings: TriggerStageTimings(
+                frameIngressTimestamp: frameIngressTimestamp,
+                regionStartTimestamp: regionStartTimestamp,
+                ocrDetectedTimestamp: ocrDetectedTimestamp,
+                cropMilliseconds: preprocessResult.cropMilliseconds,
+                metalMilliseconds: preprocessResult.metalMilliseconds,
+                fingerprintMilliseconds: fingerprintMilliseconds,
+                gatingMilliseconds: gatingMilliseconds,
+                ocrMilliseconds: ocrMilliseconds
+            )
+        )
     }
 
     private func preprocess(sourcePixelBuffer: CVPixelBuffer, roi: PixelRect) -> OCRPreprocessResult? {
@@ -447,28 +489,93 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         }
     }
 
-    private func handleTriggerBehavior(for region: OCRRegionKind, recognition: OCRRecognitionResult) {
+    private func handleTriggerBehavior(
+        for region: OCRRegionKind,
+        recognition: OCRRecognitionResult,
+        timings: TriggerStageTimings?
+    ) {
         switch region {
         case .manualCell:
-            handleManualCellBehavior(recognition: recognition)
+            handleManualCellBehavior(recognition: recognition, timings: timings)
         case .manualSymbolCell:
             handleManualSymbolBehavior(recognition: recognition)
         }
     }
 
-    private func handleManualCellBehavior(recognition: OCRRecognitionResult) {
+    private func handleManualCellBehavior(recognition: OCRRecognitionResult, timings: TriggerStageTimings?) {
+        let triggerEvaluationStart = CFAbsoluteTimeGetCurrent()
         let evaluation = triggerStateMachine.evaluateManualCell(normalizedText: recognition.normalizedText)
+        let triggerEvaluationMilliseconds = elapsedMilliseconds(since: triggerEvaluationStart)
+        let buyDecisionStart = CFAbsoluteTimeGetCurrent()
         let action: String
 
         if evaluation.shouldSendBuy {
             action = "buy_sent"
-            messageSender.send(TradingWebSocketContract.buyMessage, event: "BUY")
         } else if evaluation.isZeroOrEmpty {
             action = "armed"
         } else if evaluation.isDuplicate {
             action = "duplicate_suppressed"
         } else {
             action = "already_triggered_waiting_for_rearm"
+        }
+        let buyDecisionMilliseconds = elapsedMilliseconds(since: buyDecisionStart)
+
+        if evaluation.shouldSendBuy {
+            if let timings {
+                let frameNumber = frameCount
+                let frameIngressToRegionMilliseconds = max(
+                    0,
+                    (timings.regionStartTimestamp - timings.frameIngressTimestamp) * 1_000
+                )
+                let sendStartTimestamp = CFAbsoluteTimeGetCurrent()
+                let frameToBuyMilliseconds = max(
+                    0,
+                    (sendStartTimestamp - timings.frameIngressTimestamp) * 1_000
+                )
+                let ocrToBuyMilliseconds = max(
+                    0,
+                    (sendStartTimestamp - timings.ocrDetectedTimestamp) * 1_000
+                )
+
+                messageSender.send(TradingWebSocketContract.buyMessage, event: "BUY") { result in
+                    let sendCompletionTimestamp = CFAbsoluteTimeGetCurrent()
+                    let wsSendDurationMilliseconds = max(0, (sendCompletionTimestamp - sendStartTimestamp) * 1_000)
+                    let wsSendCompletionMilliseconds = max(
+                        0,
+                        (sendCompletionTimestamp - timings.frameIngressTimestamp) * 1_000
+                    )
+
+                    let sendResult: String
+                    let sendErrorSuffix: String
+                    switch result {
+                    case .success:
+                        sendResult = "success"
+                        sendErrorSuffix = ""
+                    case let .failure(error):
+                        sendResult = "failure"
+                        sendErrorSuffix = " send_error=\"\(self.escapedForLog(error.localizedDescription))\""
+                    }
+
+                    print(
+                        "[latency] frame=\(frameNumber) event=BUY send_result=\(sendResult) " +
+                            "frame_ingress_to_region_ms=\(self.format(frameIngressToRegionMilliseconds)) " +
+                            "crop_ms=\(self.format(timings.cropMilliseconds)) metal_ms=\(self.format(timings.metalMilliseconds)) " +
+                            "fingerprint_ms=\(self.format(timings.fingerprintMilliseconds)) " +
+                            "gating_ms=\(self.format(timings.gatingMilliseconds)) " +
+                            "ocr_ms=\(self.format(timings.ocrMilliseconds)) " +
+                            "trigger_eval_ms=\(self.format(triggerEvaluationMilliseconds)) " +
+                            "buy_decision_ms=\(self.format(buyDecisionMilliseconds)) " +
+                            "ws_send_start_ms=\(self.format(frameToBuyMilliseconds)) " +
+                            "ws_send_duration_ms=\(self.format(wsSendDurationMilliseconds)) " +
+                            "ws_send_completion_ms=\(self.format(wsSendCompletionMilliseconds)) " +
+                            "frame_to_buy_ms=\(self.format(frameToBuyMilliseconds)) " +
+                            "ocr_to_buy_ms=\(self.format(ocrToBuyMilliseconds)) " +
+                            "total_end_to_end_ms=\(self.format(wsSendCompletionMilliseconds))\(sendErrorSuffix)"
+                    )
+                }
+            } else {
+                messageSender.send(TradingWebSocketContract.buyMessage, event: "BUY")
+            }
         }
 
         if evaluation.shouldBeep {
@@ -575,6 +682,17 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             normalizedText: normalizedText,
             confidence: confidence
         )
-        handleTriggerBehavior(for: region, recognition: recognition)
+        let now = CFAbsoluteTimeGetCurrent()
+        let syntheticTimings = TriggerStageTimings(
+            frameIngressTimestamp: now,
+            regionStartTimestamp: now,
+            ocrDetectedTimestamp: now,
+            cropMilliseconds: 0,
+            metalMilliseconds: 0,
+            fingerprintMilliseconds: 0,
+            gatingMilliseconds: 0,
+            ocrMilliseconds: 0
+        )
+        handleTriggerBehavior(for: region, recognition: recognition, timings: syntheticTimings)
     }
 }

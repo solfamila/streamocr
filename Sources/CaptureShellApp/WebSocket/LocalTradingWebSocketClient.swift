@@ -1,7 +1,13 @@
 import Foundation
 
 protocol TradingMessageSending: AnyObject {
-    func send(_ payload: String, event: String)
+    func send(_ payload: String, event: String, completion: @escaping @Sendable (Result<Void, any Error>) -> Void)
+}
+
+extension TradingMessageSending {
+    func send(_ payload: String, event: String) {
+        send(payload, event: event) { _ in }
+    }
 }
 
 enum TradingWebSocketEndpoint {
@@ -59,7 +65,7 @@ final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unche
         session.invalidateAndCancel()
     }
 
-    func send(_ payload: String, event: String) {
+    func send(_ payload: String, event: String, completion: @escaping @Sendable (Result<Void, any Error>) -> Void) {
         connectIfNeeded()
 
         let taskSnapshot: URLSessionWebSocketTask?
@@ -71,21 +77,20 @@ final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unche
 
         guard connected, let taskSnapshot else {
             print("[ws] not connected; \(event) not sent")
+            completion(.failure(WebSocketSendError.notConnected))
             return
         }
 
-        taskSnapshot.send(.string(payload)) { [weak self] error in
-            guard let self else {
-                return
-            }
-
+        taskSnapshot.send(.string(payload)) { error in
             if let error {
-                handleTransportError(task: taskSnapshot, error: error)
+                self.handleTransportError(task: taskSnapshot, error: error)
                 print("[ws] send_failed event=\(event) error=\(error.localizedDescription)")
+                completion(.failure(error))
                 return
             }
 
             print("[ws] sent event=\(event) payload=\(payload)")
+            completion(.success(()))
         }
     }
 
@@ -151,6 +156,17 @@ final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unche
 
         if shouldClearState {
             print("[ws] disconnected error=\(error.localizedDescription)")
+        }
+    }
+}
+
+private enum WebSocketSendError: LocalizedError {
+    case notConnected
+
+    var errorDescription: String? {
+        switch self {
+        case .notConnected:
+            "WebSocket is not connected."
         }
     }
 }
