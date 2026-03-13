@@ -155,15 +155,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         captureController.onStatus = { [weak self] message in
-            self?.statusLabel.stringValue = message
+            DispatchQueue.main.async { [weak self] in
+                self?.statusLabel.stringValue = message
+            }
         }
 
         captureController.onCaptureStateChanged = { [weak self] active in
-            guard let self else {
-                return
+            DispatchQueue.main.async { [weak self] in
+                guard let self else {
+                    return
+                }
+                isCapturing = active
+                startStopButton.title = active ? "Stop Capture" : "Start Capture"
             }
-            isCapturing = active
-            startStopButton.title = active ? "Stop Capture" : "Start Capture"
         }
     }
 
