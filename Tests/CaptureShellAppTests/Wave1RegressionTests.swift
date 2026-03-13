@@ -1,5 +1,6 @@
 import CoreMedia
 import CoreVideo
+import Foundation
 import Testing
 @testable import CaptureShellApp
 
@@ -141,6 +142,72 @@ struct TradingTriggerStateMachineTests {
         #expect(!fourth.shouldSendSubscribe)
         #expect(fourth.normalizedSymbol.isEmpty)
         #expect(!fourth.isDuplicate)
+    }
+}
+
+struct TriggerPipelineVerificationHarnessTests {
+    @Test
+    func manualCellTransitionsEmitSingleBuyUntilRearm() {
+        let sender = CapturingMessageSender()
+        let pipeline = LowLatencyOCRFramePipeline(messageSender: sender, beep: {})
+
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "", normalizedText: "", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "0", normalizedText: "0", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "16", normalizedText: "16", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "16", normalizedText: "16", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "", normalizedText: "", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "9", normalizedText: "9", confidence: 0.9)
+
+        #expect(
+            sender.messages == [
+                TradingWebSocketContract.buyMessage,
+                TradingWebSocketContract.buyMessage
+            ]
+        )
+    }
+
+    @Test
+    func manualSymbolTransitionsEmitSubscribeOnlyOnChange() {
+        let sender = CapturingMessageSender()
+        let pipeline = LowLatencyOCRFramePipeline(messageSender: sender, beep: {})
+
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "ms ft",
+            normalizedText: "MS FT",
+            confidence: 0.8
+        )
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "m.s-f t",
+            normalizedText: "M.S-F T",
+            confidence: 0.8
+        )
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "aapl",
+            normalizedText: "AAPL",
+            confidence: 0.8
+        )
+
+        #expect(
+            sender.messages == [
+                #"{"subscribe":"MSFT"}"#,
+                #"{"subscribe":"AAPL"}"#
+            ]
+        )
+    }
+
+    private final class CapturingMessageSender: TradingMessageSending, @unchecked Sendable {
+        private let lock = NSLock()
+        private(set) var messages: [String] = []
+
+        func send(_ payload: String, event _: String) {
+            lock.lock()
+            messages.append(payload)
+            lock.unlock()
+        }
     }
 }
 

@@ -203,7 +203,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
     private let usesMetal: Bool
     private let unchangedLogCadence: Int
     private let requestByRegion: [OCRRegionKind: VNRecognizeTextRequest]
-    private let webSocketClient: LocalTradingWebSocketClient
+    private let messageSender: any TradingMessageSending
     private let beep: @Sendable () -> Void
     private let stateLock = NSLock()
     private let triggerStateMachine = TradingTriggerStateMachine()
@@ -215,7 +215,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
 
     init(
         unchangedLogCadence: Int = 30,
-        webSocketClient: LocalTradingWebSocketClient = LocalTradingWebSocketClient(),
+        messageSender: any TradingMessageSending = LocalTradingWebSocketClient(),
         beep: @escaping @Sendable () -> Void = {
             DispatchQueue.main.async {
                 NSSound.beep()
@@ -238,7 +238,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             .manualCell: Self.makeRequest(),
             .manualSymbolCell: Self.makeRequest()
         ]
-        self.webSocketClient = webSocketClient
+        self.messageSender = messageSender
         self.beep = beep
     }
 
@@ -462,7 +462,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
 
         if evaluation.shouldSendBuy {
             action = "buy_sent"
-            webSocketClient.send(TradingWebSocketContract.buyMessage, event: "BUY")
+            messageSender.send(TradingWebSocketContract.buyMessage, event: "BUY")
         } else if evaluation.isZeroOrEmpty {
             action = "armed"
         } else if evaluation.isDuplicate {
@@ -491,7 +491,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         if evaluation.shouldSendSubscribe {
             action = "subscribe_sent"
             let message = TradingWebSocketContract.subscribeMessage(symbol: evaluation.normalizedSymbol)
-            webSocketClient.send(message, event: "SUBSCRIBE")
+            messageSender.send(message, event: "SUBSCRIBE")
         } else if evaluation.isDuplicate {
             action = "duplicate_suppressed"
         } else {
@@ -557,5 +557,24 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
 
     private func escapedForLog(_ text: String) -> String {
         text.replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    // Deterministic test-only trigger path that bypasses Vision OCR/capture.
+    func processTriggerEventForTesting(
+        region: OCRRegionKind,
+        rawText: String,
+        normalizedText: String,
+        confidence: Double
+    ) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+
+        frameCount += 1
+        let recognition = OCRRecognitionResult(
+            rawText: rawText,
+            normalizedText: normalizedText,
+            confidence: confidence
+        )
+        handleTriggerBehavior(for: region, recognition: recognition)
     }
 }

@@ -1,5 +1,9 @@
 import Foundation
 
+protocol TradingMessageSending: AnyObject {
+    func send(_ payload: String, event: String)
+}
+
 enum TradingWebSocketEndpoint {
     private static let defaultURLString = "ws://localhost:8080"
     private static let environmentKey = "TRADING_WS_URL"
@@ -22,7 +26,7 @@ enum TradingWebSocketEndpoint {
     }
 }
 
-final class LocalTradingWebSocketClient: NSObject, @unchecked Sendable {
+final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unchecked Sendable {
     private let endpointURL: URL
     private let lock = NSLock()
 
