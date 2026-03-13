@@ -10,6 +10,9 @@ let package = Package(
     products: [
         .executable(name: "CaptureShellApp", targets: ["CaptureShellApp"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/swiftlang/swift-testing.git", from: "0.99.0")
+    ],
     targets: [
         .executableTarget(
             name: "CaptureShellApp",
@@ -19,6 +22,13 @@ let package = Package(
                 .linkedFramework("CoreMedia"),
                 .linkedFramework("CoreVideo"),
                 .linkedFramework("ScreenCaptureKit")
+            ]
+        ),
+        .testTarget(
+            name: "CaptureShellAppTests",
+            dependencies: [
+                "CaptureShellApp",
+                .product(name: "Testing", package: "swift-testing")
             ]
         )
     ]
