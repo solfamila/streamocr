@@ -1,7 +1,7 @@
 import CoreMedia
 import CoreVideo
 import Foundation
-import ScreenCaptureKit
+@preconcurrency import ScreenCaptureKit
 
 struct DisplayTarget: Equatable {
     let id: CGDirectDisplayID
@@ -93,7 +93,7 @@ final class DisplayCaptureController: NSObject {
             config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
             config.queueDepth = 3
 
-            let stream = SCStream(filter: filter, configuration: config, delegate: nil)
+            let stream = SCStream(filter: filter, configuration: config, delegate: self)
             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
             try await stream.startCapture()
 
@@ -124,6 +124,7 @@ final class DisplayCaptureController: NSObject {
         onCaptureStateChanged?(false)
         onStatus?("Capture stopped.")
     }
+
 }
 
 extension DisplayCaptureController: SCStreamOutput {
@@ -134,5 +135,17 @@ extension DisplayCaptureController: SCStreamOutput {
 
         timingLogger.log(sampleBuffer: sampleBuffer)
         pipeline.process(sampleBuffer)
+    }
+}
+
+extension DisplayCaptureController: SCStreamDelegate {
+    func stream(_ stream: SCStream, didStopWithError error: any Error) {
+        let message = "Capture stopped with stream error: \(error.localizedDescription)"
+        if let activeStream = self.stream, activeStream !== stream {
+            return
+        }
+        self.stream = nil
+        onCaptureStateChanged?(false)
+        onStatus?(message)
     }
 }
