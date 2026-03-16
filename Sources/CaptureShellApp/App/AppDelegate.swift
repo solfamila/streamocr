@@ -21,9 +21,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let startStopButton = NSButton(title: "Start Capture", target: nil, action: nil)
 
     private let selectBaseROIButton = NSButton(title: "Select Base ROI", target: nil, action: nil)
-    private let selectManualCellButton = NSButton(title: "Select Trigger Cell", target: nil, action: nil)
+    private let selectManualCellButton = NSButton(title: "Select Trigger Cell (Base ROI)", target: nil, action: nil)
     private let selectSymbolROIButton = NSButton(title: "Select Symbol ROI", target: nil, action: nil)
-    private let selectSymbolCellButton = NSButton(title: "Select Symbol Cell", target: nil, action: nil)
+    private let selectSymbolCellButton = NSButton(title: "Select Symbol Cell (Symbol ROI)", target: nil, action: nil)
 
     private let clearSymbolSelectionsButton = NSButton(title: "Clear Symbol ROI/Cell", target: nil, action: nil)
     private let saveConfigButton = NSButton(title: "Save Runtime Config", target: nil, action: nil)
@@ -230,7 +230,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let titleLabel = NSTextField(labelWithString: "ScreenCaptureKit Display Capture")
         titleLabel.font = NSFont.boldSystemFont(ofSize: 16)
 
-        let scopeLabel = NSTextField(labelWithString: "Display capture with interactive ROI selection and persisted runtime config.")
+        let scopeLabel = NSTextField(
+            labelWithString: "Display capture with nested ROI selection (base/symbol first, then cell) and persisted runtime config."
+        )
         scopeLabel.textColor = .secondaryLabelColor
 
         statusLabel.textColor = .labelColor
@@ -396,18 +398,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             regionState.displayHeight = selectedDisplay.height
         }
 
+        let selectionContext: ROISelectionContext?
+        switch type {
+        case .manualCellROI:
+            guard let baseROI = regionState.baseROI else {
+                statusLabel.stringValue = "Select Base ROI first. Trigger cell selection is nested inside Base ROI."
+                return
+            }
+            selectionContext = ROISelectionContext(parentRect: baseROI, label: "Base ROI")
+        case .manualSymbolCellROI:
+            guard let symbolROI = regionState.symbolROI else {
+                statusLabel.stringValue = "Select Symbol ROI first. Symbol cell selection is nested inside Symbol ROI."
+                return
+            }
+            selectionContext = ROISelectionContext(parentRect: symbolROI, label: "Symbol ROI")
+        case .baseROI, .symbolROI:
+            selectionContext = nil
+        }
+
         do {
             let selectedRect = try roiSelector.selectRect(
                 for: selectedDisplay,
                 prompt: type.prompt,
-                initialRect: currentRect(for: type)
+                initialRect: currentRect(for: type),
+                context: selectionContext
             )
 
-            setRect(selectedRect, for: type)
+            let clearedDependentSelection = setRect(selectedRect, for: type)
             regionState.sourceDescription = "Manual (unsaved)"
             syncRuntimeRegionState()
 
-            statusLabel.stringValue = "\(type.statusTitle) updated for display \(selectedDisplay.id): \(selectedRect.summary)."
+            var statusMessage = "\(type.statusTitle) updated for display \(selectedDisplay.id): \(selectedRect.summary)."
+            switch type {
+            case .baseROI:
+                statusMessage += " Next: select Trigger cell from the nested Base ROI view."
+                if clearedDependentSelection {
+                    statusMessage += " Cleared previous Trigger cell selection."
+                }
+            case .symbolROI:
+                statusMessage += " Next: select Symbol cell from the nested Symbol ROI view."
+                if clearedDependentSelection {
+                    statusMessage += " Cleared previous Symbol cell selection."
+                }
+            case .manualCellROI, .manualSymbolCellROI:
+                break
+            }
+            statusLabel.stringValue = statusMessage
         } catch ROISelectionError.cancelled {
             statusLabel.stringValue = "\(type.statusTitle) selection cancelled."
         } catch let error as ROISelectionError {
@@ -430,16 +466,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func setRect(_ rect: PixelRect, for type: RegionType) {
+    @discardableResult
+    private func setRect(_ rect: PixelRect, for type: RegionType) -> Bool {
         switch type {
         case .baseROI:
+            let parentChanged = regionState.baseROI != rect
             regionState.baseROI = rect
+            if parentChanged, regionState.manualCellROI != nil {
+                regionState.manualCellROI = nil
+                return true
+            }
+            return false
         case .manualCellROI:
             regionState.manualCellROI = rect
+            return false
         case .symbolROI:
+            let parentChanged = regionState.symbolROI != rect
             regionState.symbolROI = rect
+            if parentChanged, regionState.manualSymbolCellROI != nil {
+                regionState.manualSymbolCellROI = nil
+                return true
+            }
+            return false
         case .manualSymbolCellROI:
             regionState.manualSymbolCellROI = rect
+            return false
         }
     }
 
@@ -468,11 +519,11 @@ private enum RegionType {
         case .baseROI:
             return "Select the main OCR base ROI"
         case .manualCellROI:
-            return "Select the numeric trigger cell ROI"
+            return "Select the numeric trigger cell ROI from the zoomed Base ROI view"
         case .symbolROI:
             return "Select the optional symbol ROI"
         case .manualSymbolCellROI:
-            return "Select the optional symbol cell ROI"
+            return "Select the optional symbol cell ROI from the zoomed Symbol ROI view"
         }
     }
 
