@@ -1,10 +1,12 @@
 import AppKit
+import CoreImage
 import CoreGraphics
 import Foundation
 
 @MainActor
 enum ROISelectionError: Error {
     case screenshotUnavailable(CGDirectDisplayID)
+    case invalidContext(String)
     case cancelled
     case missingSelection
 
@@ -12,6 +14,8 @@ enum ROISelectionError: Error {
         switch self {
         case let .screenshotUnavailable(displayID):
             return "Unable to capture a snapshot for display \(displayID). Confirm Screen Recording permission."
+        case let .invalidContext(reason):
+            return reason
         case .cancelled:
             return "ROI selection cancelled."
         case .missingSelection:
@@ -20,25 +24,48 @@ enum ROISelectionError: Error {
     }
 }
 
+struct ROISelectionContext {
+    let parentRect: PixelRect
+    let label: String
+}
+
 @MainActor
 final class ROISelector {
+    private struct SelectionInput {
+        let image: NSImage
+        let coordinateWidth: Int
+        let coordinateHeight: Int
+        let initialRect: PixelRect?
+        let contextDescription: String?
+        let outputOffsetX: Int
+        let outputOffsetY: Int
+    }
+
     func selectRect(
         for display: DisplayTarget,
         prompt: String,
-        initialRect: PixelRect?
+        initialRect: PixelRect?,
+        context: ROISelectionContext? = nil
     ) throws -> PixelRect {
         guard let cgImage = CGDisplayCreateImage(display.id) else {
             throw ROISelectionError.screenshotUnavailable(display.id)
         }
 
-        let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+        let selectionInput = try makeSelectionInput(
+            cgImage: cgImage,
+            display: display,
+            initialRect: initialRect,
+            context: context
+        )
+
         let controller = ROISelectionWindowController(
-            image: image,
-            coordinateWidth: display.width,
-            coordinateHeight: display.height,
+            image: selectionInput.image,
+            coordinateWidth: selectionInput.coordinateWidth,
+            coordinateHeight: selectionInput.coordinateHeight,
             prompt: prompt,
             displayTitle: display.title,
-            initialRect: initialRect
+            initialRect: selectionInput.initialRect,
+            contextDescription: selectionInput.contextDescription
         )
 
         guard let window = controller.window else {
@@ -60,7 +87,79 @@ final class ROISelector {
             throw ROISelectionError.missingSelection
         }
 
-        return selectedRect
+        let translatedRect = PixelRect(
+            x: selectedRect.x + selectionInput.outputOffsetX,
+            y: selectedRect.y + selectionInput.outputOffsetY,
+            width: selectedRect.width,
+            height: selectedRect.height
+        )
+
+        return translatedRect.clamped(maxWidth: display.width, maxHeight: display.height) ?? translatedRect
+    }
+
+    private func makeSelectionInput(
+        cgImage: CGImage,
+        display: DisplayTarget,
+        initialRect: PixelRect?,
+        context: ROISelectionContext?
+    ) throws -> SelectionInput {
+        guard let context else {
+            return SelectionInput(
+                image: NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height)),
+                coordinateWidth: display.width,
+                coordinateHeight: display.height,
+                initialRect: initialRect,
+                contextDescription: nil,
+                outputOffsetX: 0,
+                outputOffsetY: 0
+            )
+        }
+
+        guard let clampedParent = context.parentRect.clamped(maxWidth: display.width, maxHeight: display.height) else {
+            throw ROISelectionError.invalidContext("The parent ROI for nested selection is invalid.")
+        }
+
+        let imageBounds = CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height)
+        let ciY = cgImage.height - clampedParent.y - clampedParent.height
+        let cropRect = CGRect(
+            x: clampedParent.x,
+            y: ciY,
+            width: clampedParent.width,
+            height: clampedParent.height
+        ).integral.intersection(imageBounds)
+
+        guard cropRect.width >= 1, cropRect.height >= 1 else {
+            throw ROISelectionError.invalidContext("The parent ROI for nested selection is outside the display bounds.")
+        }
+
+        let ciContext = CIContext(options: [.cacheIntermediates: false])
+        let sourceImage = CIImage(cgImage: cgImage)
+        let croppedImage = sourceImage.cropped(to: cropRect)
+        guard let nestedCGImage = ciContext.createCGImage(croppedImage, from: cropRect) else {
+            throw ROISelectionError.invalidContext("Unable to prepare nested ROI preview for \(context.label).")
+        }
+
+        let nestedInitialRect = initialRect.flatMap { rect in
+            PixelRect(
+                x: rect.x - clampedParent.x,
+                y: rect.y - clampedParent.y,
+                width: rect.width,
+                height: rect.height
+            ).clamped(maxWidth: clampedParent.width, maxHeight: clampedParent.height)
+        }
+
+        return SelectionInput(
+            image: NSImage(
+                cgImage: nestedCGImage,
+                size: NSSize(width: clampedParent.width, height: clampedParent.height)
+            ),
+            coordinateWidth: clampedParent.width,
+            coordinateHeight: clampedParent.height,
+            initialRect: nestedInitialRect,
+            contextDescription: "Nested inside \(context.label): \(clampedParent.summary)",
+            outputOffsetX: clampedParent.x,
+            outputOffsetY: clampedParent.y
+        )
     }
 }
 
@@ -82,7 +181,8 @@ private final class ROISelectionWindowController: NSWindowController, NSWindowDe
         coordinateHeight: Int,
         prompt: String,
         displayTitle: String,
-        initialRect: PixelRect?
+        initialRect: PixelRect?,
+        contextDescription: String?
     ) {
         self.selectionView = ROISelectionCanvasView(
             image: image,
@@ -113,7 +213,13 @@ private final class ROISelectionWindowController: NSWindowController, NSWindowDe
         instructionLabel.lineBreakMode = .byWordWrapping
         instructionLabel.maximumNumberOfLines = 2
 
-        let hintLabel = NSTextField(labelWithString: "Drag to select a region, then click Use Selection.")
+        let hintText: String
+        if let contextDescription {
+            hintText = "\(contextDescription). Drag to select the nested cell region, then click Use Selection."
+        } else {
+            hintText = "Drag to select a region, then click Use Selection."
+        }
+        let hintLabel = NSTextField(labelWithString: hintText)
         hintLabel.textColor = .secondaryLabelColor
 
         selectionLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
