@@ -91,12 +91,16 @@ struct CaptureRuntimeConfig: Codable, Equatable, Sendable {
     }
 
     func adjustedForDisplay(_ display: DisplayTarget) -> CaptureRuntimeConfig {
-        guard displayWidth > 0, displayHeight > 0, (displayWidth != display.width || displayHeight != display.height) else {
+        adjustedForFrameSize(width: display.width, height: display.height, displayID: UInt32(display.id))
+    }
+
+    func adjustedForFrameSize(width: Int, height: Int, displayID: UInt32? = nil) -> CaptureRuntimeConfig {
+        guard displayWidth > 0, displayHeight > 0, (displayWidth != width || displayHeight != height) else {
             return CaptureRuntimeConfig(
                 version: version,
-                displayID: UInt32(display.id),
-                displayWidth: display.width,
-                displayHeight: display.height,
+                displayID: displayID ?? self.displayID,
+                displayWidth: width,
+                displayHeight: height,
                 baseROI: baseROI,
                 manualCellROI: manualCellROI,
                 symbolROI: symbolROI,
@@ -105,13 +109,13 @@ struct CaptureRuntimeConfig: Codable, Equatable, Sendable {
         }
 
         let sourceSize = CGSize(width: displayWidth, height: displayHeight)
-        let targetSize = CGSize(width: display.width, height: display.height)
+        let targetSize = CGSize(width: width, height: height)
 
         return CaptureRuntimeConfig(
             version: version,
-            displayID: UInt32(display.id),
-            displayWidth: display.width,
-            displayHeight: display.height,
+            displayID: displayID ?? self.displayID,
+            displayWidth: width,
+            displayHeight: height,
             baseROI: baseROI.scaled(from: sourceSize, to: targetSize),
             manualCellROI: manualCellROI.scaled(from: sourceSize, to: targetSize),
             symbolROI: symbolROI?.scaled(from: sourceSize, to: targetSize),

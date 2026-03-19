@@ -1,4 +1,13 @@
 import AppKit
+import Foundation
+
+if let exitCode = OfflineFrameExportCommand.runIfRequested(arguments: CommandLine.arguments) {
+    exit(Int32(exitCode))
+}
+
+if let exitCode = OfflineAnalysisCommand.runIfRequested(arguments: CommandLine.arguments) {
+    exit(Int32(exitCode))
+}
 
 let app = NSApplication.shared
 let delegate = AppDelegate()

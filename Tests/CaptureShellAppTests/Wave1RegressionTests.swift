@@ -199,6 +199,56 @@ struct TriggerPipelineVerificationHarnessTests {
         )
     }
 
+    @Test
+    func eventHandlerReceivesOnlySignalEvents() {
+        let sender = CapturingMessageSender()
+        let eventCollector = CapturingPipelineEventHandler()
+        let pipeline = LowLatencyOCRFramePipeline(
+            messageSender: sender,
+            beep: {},
+            eventHandler: eventCollector.handle(_:)
+        )
+
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "", normalizedText: "", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "0", normalizedText: "0", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(region: .manualSymbolCell, rawText: "ms ft", normalizedText: "MS FT", confidence: 0.8)
+        pipeline.processTriggerEventForTesting(region: .manualSymbolCell, rawText: "m.s-f t", normalizedText: "M.S-F T", confidence: 0.8)
+
+        #expect(
+            eventCollector.events == [
+                OCRPipelineEvent(
+                    kind: .trigger,
+                    frameNumber: 3,
+                    region: "manual_cell",
+                    action: "buy_sent",
+                    rawText: "15",
+                    normalizedText: "15",
+                    confidence: 0.9,
+                    symbol: nil,
+                    parsedInteger: 15,
+                    isDuplicate: false,
+                    isZeroOrEmpty: false,
+                    presentationTimeSeconds: nil
+                ),
+                OCRPipelineEvent(
+                    kind: .trigger,
+                    frameNumber: 4,
+                    region: "manual_symbol_cell",
+                    action: "subscribe_sent",
+                    rawText: "ms ft",
+                    normalizedText: "MS FT",
+                    confidence: 0.8,
+                    symbol: "MSFT",
+                    parsedInteger: nil,
+                    isDuplicate: false,
+                    isZeroOrEmpty: nil,
+                    presentationTimeSeconds: nil
+                )
+            ]
+        )
+    }
+
     private final class CapturingMessageSender: TradingMessageSending, @unchecked Sendable {
         private let lock = NSLock()
         private(set) var messages: [String] = []
@@ -213,6 +263,201 @@ struct TriggerPipelineVerificationHarnessTests {
             lock.unlock()
             completion(.success(()))
         }
+    }
+
+    private final class CapturingPipelineEventHandler: @unchecked Sendable {
+        private let lock = NSLock()
+        private(set) var events: [OCRPipelineEvent] = []
+
+        func handle(_ event: OCRPipelineEvent) {
+            lock.lock()
+            events.append(event)
+            lock.unlock()
+        }
+    }
+}
+
+struct CaptureRuntimeConfigScalingTests {
+    @Test
+    func adjustedForFrameSizeScalesNestedROIs() {
+        let config = CaptureRuntimeConfig(
+            displayID: 7,
+            displayWidth: 1920,
+            displayHeight: 1080,
+            baseROI: PixelRect(x: 100, y: 200, width: 400, height: 200),
+            manualCellROI: PixelRect(x: 120, y: 220, width: 100, height: 50),
+            symbolROI: PixelRect(x: 600, y: 100, width: 240, height: 120),
+            manualSymbolCellROI: PixelRect(x: 620, y: 120, width: 80, height: 40)
+        )
+
+        let scaled = config.adjustedForFrameSize(width: 960, height: 540)
+
+        #expect(scaled.displayID == 7)
+        #expect(scaled.displayWidth == 960)
+        #expect(scaled.displayHeight == 540)
+        #expect(scaled.baseROI == PixelRect(x: 50, y: 100, width: 200, height: 100))
+        #expect(scaled.manualCellROI == PixelRect(x: 60, y: 110, width: 50, height: 25))
+        #expect(scaled.symbolROI == PixelRect(x: 300, y: 50, width: 120, height: 60))
+        #expect(scaled.manualSymbolCellROI == PixelRect(x: 310, y: 60, width: 40, height: 20))
+    }
+}
+
+struct OfflineVerificationEngineTests {
+    @Test
+    func verifyMatchesRecognitionAndTriggerSections() {
+        let expected = OfflineExpectedOutput(
+            recognitionEvents: [
+                OfflineExpectedOCRPipelineEvent(
+                    kind: .recognition,
+                    frameNumber: 12,
+                    region: "manual_cell",
+                    action: "ocr_changed",
+                    rawText: "15",
+                    normalizedText: "15",
+                    symbol: nil,
+                    parsedInteger: 15,
+                    presentationTimeSeconds: 1.0,
+                    presentationTimeToleranceSeconds: 0.1
+                )
+            ],
+            triggerEvents: [
+                OfflineExpectedOCRPipelineEvent(
+                    kind: .trigger,
+                    frameNumber: 12,
+                    region: "manual_cell",
+                    action: "buy_sent",
+                    rawText: "15",
+                    normalizedText: "15",
+                    symbol: nil,
+                    parsedInteger: 15,
+                    presentationTimeSeconds: nil,
+                    presentationTimeToleranceSeconds: nil
+                )
+            ]
+        )
+
+        let recognitionActual = [
+            OCRPipelineEvent(
+                kind: .recognition,
+                frameNumber: 12,
+                region: "manual_cell",
+                action: "ocr_changed",
+                rawText: "15",
+                normalizedText: "15",
+                confidence: 0.97,
+                symbol: nil,
+                parsedInteger: 15,
+                isDuplicate: nil,
+                isZeroOrEmpty: nil,
+                presentationTimeSeconds: 1.04
+            )
+        ]
+        let triggerActual = [
+            OCRPipelineEvent(
+                kind: .trigger,
+                frameNumber: 12,
+                region: "manual_cell",
+                action: "buy_sent",
+                rawText: "15",
+                normalizedText: "15",
+                confidence: 0.97,
+                symbol: nil,
+                parsedInteger: 15,
+                isDuplicate: false,
+                isZeroOrEmpty: false,
+                presentationTimeSeconds: 1.04
+            )
+        ]
+
+        let report = OfflineVerificationEngine.verify(
+            expected: expected,
+            actualRecognitionEvents: recognitionActual,
+            actualTriggerEvents: triggerActual
+        )
+
+        #expect(report.matched)
+        #expect(report.recognition?.matched == true)
+        #expect(report.trigger?.matched == true)
+        #expect(report.recognition?.mismatches.isEmpty == true)
+        #expect(report.trigger?.mismatches.isEmpty == true)
+    }
+
+    @Test
+    func verifyReportsRecognitionMismatchWithoutAffectingTriggerMatch() {
+        let expected = OfflineExpectedOutput(
+            recognitionEvents: [
+                OfflineExpectedOCRPipelineEvent(
+                    kind: .recognition,
+                    frameNumber: nil,
+                    region: "manual_symbol_cell",
+                    action: "ocr_changed",
+                    rawText: nil,
+                    normalizedText: "AAPL",
+                    symbol: "AAPL",
+                    parsedInteger: nil,
+                    presentationTimeSeconds: nil,
+                    presentationTimeToleranceSeconds: nil
+                )
+            ],
+            triggerEvents: [
+                OfflineExpectedOCRPipelineEvent(
+                    kind: .trigger,
+                    frameNumber: nil,
+                    region: "manual_cell",
+                    action: "buy_sent",
+                    rawText: nil,
+                    normalizedText: "15",
+                    symbol: nil,
+                    parsedInteger: 15,
+                    presentationTimeSeconds: nil,
+                    presentationTimeToleranceSeconds: nil
+                )
+            ]
+        )
+
+        let recognitionActual = [
+            OCRPipelineEvent(
+                kind: .recognition,
+                frameNumber: 8,
+                region: "manual_symbol_cell",
+                action: "ocr_changed",
+                rawText: "ms ft",
+                normalizedText: "MS FT",
+                confidence: 0.93,
+                symbol: "MSFT",
+                parsedInteger: nil,
+                isDuplicate: nil,
+                isZeroOrEmpty: nil,
+                presentationTimeSeconds: 0.5
+            )
+        ]
+        let triggerActual = [
+            OCRPipelineEvent(
+                kind: .trigger,
+                frameNumber: 12,
+                region: "manual_cell",
+                action: "buy_sent",
+                rawText: "15",
+                normalizedText: "15",
+                confidence: 0.98,
+                symbol: nil,
+                parsedInteger: 15,
+                isDuplicate: false,
+                isZeroOrEmpty: false,
+                presentationTimeSeconds: 0.8
+            )
+        ]
+
+        let report = OfflineVerificationEngine.verify(
+            expected: expected,
+            actualRecognitionEvents: recognitionActual,
+            actualTriggerEvents: triggerActual
+        )
+
+        #expect(!report.matched)
+        #expect(report.recognition?.matched == false)
+        #expect(report.trigger?.matched == true)
+        #expect(report.recognition?.mismatches.first?.reason == "normalized_text_mismatch")
     }
 }
 

@@ -145,7 +145,10 @@ extension DisplayCaptureController: SCStreamOutput {
         }
 
         timingLogger.log(sampleBuffer: sampleBuffer)
-        pipeline.process(sampleBuffer, runtimeConfig: activeRuntimeConfigSnapshot())
+        guard let frame = VideoFrame(sampleBuffer: sampleBuffer) else {
+            return
+        }
+        pipeline.process(frame, runtimeConfig: activeRuntimeConfigSnapshot())
     }
 }
 

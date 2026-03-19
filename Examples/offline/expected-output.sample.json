@@ -1,0 +1,35 @@
+{
+  "recognitionEvents": [
+    {
+      "kind": "recognition",
+      "region": "manual_symbol_cell",
+      "action": "ocr_changed",
+      "normalizedText": "ATPC",
+      "symbol": "ATPC",
+      "presentationTimeSeconds": 0.5,
+      "presentationTimeToleranceSeconds": 0.1
+    },
+    {
+      "kind": "recognition",
+      "region": "manual_cell",
+      "action": "ocr_changed",
+      "normalizedText": "15",
+      "parsedInteger": 15
+    }
+  ],
+  "triggerEvents": [
+    {
+      "kind": "trigger",
+      "region": "manual_symbol_cell",
+      "action": "subscribe_sent",
+      "symbol": "ATPC"
+    },
+    {
+      "kind": "trigger",
+      "region": "manual_cell",
+      "action": "buy_sent",
+      "normalizedText": "15",
+      "parsedInteger": 15
+    }
+  ]
+}

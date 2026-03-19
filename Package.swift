@@ -17,7 +17,9 @@ let package = Package(
         .executableTarget(
             name: "CaptureShellApp",
             linkerSettings: [
+                .linkedFramework("AVFoundation"),
                 .linkedFramework("AppKit"),
+                .linkedFramework("CoreML"),
                 .linkedFramework("CoreImage"),
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("CoreMedia"),

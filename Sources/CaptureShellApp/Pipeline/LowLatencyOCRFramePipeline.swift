@@ -4,7 +4,6 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import Metal
-import Vision
 
 enum OCRRegionKind: String, Hashable, Sendable {
     case manualCell = "manual_cell"
@@ -202,6 +201,7 @@ private struct TriggerStageTimings {
     let frameIngressTimestamp: CFAbsoluteTime
     let regionStartTimestamp: CFAbsoluteTime
     let ocrDetectedTimestamp: CFAbsoluteTime
+    let presentationTimeSeconds: Double?
     let cropMilliseconds: Double
     let metalMilliseconds: Double
     let fingerprintMilliseconds: Double
@@ -213,9 +213,10 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
     private let ciContext: CIContext
     private let usesMetal: Bool
     private let unchangedLogCadence: Int
-    private let requestByRegion: [OCRRegionKind: VNRecognizeTextRequest]
+    private let recognizer: any OCRTextRecognizing
     private let messageSender: any TradingMessageSending
     private let beep: @Sendable () -> Void
+    private let eventHandler: OCRPipelineEventHandler?
     private let stateLock = NSLock()
     private let triggerStateMachine = TradingTriggerStateMachine()
 
@@ -226,12 +227,14 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
 
     init(
         unchangedLogCadence: Int = 30,
+        recognizer: any OCRTextRecognizing = VisionTextRecognizer(),
         messageSender: any TradingMessageSending = LocalTradingWebSocketClient(),
         beep: @escaping @Sendable () -> Void = {
             DispatchQueue.main.async {
                 NSSound.beep()
             }
-        }
+        },
+        eventHandler: OCRPipelineEventHandler? = nil
     ) {
         if let device = MTLCreateSystemDefaultDevice() {
             ciContext = CIContext(
@@ -245,12 +248,10 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         }
 
         self.unchangedLogCadence = max(1, unchangedLogCadence)
-        self.requestByRegion = [
-            .manualCell: Self.makeRequest(),
-            .manualSymbolCell: Self.makeRequest()
-        ]
+        self.recognizer = recognizer
         self.messageSender = messageSender
         self.beep = beep
+        self.eventHandler = eventHandler
     }
 
     func reset() {
@@ -264,7 +265,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         triggerStateMachine.reset()
     }
 
-    func process(_ sampleBuffer: CMSampleBuffer, runtimeConfig: CaptureRuntimeConfig?) {
+    func process(_ frame: VideoFrame, runtimeConfig: CaptureRuntimeConfig?) {
         stateLock.lock()
         defer { stateLock.unlock() }
 
@@ -278,10 +279,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             return
         }
 
-        guard let sourcePixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
-            print("[ocr] frame=\(frameCount) gate=missing_pixel_buffer")
-            return
-        }
+        let sourcePixelBuffer = frame.pixelBuffer
 
         if !didLogBackend {
             didLogBackend = true
@@ -298,7 +296,8 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             .manualCell,
             sourcePixelBuffer: sourcePixelBuffer,
             runtimeConfig: runtimeConfig,
-            frameIngressTimestamp: frameIngressTimestamp
+            frameIngressTimestamp: frameIngressTimestamp,
+            presentationTimeSeconds: frame.presentationTimeSeconds
         )
 
         if runtimeConfig.manualSymbolCellROI != nil {
@@ -306,7 +305,8 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
                 .manualSymbolCell,
                 sourcePixelBuffer: sourcePixelBuffer,
                 runtimeConfig: runtimeConfig,
-                frameIngressTimestamp: frameIngressTimestamp
+                frameIngressTimestamp: frameIngressTimestamp,
+                presentationTimeSeconds: frame.presentationTimeSeconds
             )
         }
     }
@@ -315,7 +315,8 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         _ region: OCRRegionKind,
         sourcePixelBuffer: CVPixelBuffer,
         runtimeConfig: CaptureRuntimeConfig,
-        frameIngressTimestamp: CFAbsoluteTime
+        frameIngressTimestamp: CFAbsoluteTime,
+        presentationTimeSeconds: Double?
     ) {
         guard let configuredROI = region.roi(from: runtimeConfig) else {
             return
@@ -384,6 +385,23 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
                 "confidence=\(format(recognition.confidence, precision: 3))"
         )
 
+        eventHandler?(
+            OCRPipelineEvent(
+                kind: .recognition,
+                frameNumber: frameCount,
+                region: region.rawValue,
+                action: "ocr_changed",
+                rawText: recognition.rawText,
+                normalizedText: recognition.normalizedText,
+                confidence: recognition.confidence,
+                symbol: region == .manualSymbolCell ? TradingWebSocketContract.normalizeSymbol(recognition.normalizedText) : nil,
+                parsedInteger: region == .manualCell ? ManualCellIntegerPolicy.parseInteger(recognition.normalizedText) : nil,
+                isDuplicate: nil,
+                isZeroOrEmpty: nil,
+                presentationTimeSeconds: presentationTimeSeconds
+            )
+        )
+
         handleTriggerBehavior(
             for: region,
             recognition: recognition,
@@ -391,6 +409,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
                 frameIngressTimestamp: frameIngressTimestamp,
                 regionStartTimestamp: regionStartTimestamp,
                 ocrDetectedTimestamp: ocrDetectedTimestamp,
+                presentationTimeSeconds: presentationTimeSeconds,
                 cropMilliseconds: preprocessResult.cropMilliseconds,
                 metalMilliseconds: preprocessResult.metalMilliseconds,
                 fingerprintMilliseconds: fingerprintMilliseconds,
@@ -460,33 +479,13 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
     }
 
     private func recognizeText(in pixelBuffer: CVPixelBuffer, region: OCRRegionKind) -> OCRRecognitionResult {
-        guard let request = requestByRegion[region] else {
-            return OCRRecognitionResult(rawText: "", normalizedText: "", confidence: 0)
-        }
-
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
-
-        do {
-            try handler.perform([request])
-            let observations = request.results ?? []
-            guard
-                let topObservation = observations.first,
-                let topCandidate = topObservation.topCandidates(1).first
-            else {
-                return OCRRecognitionResult(rawText: "", normalizedText: "", confidence: 0)
-            }
-
-            let rawText = topCandidate.string
-            let normalizedText = OCRNormalizationPolicy.normalize(rawText, for: region)
-            return OCRRecognitionResult(
-                rawText: rawText,
-                normalizedText: normalizedText,
-                confidence: Double(topCandidate.confidence)
-            )
-        } catch {
-            print("[ocr] frame=\(frameCount) region=\(region.rawValue) gate=ocr_error message=\(error.localizedDescription)")
-            return OCRRecognitionResult(rawText: "", normalizedText: "", confidence: 0)
-        }
+        let recognition = recognizer.recognizeText(in: pixelBuffer, region: region)
+        let normalizedText = OCRNormalizationPolicy.normalize(recognition.rawText, for: region)
+        return OCRRecognitionResult(
+            rawText: recognition.rawText,
+            normalizedText: normalizedText,
+            confidence: recognition.confidence
+        )
     }
 
     private func handleTriggerBehavior(
@@ -498,7 +497,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         case .manualCell:
             handleManualCellBehavior(recognition: recognition, timings: timings)
         case .manualSymbolCell:
-            handleManualSymbolBehavior(recognition: recognition)
+            handleManualSymbolBehavior(recognition: recognition, timings: timings)
         }
     }
 
@@ -576,6 +575,23 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             } else {
                 messageSender.send(TradingWebSocketContract.buyMessage, event: "BUY")
             }
+
+            eventHandler?(
+                OCRPipelineEvent(
+                    kind: .trigger,
+                    frameNumber: frameCount,
+                    region: OCRRegionKind.manualCell.rawValue,
+                    action: action,
+                    rawText: recognition.rawText,
+                    normalizedText: evaluation.normalizedText,
+                    confidence: recognition.confidence,
+                    symbol: nil,
+                    parsedInteger: evaluation.integerValue,
+                    isDuplicate: evaluation.isDuplicate,
+                    isZeroOrEmpty: evaluation.isZeroOrEmpty,
+                    presentationTimeSeconds: timings?.presentationTimeSeconds
+                )
+            )
         }
 
         if evaluation.shouldBeep {
@@ -591,7 +607,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         )
     }
 
-    private func handleManualSymbolBehavior(recognition: OCRRecognitionResult) {
+    private func handleManualSymbolBehavior(recognition: OCRRecognitionResult, timings: TriggerStageTimings?) {
         let evaluation = triggerStateMachine.evaluateManualSymbol(normalizedText: recognition.normalizedText)
         let action: String
 
@@ -599,6 +615,23 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             action = "subscribe_sent"
             let message = TradingWebSocketContract.subscribeMessage(symbol: evaluation.normalizedSymbol)
             messageSender.send(message, event: "SUBSCRIBE")
+
+            eventHandler?(
+                OCRPipelineEvent(
+                    kind: .trigger,
+                    frameNumber: frameCount,
+                    region: OCRRegionKind.manualSymbolCell.rawValue,
+                    action: action,
+                    rawText: recognition.rawText,
+                    normalizedText: recognition.normalizedText,
+                    confidence: recognition.confidence,
+                    symbol: evaluation.normalizedSymbol,
+                    parsedInteger: nil,
+                    isDuplicate: evaluation.isDuplicate,
+                    isZeroOrEmpty: nil,
+                    presentationTimeSeconds: timings?.presentationTimeSeconds
+                )
+            )
         } else if evaluation.isDuplicate {
             action = "duplicate_suppressed"
         } else {
@@ -615,14 +648,6 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
                 "symbol=\"\(escapedForLog(evaluation.normalizedSymbol))\" confidence=\(format(recognition.confidence, precision: 3)) " +
                 "duplicate=\(evaluation.isDuplicate)"
         )
-    }
-
-    private static func makeRequest() -> VNRecognizeTextRequest {
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .fast
-        request.usesLanguageCorrection = false
-        request.minimumTextHeight = 0
-        return request
     }
 
     private static func makeOutputPixelBuffer(width: Int, height: Int) -> CVPixelBuffer? {
@@ -687,6 +712,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             frameIngressTimestamp: now,
             regionStartTimestamp: now,
             ocrDetectedTimestamp: now,
+            presentationTimeSeconds: nil,
             cropMilliseconds: 0,
             metalMilliseconds: 0,
             fingerprintMilliseconds: 0,
