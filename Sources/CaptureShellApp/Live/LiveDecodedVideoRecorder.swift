@@ -34,6 +34,7 @@ enum LiveDecodedVideoRecorderError: Error, LocalizedError {
     case failedToCreateWriter(URL)
     case appendFailed(String)
     case finishFailed(String)
+    case finishTimedOut(URL)
 
     var errorDescription: String? {
         switch self {
@@ -43,6 +44,8 @@ enum LiveDecodedVideoRecorderError: Error, LocalizedError {
             return "Decoded live recording append failed: \(message)"
         case let .finishFailed(message):
             return "Decoded live recording finalize failed: \(message)"
+        case let .finishTimedOut(url):
+            return "Decoded live recording timed out while finalizing \(url.path)."
         }
     }
 }
@@ -126,10 +129,14 @@ final class LiveDecodedVideoRecorder {
             semaphore.signal()
         }
 
-        _ = semaphore.wait(timeout: .now() + 15)
-        if writer.status == .failed {
-            throw LiveDecodedVideoRecorderError.finishFailed(writer.error?.localizedDescription ?? "unknown writer error")
-        }
+        let waitResult = semaphore.wait(timeout: .now() + 15)
+        try Self.validateFinishState(
+            waitResult: waitResult,
+            writerStatus: writer.status,
+            writerErrorDescription: writer.error?.localizedDescription,
+            outputURL: outputURL,
+            cancelWriting: { writer.cancelWriting() }
+        )
 
         let fileSizeBytes = (try? FileManager.default.attributesOfItem(atPath: outputURL.path)[.size] as? NSNumber)?.int64Value
         let firstSeconds = firstRecordedTime.flatMap(seconds(for:))
@@ -222,6 +229,37 @@ final class LiveDecodedVideoRecorder {
     private func seconds(for time: CMTime) -> Double? {
         let seconds = CMTimeGetSeconds(time)
         return seconds.isFinite ? max(0, seconds) : nil
+    }
+
+    static func validateFinishState(
+        waitResult: DispatchTimeoutResult,
+        writerStatus: AVAssetWriter.Status,
+        writerErrorDescription: String?,
+        outputURL: URL,
+        cancelWriting: () -> Void
+    ) throws {
+        guard waitResult == .success else {
+            cancelWriting()
+            throw LiveDecodedVideoRecorderError.finishTimedOut(outputURL)
+        }
+
+        switch writerStatus {
+        case .completed:
+            return
+        case .failed:
+            throw LiveDecodedVideoRecorderError.finishFailed(writerErrorDescription ?? "unknown writer error")
+        case .cancelled:
+            throw LiveDecodedVideoRecorderError.finishFailed("writer was cancelled during finish")
+        case .writing:
+            cancelWriting()
+            throw LiveDecodedVideoRecorderError.finishFailed("writer finish callback returned before completion (status=writing)")
+        case .unknown:
+            cancelWriting()
+            throw LiveDecodedVideoRecorderError.finishFailed("writer finish callback returned without a terminal status")
+        @unknown default:
+            cancelWriting()
+            throw LiveDecodedVideoRecorderError.finishFailed("writer finish callback returned with an unknown status")
+        }
     }
 }
 

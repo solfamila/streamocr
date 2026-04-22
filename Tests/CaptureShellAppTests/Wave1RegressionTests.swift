@@ -19,10 +19,8 @@ struct TradingWebSocketContractTests {
     }
 
     @Test
-    func subscribeMessageKeepsLettersOnly() {
-        #expect(
-            TradingWebSocketContract.subscribeMessage(symbol: " m s-f.t 1 ") == #"{"subscribe":"MSFT"}"#
-        )
+    func subscribeMessageRejectsLaunderedSymbolInput() {
+        #expect(TradingWebSocketContract.subscribeMessage(symbol: " m s-f.t 1 ") == nil)
     }
 
     @Test
@@ -527,7 +525,7 @@ struct TriggerPipelineVerificationHarnessTests {
     }
 
     @Test
-    func staleBuyTransportSuccessDoesNotDisarmAfterManualCellRearm() {
+    func staleBuyTransportSuccessDoesNotDisarmAfterConfirmedDifferentCandidate() {
         let sender = ControlledTransportMessageSender()
         let eventCollector = CapturingPipelineEventHandler()
         let pipeline = LowLatencyOCRFramePipeline(
@@ -539,12 +537,33 @@ struct TriggerPipelineVerificationHarnessTests {
         )
 
         pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
-        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "", normalizedText: "", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "20", normalizedText: "20", confidence: 0.9)
         sender.succeedNext()
         pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "20", normalizedText: "20", confidence: 0.9)
 
         #expect(sender.messages == [TradingWebSocketContract.buyMessage, TradingWebSocketContract.buyMessage])
         #expect(eventCollector.events.map(\.action) == ["buy_triggered", "buy_transport_succeeded", "buy_triggered"])
+    }
+
+    @Test
+    func transientBlankDoesNotStalePendingBuyBeforeTrueRearm() {
+        let sender = ControlledTransportMessageSender()
+        let eventCollector = CapturingPipelineEventHandler()
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 12,
+            manualCellTriggerConfirmationFrames: 1,
+            messageSender: sender,
+            beep: {},
+            eventHandler: eventCollector.handle(_:)
+        )
+
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "", normalizedText: "", confidence: 0.9)
+        sender.succeedNext()
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
+
+        #expect(sender.messages == [TradingWebSocketContract.buyMessage])
+        #expect(eventCollector.events.map(\.action) == ["buy_triggered", "buy_transport_succeeded"])
     }
 
     @Test
@@ -642,6 +661,54 @@ struct TriggerPipelineVerificationHarnessTests {
     }
 
     @Test
+    func tentativeAlternateSymbolDoesNotStalePendingSubscribe() {
+        let sender = ControlledTransportMessageSender()
+        let eventCollector = CapturingPipelineEventHandler()
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1,
+            manualSymbolTriggerConfirmationFrames: 2,
+            messageSender: sender,
+            beep: {},
+            eventHandler: eventCollector.handle(_:)
+        )
+
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "plrz",
+            normalizedText: "PLRZ",
+            confidence: 0.9
+        )
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "plrz",
+            normalizedText: "PLRZ",
+            confidence: 0.9
+        )
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "aapl",
+            normalizedText: "AAPL",
+            confidence: 0.9
+        )
+        sender.succeedNext()
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "aapl",
+            normalizedText: "AAPL",
+            confidence: 0.9
+        )
+
+        #expect(sender.messages == [#"{"subscribe":"PLRZ"}"#])
+        #expect(
+            eventCollector.events.map(\.action) == [
+                "subscribe_triggered",
+                "subscribe_transport_succeeded"
+            ]
+        )
+    }
+
+    @Test
     func manualSymbolTriggerRejectsDigitLaunderedOCRCandidate() {
         let sender = ControlledTransportMessageSender()
         let eventCollector = CapturingPipelineEventHandler()
@@ -663,6 +730,42 @@ struct TriggerPipelineVerificationHarnessTests {
 
         #expect(sender.messages.isEmpty)
         #expect(eventCollector.events.isEmpty)
+    }
+
+    @Test
+    func recorderFinishValidationThrowsOnTimeout() {
+        let outputURL = URL(fileURLWithPath: "/tmp/live-decoded-timeout.mp4")
+        var didCancel = false
+
+        #expect(throws: LiveDecodedVideoRecorderError.self) {
+            try LiveDecodedVideoRecorder.validateFinishState(
+                waitResult: .timedOut,
+                writerStatus: .writing,
+                writerErrorDescription: nil,
+                outputURL: outputURL,
+                cancelWriting: { didCancel = true }
+            )
+        }
+
+        #expect(didCancel)
+    }
+
+    @Test
+    func recorderFinishValidationRequiresCompletedWriterState() {
+        let outputURL = URL(fileURLWithPath: "/tmp/live-decoded-incomplete.mp4")
+        var didCancel = false
+
+        #expect(throws: LiveDecodedVideoRecorderError.self) {
+            try LiveDecodedVideoRecorder.validateFinishState(
+                waitResult: .success,
+                writerStatus: .writing,
+                writerErrorDescription: nil,
+                outputURL: outputURL,
+                cancelWriting: { didCancel = true }
+            )
+        }
+
+        #expect(didCancel)
     }
 
     @Test

@@ -987,7 +987,10 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         symbol: String
     ) {
         pendingSubscribeTransport = PendingSubscribeTransport(symbol: symbol, triggerEvent: triggerEvent)
-        let message = TradingWebSocketContract.subscribeMessage(symbol: symbol)
+        guard let message = TradingWebSocketContract.subscribeMessage(symbol: symbol) else {
+            handleSubscribeTransportResult(.failure(TradingWebSocketContractError.invalidSymbol(symbol)))
+            return
+        }
         messageSender.send(message, event: "SUBSCRIBE") { result in
             self.handleSubscribeTransportResult(result)
         }
@@ -1021,14 +1024,13 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             return
         }
 
-        let candidateChanged =
-            evaluation.isZeroOrEmpty ||
-            (
-                evaluation.integerValue != nil &&
-                !pendingBuyTransport.matches(integerValue: evaluation.integerValue)
-            )
+        let didGenuinelyRearm = !evaluation.wasArmed && evaluation.isArmedAfter
+        let didConfirmDifferentCandidate =
+            evaluation.shouldTriggerBuy &&
+            evaluation.integerValue != nil &&
+            !pendingBuyTransport.matches(integerValue: evaluation.integerValue)
 
-        guard candidateChanged else {
+        guard didGenuinelyRearm || didConfirmDifferentCandidate else {
             return
         }
 
@@ -1042,7 +1044,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         }
 
         guard
-            !evaluation.normalizedSymbol.isEmpty,
+            evaluation.shouldTriggerSubscribe,
             !pendingSubscribeTransport.matches(symbol: evaluation.normalizedSymbol)
         else {
             return

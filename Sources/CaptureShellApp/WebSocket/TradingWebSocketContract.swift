@@ -1,5 +1,16 @@
 import Foundation
 
+enum TradingWebSocketContractError: Error, LocalizedError {
+    case invalidSymbol(String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .invalidSymbol(symbol):
+            "Refusing to build subscribe payload from invalid symbol input: \(symbol)"
+        }
+    }
+}
+
 struct SymbolNormalizationAnalysis: Equatable, Sendable {
     let normalized: String
     let droppedAlphanumericCount: Int
@@ -23,10 +34,6 @@ enum TradingWebSocketContract {
             return nil
         }
         return analysis.normalized
-    }
-
-    static func sanitizeTransportSymbol(_ symbol: String) -> String {
-        symbol.uppercased().filter(\.isLetter)
     }
 
     static func analyzeSymbol(_ symbol: String) -> SymbolNormalizationAnalysis {
@@ -58,8 +65,10 @@ enum TradingWebSocketContract {
         )
     }
 
-    static func subscribeMessage(symbol: String) -> String {
-        let normalized = sanitizeTransportSymbol(symbol)
+    static func subscribeMessage(symbol: String) -> String? {
+        guard let normalized = normalizedOCRSymbol(symbol) else {
+            return nil
+        }
         return #"{"subscribe":"\#(normalized)"}"#
     }
 }
