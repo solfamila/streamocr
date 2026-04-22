@@ -26,3 +26,13 @@ Thumbs.db
 # Logs
 *.log
 npm-debug.log*
+
+# Offline OCR generated artifacts
+Examples/offline/font-template-diag*/
+Examples/offline/offline-result*.json
+Examples/offline/plrz-*.png
+Examples/offline/plrz-dataset*/
+Examples/offline/plrz-glyph-dataset*/
+Examples/offline/plrz-glyph-prep*/
+Examples/offline/plrz-glyph-smoke-overrides.jsonl
+Examples/offline/plrz-models*/

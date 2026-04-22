@@ -74,7 +74,8 @@ final class OfflineVideoAnalyzer {
     func analyze(
         videoURL: URL,
         runtimeConfigURL: URL,
-        expectedOutputURL: URL? = nil
+        expectedOutputURL: URL? = nil,
+        recognizer: any OCRTextRecognizing = FontTemplateTextRecognizer()
     ) throws -> OfflineAnalysisResult {
         let runtimeConfig = try RuntimeConfigFileIO.load(from: runtimeConfigURL)
         let asset = AVURLAsset(url: videoURL)
@@ -105,8 +106,10 @@ final class OfflineVideoAnalyzer {
             throw OfflineVideoAnalyzerError.assetReaderStartFailed(message)
         }
 
-        let eventCollector = OfflinePipelineEventCollector()
+        let eventCollector = PipelineEventCollector()
         let pipeline = LowLatencyOCRFramePipeline(
+            loggingEnabled: false,
+            recognizer: recognizer,
             messageSender: DiscardingTradingMessageSender(),
             beep: {},
             eventHandler: eventCollector.handle(_:)
@@ -160,7 +163,7 @@ final class OfflineVideoAnalyzer {
     }
 }
 
-private final class OfflinePipelineEventCollector: @unchecked Sendable {
+final class PipelineEventCollector: @unchecked Sendable {
     private let lock = NSLock()
     private(set) var events: [OCRPipelineEvent] = []
 
@@ -171,7 +174,7 @@ private final class OfflinePipelineEventCollector: @unchecked Sendable {
     }
 }
 
-private final class DiscardingTradingMessageSender: TradingMessageSending, @unchecked Sendable {
+final class DiscardingTradingMessageSender: TradingMessageSending, @unchecked Sendable {
     func send(
         _ payload: String,
         event _: String,
@@ -182,7 +185,7 @@ private final class DiscardingTradingMessageSender: TradingMessageSending, @unch
     }
 }
 
-private enum RuntimeConfigFileIO {
+enum RuntimeConfigFileIO {
     static func load(from url: URL) throws -> CaptureRuntimeConfig {
         let data = try Data(contentsOf: url)
         return try JSONDecoder().decode(CaptureRuntimeConfig.self, from: data)

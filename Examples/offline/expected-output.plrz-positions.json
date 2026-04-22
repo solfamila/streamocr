@@ -1,0 +1,16 @@
+{
+  "triggerEvents": [
+    {
+      "action": "buy_sent",
+      "kind": "trigger",
+      "parsedInteger": 10000,
+      "region": "manual_cell"
+    },
+    {
+      "action": "buy_sent",
+      "kind": "trigger",
+      "parsedInteger": 10000,
+      "region": "manual_cell"
+    }
+  ]
+}

@@ -1,3 +1,4 @@
+import CoreGraphics
 import CoreMedia
 import CoreVideo
 import Foundation
@@ -22,6 +23,38 @@ struct TradingWebSocketContractTests {
         #expect(
             TradingWebSocketContract.subscribeMessage(symbol: " m s-f.t 1 ") == #"{"subscribe":"MSFT"}"#
         )
+    }
+}
+
+struct NanocosmosStreamResolverTests {
+    @Test
+    func derivesPlayablePlaylistCandidatesFromSeedURL() throws {
+        let seed = try #require(URL(string: "wss://bintu-h5live.nanocosmos.de/h5live/stream/stream.mp4?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=433201&pid=72860723635"))
+
+        let candidates = try NanocosmosStreamResolver.derivePlaylistCandidates(seedURL: seed)
+
+        #expect(candidates.map(\.absoluteString).contains("https://bintu-h5live.nanocosmos.de/h5live/http/playlist.m3u8?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=433201&pid=72860723635"))
+    }
+
+    @Test
+    func resolvesRawNanocosmosSegmentLineToEncodedHTTPURL() throws {
+        let playlistURL = try #require(URL(string: "https://bintu-h5live.nanocosmos.de/h5live/http/playlist.m3u8?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=433201&pid=72860723635"))
+        let playlist = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:1
+        #EXTINF:1.0,
+        stream.mp4?url=rtmp://localhost:1935/play&stream=COeCf-9jp1Q&cid=433201&pid=72860723635&h5pltc=4181112
+        #EXT-X-ENDLIST
+        """
+
+        let streamURL = try NanocosmosStreamResolver.streamURL(fromPlaylist: playlist, playlistURL: playlistURL)
+
+        #expect(streamURL.scheme == "https")
+        #expect(streamURL.host == "bintu-h5live.nanocosmos.de")
+        #expect(streamURL.path == "/h5live/http/stream.mp4")
+        #expect(streamURL.absoluteString.contains("url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay"))
+        #expect(streamURL.absoluteString.contains("stream=COeCf-9jp1Q"))
+        #expect(streamURL.absoluteString.contains("h5pltc=4181112"))
     }
 }
 
@@ -71,12 +104,25 @@ struct OCRNormalizationPolicyTests {
         let normalized = OCRNormalizationPolicy.normalize("  ms ft \n", for: .manualSymbolCell)
         #expect(normalized == "MS FT")
     }
+
+    @Test
+    func manualCellIntegerParserAcceptsPeriodThousandsSeparator() {
+        #expect(ManualCellIntegerPolicy.parseInteger("10.000") == 10000)
+    }
+
+    @Test
+    func manualCellIntegerParserAcceptsSingleAmbiguousDigitInsideNumericToken() {
+        #expect(ManualCellIntegerPolicy.parseInteger("16A74") == 16474)
+    }
 }
 
 struct TradingTriggerStateMachineTests {
     @Test
     func manualCellFiresOnlyOnceUntilRearmed() {
-        let stateMachine = TradingTriggerStateMachine()
+        let stateMachine = TradingTriggerStateMachine(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1
+        )
 
         let first = stateMachine.evaluateManualCell(normalizedText: "")
         #expect(!first.shouldSendBuy)
@@ -109,39 +155,133 @@ struct TradingTriggerStateMachineTests {
     }
 
     @Test
-    func manualCellTreatsNonIntegerAsEmptyForArming() {
-        let stateMachine = TradingTriggerStateMachine()
+    func manualCellDoesNotRearmOnNonEmptyNonIntegerNoise() {
+        let stateMachine = TradingTriggerStateMachine(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1
+        )
 
         _ = stateMachine.evaluateManualCell(normalizedText: "11")
         let nonInteger = stateMachine.evaluateManualCell(normalizedText: "ABCD")
-        #expect(nonInteger.isZeroOrEmpty)
-        #expect(nonInteger.isArmedAfter)
+        #expect(!nonInteger.isZeroOrEmpty)
+        #expect(!nonInteger.isArmedAfter)
 
         let retrigger = stateMachine.evaluateManualCell(normalizedText: "5")
-        #expect(retrigger.shouldSendBuy)
+        #expect(!retrigger.shouldSendBuy)
+
+        let rearmed = stateMachine.evaluateManualCell(normalizedText: "")
+        #expect(rearmed.isArmedAfter)
+
+        let actualRetrigger = stateMachine.evaluateManualCell(normalizedText: "5")
+        #expect(actualRetrigger.shouldSendBuy)
     }
 
     @Test
-    func manualSymbolSubscribesOnlyWhenNormalizedSymbolChanges() {
+    func manualCellCanRequireMultipleZeroLikeFramesBeforeRearming() {
+        let stateMachine = TradingTriggerStateMachine(
+            manualCellRearmConfirmationFrames: 3,
+            manualCellTriggerConfirmationFrames: 1
+        )
+
+        _ = stateMachine.evaluateManualCell(normalizedText: "11")
+        let firstBlank = stateMachine.evaluateManualCell(normalizedText: "")
+        #expect(!firstBlank.isArmedAfter)
+
+        let secondBlank = stateMachine.evaluateManualCell(normalizedText: "")
+        #expect(!secondBlank.isArmedAfter)
+
+        let thirdBlank = stateMachine.evaluateManualCell(normalizedText: "")
+        #expect(thirdBlank.isArmedAfter)
+    }
+
+    @Test
+    func manualCellCanRequireMultipleConfirmedReadsBeforeBuying() {
+        let stateMachine = TradingTriggerStateMachine(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 2
+        )
+
+        let firstRead = stateMachine.evaluateManualCell(normalizedText: "10,000")
+        #expect(!firstRead.shouldSendBuy)
+        #expect(firstRead.isAwaitingConfirmation)
+        #expect(firstRead.confirmationProgress == 1)
+
+        let secondRead = stateMachine.evaluateManualCell(normalizedText: "10,000")
+        #expect(secondRead.shouldSendBuy)
+        #expect(secondRead.confirmationProgress == 2)
+        #expect(!secondRead.isArmedAfter)
+    }
+
+    @Test
+    func manualCellSingleFrameHallucinationDoesNotBuyWhenConfirmationRequired() {
+        let stateMachine = TradingTriggerStateMachine(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 2
+        )
+
+        let noise = stateMachine.evaluateManualCell(normalizedText: "1,6.1")
+        #expect(!noise.shouldSendBuy)
+        #expect(noise.isAwaitingConfirmation)
+
+        let cleared = stateMachine.evaluateManualCell(normalizedText: "")
+        #expect(!cleared.shouldSendBuy)
+        #expect(cleared.isArmedAfter)
+
+        let firstReal = stateMachine.evaluateManualCell(normalizedText: "10,000")
+        #expect(!firstReal.shouldSendBuy)
+
+        let secondReal = stateMachine.evaluateManualCell(normalizedText: "10,000")
+        #expect(secondReal.shouldSendBuy)
+    }
+
+    @Test
+    func manualSymbolLocksSymbolChangesUntilManualCellRearms() {
         let stateMachine = TradingTriggerStateMachine()
 
-        let first = stateMachine.evaluateManualSymbol(normalizedText: "ms ft")
+        let first = stateMachine.evaluateManualSymbol(normalizedText: "ms ft", confidence: 0.82)
         #expect(first.shouldSendSubscribe)
         #expect(first.normalizedSymbol == "MSFT")
 
-        let second = stateMachine.evaluateManualSymbol(normalizedText: "m.s-f t")
+        let second = stateMachine.evaluateManualSymbol(normalizedText: "m.s-f t", confidence: 0.82)
         #expect(!second.shouldSendSubscribe)
         #expect(second.isDuplicate)
         #expect(second.normalizedSymbol == "MSFT")
 
-        let third = stateMachine.evaluateManualSymbol(normalizedText: "aapl")
-        #expect(third.shouldSendSubscribe)
+        let blankWhileAlreadyArmed = stateMachine.evaluateManualCell(normalizedText: "")
+        #expect(blankWhileAlreadyArmed.isArmedAfter)
+
+        let third = stateMachine.evaluateManualSymbol(normalizedText: "aapl", confidence: 0.82)
+        #expect(!third.shouldSendSubscribe)
+        #expect(third.isChangeLocked)
         #expect(third.normalizedSymbol == "AAPL")
 
-        let fourth = stateMachine.evaluateManualSymbol(normalizedText: "")
-        #expect(!fourth.shouldSendSubscribe)
-        #expect(fourth.normalizedSymbol.isEmpty)
-        #expect(!fourth.isDuplicate)
+        _ = stateMachine.evaluateManualCell(normalizedText: "15")
+        let rearmed = stateMachine.evaluateManualCell(normalizedText: "")
+        #expect(rearmed.isArmedAfter)
+
+        let fourth = stateMachine.evaluateManualSymbol(normalizedText: "aapl", confidence: 0.82)
+        #expect(fourth.shouldSendSubscribe)
+        #expect(fourth.normalizedSymbol == "AAPL")
+    }
+
+    @Test
+    func manualSymbolChangedSymbolRequiresHigherConfidenceAfterRearm() {
+        let stateMachine = TradingTriggerStateMachine(manualSymbolTriggerConfirmationFrames: 1)
+
+        let first = stateMachine.evaluateManualSymbol(normalizedText: "plrz", confidence: 0.82)
+        #expect(first.shouldSendSubscribe)
+
+        _ = stateMachine.evaluateManualCell(normalizedText: "15")
+        let rearmed = stateMachine.evaluateManualCell(normalizedText: "")
+        #expect(rearmed.isArmedAfter)
+
+        let lowConfidenceChange = stateMachine.evaluateManualSymbol(normalizedText: "plpz", confidence: 0.77)
+        #expect(!lowConfidenceChange.shouldSendSubscribe)
+        #expect(lowConfidenceChange.isChangeLocked)
+
+        let highConfidenceChange = stateMachine.evaluateManualSymbol(normalizedText: "aapl", confidence: 0.80)
+        #expect(highConfidenceChange.shouldSendSubscribe)
+        #expect(highConfidenceChange.normalizedSymbol == "AAPL")
     }
 }
 
@@ -149,7 +289,12 @@ struct TriggerPipelineVerificationHarnessTests {
     @Test
     func manualCellTransitionsEmitSingleBuyUntilRearm() {
         let sender = CapturingMessageSender()
-        let pipeline = LowLatencyOCRFramePipeline(messageSender: sender, beep: {})
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1,
+            messageSender: sender,
+            beep: {}
+        )
 
         pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "", normalizedText: "", confidence: 0.9)
         pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "0", normalizedText: "0", confidence: 0.9)
@@ -168,9 +313,15 @@ struct TriggerPipelineVerificationHarnessTests {
     }
 
     @Test
-    func manualSymbolTransitionsEmitSubscribeOnlyOnChange() {
+    func manualSymbolTransitionsEmitSubscribeOnlyAfterManualCellRearm() {
         let sender = CapturingMessageSender()
-        let pipeline = LowLatencyOCRFramePipeline(messageSender: sender, beep: {})
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1,
+            manualSymbolTriggerConfirmationFrames: 1,
+            messageSender: sender,
+            beep: {}
+        )
 
         pipeline.processTriggerEventForTesting(
             region: .manualSymbolCell,
@@ -190,13 +341,50 @@ struct TriggerPipelineVerificationHarnessTests {
             normalizedText: "AAPL",
             confidence: 0.8
         )
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "", normalizedText: "", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "aapl",
+            normalizedText: "AAPL",
+            confidence: 0.8
+        )
 
         #expect(
             sender.messages == [
                 #"{"subscribe":"MSFT"}"#,
+                TradingWebSocketContract.buyMessage,
                 #"{"subscribe":"AAPL"}"#
             ]
         )
+    }
+
+    @Test
+    func manualSymbolRequiresConfirmationBeforeSubscribe() {
+        let sender = CapturingMessageSender()
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1,
+            manualSymbolTriggerConfirmationFrames: 2,
+            messageSender: sender,
+            beep: {}
+        )
+
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "plrz",
+            normalizedText: "PLRZ",
+            confidence: 0.8
+        )
+        #expect(sender.messages.isEmpty)
+
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "p l r z",
+            normalizedText: "P L R Z",
+            confidence: 0.8
+        )
+        #expect(sender.messages == [#"{"subscribe":"PLRZ"}"#])
     }
 
     @Test
@@ -204,6 +392,9 @@ struct TriggerPipelineVerificationHarnessTests {
         let sender = CapturingMessageSender()
         let eventCollector = CapturingPipelineEventHandler()
         let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1,
+            manualSymbolTriggerConfirmationFrames: 1,
             messageSender: sender,
             beep: {},
             eventHandler: eventCollector.handle(_:)
@@ -249,6 +440,78 @@ struct TriggerPipelineVerificationHarnessTests {
         )
     }
 
+    @Test
+    func manualCellRequiresConfirmationBeforeSendingBuy() {
+        let sender = CapturingMessageSender()
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 2,
+            messageSender: sender,
+            beep: {}
+        )
+
+        pipeline.processTriggerEventForTesting(
+            region: .manualCell,
+            rawText: "1,6.1",
+            normalizedText: "1,6.1",
+            confidence: 0.3
+        )
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "", normalizedText: "", confidence: 0.0)
+        pipeline.processTriggerEventForTesting(
+            region: .manualCell,
+            rawText: "10,000",
+            normalizedText: "10,000",
+            confidence: 1.0
+        )
+        pipeline.processTriggerEventForTesting(
+            region: .manualCell,
+            rawText: "10,000",
+            normalizedText: "10,000",
+            confidence: 1.0
+        )
+
+        #expect(sender.messages == [TradingWebSocketContract.buyMessage])
+    }
+
+    @Test
+    func unchangedManualCellFrameConfirmsCachedRecognitionWithoutRerunningOCR() {
+        let sender = CapturingMessageSender()
+        let eventCollector = CapturingPipelineEventHandler()
+        let recognizer = CountingTextRecognizer(
+            result: OCRTextRecognition(rawText: "10,000", confidence: 1.0)
+        )
+        let pipeline = LowLatencyOCRFramePipeline(
+            loggingEnabled: false,
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 2,
+            recognizer: recognizer,
+            messageSender: sender,
+            beep: {},
+            eventHandler: eventCollector.handle(_:)
+        )
+        let pixelBuffer = makeSolidPixelBuffer(width: 48, height: 48, fillValue: 0)
+        let runtimeConfig = CaptureRuntimeConfig(
+            displayID: 0,
+            displayWidth: 48,
+            displayHeight: 48,
+            baseROI: PixelRect(x: 0, y: 0, width: 48, height: 48),
+            manualCellROI: PixelRect(x: 0, y: 0, width: 48, height: 48),
+            symbolROI: nil,
+            manualSymbolCellROI: nil
+        )
+
+        pipeline.process(VideoFrame(pixelBuffer: pixelBuffer), runtimeConfig: runtimeConfig)
+        pipeline.process(VideoFrame(pixelBuffer: pixelBuffer), runtimeConfig: runtimeConfig)
+
+        #expect(recognizer.callCount == 1)
+        #expect(sender.messages == [TradingWebSocketContract.buyMessage])
+        #expect(eventCollector.events.count == 2)
+        #expect(eventCollector.events[0].kind == .recognition)
+        #expect(eventCollector.events[1].kind == .trigger)
+        #expect(eventCollector.events[1].frameNumber == 2)
+        #expect(eventCollector.events[1].parsedInteger == 10000)
+    }
+
     private final class CapturingMessageSender: TradingMessageSending, @unchecked Sendable {
         private let lock = NSLock()
         private(set) var messages: [String] = []
@@ -274,6 +537,75 @@ struct TriggerPipelineVerificationHarnessTests {
             events.append(event)
             lock.unlock()
         }
+    }
+
+    private final class CountingTextRecognizer: OCRTextRecognizing, @unchecked Sendable {
+        private let lock = NSLock()
+        private let result: OCRTextRecognition
+        private var calls = 0
+
+        var callCount: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return calls
+        }
+
+        init(result: OCRTextRecognition) {
+            self.result = result
+        }
+
+        func recognizeText(in pixelBuffer: CVPixelBuffer, region: OCRRegionKind) -> OCRTextRecognition {
+            _ = pixelBuffer
+            _ = region
+            lock.lock()
+            calls += 1
+            lock.unlock()
+            return result
+        }
+    }
+
+    private func makeSolidPixelBuffer(width: Int, height: Int, fillValue: UInt8) -> CVPixelBuffer {
+        var pixelBuffer: CVPixelBuffer?
+        let attributes: [CFString: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:]
+        ]
+
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_32BGRA,
+            attributes as CFDictionary,
+            &pixelBuffer
+        )
+
+        #expect(status == kCVReturnSuccess)
+        guard let pixelBuffer else {
+            fatalError("Failed to allocate solid pixel buffer.")
+        }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            fatalError("Missing base address for solid pixel buffer.")
+        }
+
+        let pointer = baseAddress.assumingMemoryBound(to: UInt8.self)
+        for y in 0..<height {
+            let row = pointer.advanced(by: y * bytesPerRow)
+            for x in stride(from: 0, to: bytesPerRow, by: 4) {
+                row[x] = fillValue
+                row[x + 1] = fillValue
+                row[x + 2] = fillValue
+                row[x + 3] = 255
+            }
+        }
+
+        return pixelBuffer
     }
 }
 

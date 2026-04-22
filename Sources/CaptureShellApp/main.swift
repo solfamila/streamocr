@@ -5,7 +5,15 @@ if let exitCode = OfflineFrameExportCommand.runIfRequested(arguments: CommandLin
     exit(Int32(exitCode))
 }
 
+if let exitCode = OfflineROISelectionCommand.runIfRequested(arguments: CommandLine.arguments) {
+    exit(Int32(exitCode))
+}
+
 if let exitCode = OfflineAnalysisCommand.runIfRequested(arguments: CommandLine.arguments) {
+    exit(Int32(exitCode))
+}
+
+if let exitCode = LiveAnalysisCommand.runIfRequested(arguments: CommandLine.arguments) {
     exit(Int32(exitCode))
 }
 

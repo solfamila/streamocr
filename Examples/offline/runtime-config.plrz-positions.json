@@ -1,0 +1,30 @@
+{
+  "baseROI" : {
+    "height" : 35,
+    "width" : 137,
+    "x" : 0,
+    "y" : 581
+  },
+  "displayHeight" : 1080,
+  "displayID" : 0,
+  "displayWidth" : 1920,
+  "manualCellROI" : {
+    "height" : 16,
+    "width" : 58,
+    "x" : 60,
+    "y" : 593
+  },
+  "manualSymbolCellROI" : {
+    "height" : 19,
+    "width" : 52,
+    "x" : 868,
+    "y" : 377
+  },
+  "symbolROI" : {
+    "height" : 50,
+    "width" : 83,
+    "x" : 865,
+    "y" : 360
+  },
+  "version" : 1
+}

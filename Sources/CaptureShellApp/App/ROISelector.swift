@@ -53,17 +53,58 @@ final class ROISelector {
 
         let selectionInput = try makeSelectionInput(
             cgImage: cgImage,
-            display: display,
+            coordinateWidth: display.width,
+            coordinateHeight: display.height,
             initialRect: initialRect,
             context: context
         )
 
+        return try selectRect(
+            selectionInput: selectionInput,
+            prompt: prompt,
+            displayTitle: display.title,
+            maxWidth: display.width,
+            maxHeight: display.height
+        )
+    }
+
+    func selectRect(
+        on cgImage: CGImage,
+        frameTitle: String,
+        prompt: String,
+        initialRect: PixelRect?,
+        context: ROISelectionContext? = nil
+    ) throws -> PixelRect {
+        let selectionInput = try makeSelectionInput(
+            cgImage: cgImage,
+            coordinateWidth: cgImage.width,
+            coordinateHeight: cgImage.height,
+            initialRect: initialRect,
+            context: context
+        )
+
+        return try selectRect(
+            selectionInput: selectionInput,
+            prompt: prompt,
+            displayTitle: frameTitle,
+            maxWidth: cgImage.width,
+            maxHeight: cgImage.height
+        )
+    }
+
+    private func selectRect(
+        selectionInput: SelectionInput,
+        prompt: String,
+        displayTitle: String,
+        maxWidth: Int,
+        maxHeight: Int
+    ) throws -> PixelRect {
         let controller = ROISelectionWindowController(
             image: selectionInput.image,
             coordinateWidth: selectionInput.coordinateWidth,
             coordinateHeight: selectionInput.coordinateHeight,
             prompt: prompt,
-            displayTitle: display.title,
+            displayTitle: displayTitle,
             initialRect: selectionInput.initialRect,
             contextDescription: selectionInput.contextDescription
         )
@@ -74,10 +115,11 @@ final class ROISelector {
 
         NSApp.activate(ignoringOtherApps: true)
         window.center()
-        window.makeKeyAndOrderFront(nil)
+        window.makeKeyAndOrderFront(nil as Any?)
+        window.orderFrontRegardless()
 
         let response = NSApp.runModal(for: window)
-        window.orderOut(nil)
+        window.orderOut(nil as Any?)
 
         guard response == .OK else {
             throw ROISelectionError.cancelled
@@ -94,20 +136,21 @@ final class ROISelector {
             height: selectedRect.height
         )
 
-        return translatedRect.clamped(maxWidth: display.width, maxHeight: display.height) ?? translatedRect
+        return translatedRect.clamped(maxWidth: maxWidth, maxHeight: maxHeight) ?? translatedRect
     }
 
     private func makeSelectionInput(
         cgImage: CGImage,
-        display: DisplayTarget,
+        coordinateWidth: Int,
+        coordinateHeight: Int,
         initialRect: PixelRect?,
         context: ROISelectionContext?
     ) throws -> SelectionInput {
         guard let context else {
             return SelectionInput(
                 image: NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height)),
-                coordinateWidth: display.width,
-                coordinateHeight: display.height,
+                coordinateWidth: coordinateWidth,
+                coordinateHeight: coordinateHeight,
                 initialRect: initialRect,
                 contextDescription: nil,
                 outputOffsetX: 0,
@@ -115,7 +158,7 @@ final class ROISelector {
             )
         }
 
-        guard let clampedParent = context.parentRect.clamped(maxWidth: display.width, maxHeight: display.height) else {
+        guard let clampedParent = context.parentRect.clamped(maxWidth: coordinateWidth, maxHeight: coordinateHeight) else {
             throw ROISelectionError.invalidContext("The parent ROI for nested selection is invalid.")
         }
 
@@ -205,6 +248,7 @@ private final class ROISelectionWindowController: NSWindowController, NSWindowDe
         super.init(window: window)
 
         window.title = "Select ROI"
+        window.level = .floating
         window.isReleasedWhenClosed = false
         window.delegate = self
 

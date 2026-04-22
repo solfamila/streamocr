@@ -19,14 +19,13 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("AppKit"),
-                .linkedFramework("CoreML"),
                 .linkedFramework("CoreImage"),
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("CoreMedia"),
                 .linkedFramework("CoreVideo"),
                 .linkedFramework("Metal"),
-                .linkedFramework("ScreenCaptureKit"),
-                .linkedFramework("Vision")
+                .linkedFramework("QuartzCore"),
+                .linkedFramework("ScreenCaptureKit")
             ]
         ),
         .testTarget(
