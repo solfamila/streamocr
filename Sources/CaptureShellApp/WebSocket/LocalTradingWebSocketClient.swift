@@ -66,6 +66,7 @@ final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unche
     private var isConnected = false
     private var isConnecting = false
     private var isSending = false
+    private var isCompletingCurrentSend = false
     private var currentSend: PendingSend?
     private var pendingSends: [PendingSend] = []
     private var nextSendID = 0
@@ -102,14 +103,18 @@ final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unche
     func waitForPendingMessages(timeout: TimeInterval) -> Bool {
         let deadline = Date().addingTimeInterval(max(0, timeout))
         while Date() < deadline {
-            if isIdle {
+            if !hasOutstandingMessages {
                 return true
             }
             Thread.sleep(forTimeInterval: 0.01)
         }
 
-        if isIdle {
+        if !hasOutstandingMessages {
             return true
+        }
+
+        if isCurrentSendCompletionInProgress {
+            return false
         }
 
         let timedOutSends = failOutstandingSends(with: WebSocketSendError.timedOut, cancelActiveTask: true)
@@ -119,10 +124,16 @@ final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unche
         return false
     }
 
-    private var isIdle: Bool {
+    private var hasOutstandingMessages: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return pendingSends.isEmpty && currentSend == nil && !isSending && !isConnecting
+        return !pendingSends.isEmpty || currentSend != nil || isSending || isCompletingCurrentSend
+    }
+
+    private var isCurrentSendCompletionInProgress: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isCompletingCurrentSend
     }
 
     private var hasPendingSends: Bool {
@@ -179,12 +190,13 @@ final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unche
 
         nextSend.task.send(.string(nextSend.pending.payload)) { error in
             if let error {
-                guard let failedSend = self.finishCurrentSendIfMatching(id: nextSend.pending.id) else {
+                guard let failedSend = self.beginCurrentSendCompletionIfMatching(id: nextSend.pending.id) else {
                     return
                 }
                 self.handleTransportError(task: nextSend.task, error: error)
                 print("[ws] send_failed event=\(failedSend.event) error=\(error.localizedDescription)")
                 failedSend.completion(.failure(error))
+                self.finishCurrentSendCompletionIfMatching(id: nextSend.pending.id)
                 if self.hasPendingSends {
                     self.connectIfNeeded()
                     self.flushPendingSendsIfPossible()
@@ -192,12 +204,13 @@ final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unche
                 return
             }
 
-            guard let sentSend = self.finishCurrentSendIfMatching(id: nextSend.pending.id) else {
+            guard let sentSend = self.beginCurrentSendCompletionIfMatching(id: nextSend.pending.id) else {
                 return
             }
 
             print("[ws] sent event=\(sentSend.event) payload=\(sentSend.payload)")
             sentSend.completion(.success(()))
+            self.finishCurrentSendCompletionIfMatching(id: nextSend.pending.id)
             self.flushPendingSendsIfPossible()
         }
     }
@@ -259,15 +272,29 @@ final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unche
         return pending
     }
 
-    private func finishCurrentSendIfMatching(id: Int) -> PendingSend? {
+    private func beginCurrentSendCompletionIfMatching(id: Int) -> PendingSend? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard
+            let currentSend,
+            currentSend.id == id,
+            !isCompletingCurrentSend
+        else {
+            return nil
+        }
+        isCompletingCurrentSend = true
+        return currentSend
+    }
+
+    private func finishCurrentSendCompletionIfMatching(id: Int) {
         lock.lock()
         defer { lock.unlock() }
         guard let currentSend, currentSend.id == id else {
-            return nil
+            return
         }
         self.currentSend = nil
         isSending = false
-        return currentSend
+        isCompletingCurrentSend = false
     }
 
     private func failOutstandingSends(with error: WebSocketSendError, cancelActiveTask: Bool) -> [PendingSend] {
@@ -281,6 +308,7 @@ final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unche
         isConnected = false
         isConnecting = false
         isSending = false
+        isCompletingCurrentSend = false
         currentSend = nil
         pendingSends.removeAll()
         lock.unlock()
@@ -313,7 +341,32 @@ final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unche
         lock.lock()
         currentSend = makePendingSend(payload: payload, event: event, completion: completion)
         isSending = true
+        isCompletingCurrentSend = false
         lock.unlock()
+    }
+
+    func setConnectingForTesting(_ connecting: Bool) {
+        lock.lock()
+        isConnecting = connecting
+        lock.unlock()
+    }
+
+    func completeCurrentSendForTesting(result: Result<Void, any Error>) {
+        let sendID: Int
+        lock.lock()
+        guard let currentSend else {
+            lock.unlock()
+            return
+        }
+        sendID = currentSend.id
+        lock.unlock()
+
+        guard let send = beginCurrentSendCompletionIfMatching(id: sendID) else {
+            return
+        }
+
+        send.completion(result)
+        finishCurrentSendCompletionIfMatching(id: sendID)
     }
 }
 

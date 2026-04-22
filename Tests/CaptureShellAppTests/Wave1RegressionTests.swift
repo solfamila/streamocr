@@ -38,6 +38,46 @@ struct TradingWebSocketContractTests {
 
 struct LocalTradingWebSocketClientTests {
     @Test
+    func waitForPendingMessagesWaitsForCompletionCallbackToReturn() throws {
+        let endpointURL = try #require(URL(string: "ws://localhost:65535"))
+        let client = LocalTradingWebSocketClient(endpointURL: endpointURL, connectOnInit: false)
+        let recorder = CompletionResultRecorder()
+        let didEnterCompletion = DispatchSemaphore(value: 0)
+        let allowCompletionToReturn = DispatchSemaphore(value: 0)
+        let didFinishCompletion = DispatchSemaphore(value: 0)
+
+        client.beginInFlightSendForTesting(payload: TradingWebSocketContract.buyMessage, event: "BUY") { result in
+            recorder.record(label: "BUY", result: result)
+            didEnterCompletion.signal()
+            _ = allowCompletionToReturn.wait(timeout: .now() + 1)
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            client.completeCurrentSendForTesting(result: .success(()))
+            didFinishCompletion.signal()
+        }
+
+        #expect(didEnterCompletion.wait(timeout: .now() + 1) == .success)
+        #expect(client.waitForPendingMessages(timeout: 0) == false)
+
+        allowCompletionToReturn.signal()
+
+        #expect(didFinishCompletion.wait(timeout: .now() + 1) == .success)
+        #expect(client.waitForPendingMessages(timeout: 0) == true)
+        #expect(recorder.snapshot() == ["BUY: success"])
+    }
+
+    @Test
+    func waitForPendingMessagesIgnoresConnectingStateWithoutMessages() throws {
+        let endpointURL = try #require(URL(string: "ws://localhost:65535"))
+        let client = LocalTradingWebSocketClient(endpointURL: endpointURL, connectOnInit: false)
+
+        client.setConnectingForTesting(true)
+
+        #expect(client.waitForPendingMessages(timeout: 0) == true)
+    }
+
+    @Test
     func waitForPendingMessagesTimeoutFailsInFlightAndQueuedSends() throws {
         let endpointURL = try #require(URL(string: "ws://localhost:65535"))
         let client = LocalTradingWebSocketClient(endpointURL: endpointURL, connectOnInit: false)
@@ -52,7 +92,7 @@ struct LocalTradingWebSocketClientTests {
 
         #expect(client.waitForPendingMessages(timeout: 0) == false)
         #expect(
-            recorder.results == [
+            recorder.snapshot() == [
                 "BUY: WebSocket sender timed out before pending messages were delivered.",
                 "SUBSCRIBE: WebSocket sender timed out before pending messages were delivered."
             ]
@@ -76,7 +116,7 @@ struct LocalTradingWebSocketClientTests {
         }
 
         #expect(
-            recorder.results == [
+            recorder.snapshot() == [
                 "BUY: WebSocket sender was cancelled before pending messages were delivered.",
                 "SUBSCRIBE: WebSocket sender was cancelled before pending messages were delivered."
             ]
@@ -86,7 +126,7 @@ struct LocalTradingWebSocketClientTests {
 
 private final class CompletionResultRecorder: @unchecked Sendable {
     private let lock = NSLock()
-    private(set) var results: [String] = []
+    private var results: [String] = []
 
     func record(label: String, result: Result<Void, any Error>) {
         lock.lock()
@@ -97,6 +137,12 @@ private final class CompletionResultRecorder: @unchecked Sendable {
         case let .failure(error):
             results.append("\(label): \(error.localizedDescription)")
         }
+    }
+
+    func snapshot() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return results
     }
 }
 

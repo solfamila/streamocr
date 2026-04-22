@@ -117,10 +117,10 @@ For the numeric position cell, the allowed characters are `0-9`, comma, and
 period in Apple SD Gothic Neo. For the symbol cell, the allowed characters are
 `A-Z` in Microsoft Sans Serif.
 
-OCR-side symbol normalization is intentionally stricter than transport-side
-symbol formatting. If OCR had to drop any alphanumeric character to get from
-the raw read to a ticker, that candidate is rejected instead of being laundered
-into a plausible symbol.
+OCR-side symbol normalization is strict, and the same validation is enforced at
+the transport boundary too. If OCR had to drop any alphanumeric character to
+get from the raw read to a ticker, that candidate is rejected instead of being
+laundered into a plausible symbol.
 
 The pipeline still fingerprints each ROI so unchanged frames avoid repeated OCR
 work. If the numeric cell or sampled symbol cell is unchanged, the cached
