@@ -109,13 +109,16 @@ final class LiveStreamAnalyzer {
             throw LiveStreamAnalyzerError.noFramesDecoded(resolvedForResult?.playlistURL ?? seedURL)
         }
 
+        _ = messageSender.waitForPendingMessages(timeout: 2)
+
         let recognitionEvents = eventCollector.events.filter { $0.kind == .recognition }
         let triggerEvents = eventCollector.events.filter { $0.kind == .trigger }
+        let playbackURL = resolvedForResult?.playlistURL.absoluteString ?? ""
 
         return LiveStreamAnalysisResult(
             seedURL: (resolvedForResult?.seedURL ?? seedURL).absoluteString,
             playlistURL: resolvedForResult?.playlistURL.absoluteString ?? "",
-            playbackURL: resolvedForResult?.playlistURL.absoluteString ?? "",
+            playbackURL: playbackURL,
             streamURL: resolvedForResult?.streamURL.absoluteString ?? "",
             runtimeConfigPath: runtimeConfigURL?.path,
             requestedRunSeconds: runSeconds,

@@ -125,33 +125,34 @@ struct TradingTriggerStateMachineTests {
         )
 
         let first = stateMachine.evaluateManualCell(normalizedText: "")
-        #expect(!first.shouldSendBuy)
+        #expect(!first.shouldTriggerBuy)
         #expect(first.isArmedAfter)
 
         let second = stateMachine.evaluateManualCell(normalizedText: "0")
-        #expect(!second.shouldSendBuy)
+        #expect(!second.shouldTriggerBuy)
         #expect(second.isArmedAfter)
 
         let third = stateMachine.evaluateManualCell(normalizedText: "42")
-        #expect(third.shouldSendBuy)
-        #expect(!third.isArmedAfter)
+        #expect(third.shouldTriggerBuy)
+        #expect(third.isArmedAfter)
+        stateMachine.commitManualCellTriggerSuccess()
 
         let fourth = stateMachine.evaluateManualCell(normalizedText: "42")
-        #expect(!fourth.shouldSendBuy)
+        #expect(!fourth.shouldTriggerBuy)
         #expect(fourth.isDuplicate)
         #expect(!fourth.isArmedAfter)
 
         let fifth = stateMachine.evaluateManualCell(normalizedText: "99")
-        #expect(!fifth.shouldSendBuy)
+        #expect(!fifth.shouldTriggerBuy)
         #expect(!fifth.isArmedAfter)
 
         let sixth = stateMachine.evaluateManualCell(normalizedText: "")
-        #expect(!sixth.shouldSendBuy)
+        #expect(!sixth.shouldTriggerBuy)
         #expect(sixth.isArmedAfter)
 
         let seventh = stateMachine.evaluateManualCell(normalizedText: "7")
-        #expect(seventh.shouldSendBuy)
-        #expect(!seventh.isArmedAfter)
+        #expect(seventh.shouldTriggerBuy)
+        #expect(seventh.isArmedAfter)
     }
 
     @Test
@@ -161,19 +162,21 @@ struct TradingTriggerStateMachineTests {
             manualCellTriggerConfirmationFrames: 1
         )
 
-        _ = stateMachine.evaluateManualCell(normalizedText: "11")
+        let firstTrigger = stateMachine.evaluateManualCell(normalizedText: "11")
+        #expect(firstTrigger.shouldTriggerBuy)
+        stateMachine.commitManualCellTriggerSuccess()
         let nonInteger = stateMachine.evaluateManualCell(normalizedText: "ABCD")
         #expect(!nonInteger.isZeroOrEmpty)
         #expect(!nonInteger.isArmedAfter)
 
         let retrigger = stateMachine.evaluateManualCell(normalizedText: "5")
-        #expect(!retrigger.shouldSendBuy)
+        #expect(!retrigger.shouldTriggerBuy)
 
         let rearmed = stateMachine.evaluateManualCell(normalizedText: "")
         #expect(rearmed.isArmedAfter)
 
         let actualRetrigger = stateMachine.evaluateManualCell(normalizedText: "5")
-        #expect(actualRetrigger.shouldSendBuy)
+        #expect(actualRetrigger.shouldTriggerBuy)
     }
 
     @Test
@@ -183,7 +186,9 @@ struct TradingTriggerStateMachineTests {
             manualCellTriggerConfirmationFrames: 1
         )
 
-        _ = stateMachine.evaluateManualCell(normalizedText: "11")
+        let firstTrigger = stateMachine.evaluateManualCell(normalizedText: "11")
+        #expect(firstTrigger.shouldTriggerBuy)
+        stateMachine.commitManualCellTriggerSuccess()
         let firstBlank = stateMachine.evaluateManualCell(normalizedText: "")
         #expect(!firstBlank.isArmedAfter)
 
@@ -202,14 +207,14 @@ struct TradingTriggerStateMachineTests {
         )
 
         let firstRead = stateMachine.evaluateManualCell(normalizedText: "10,000")
-        #expect(!firstRead.shouldSendBuy)
+        #expect(!firstRead.shouldTriggerBuy)
         #expect(firstRead.isAwaitingConfirmation)
         #expect(firstRead.confirmationProgress == 1)
 
         let secondRead = stateMachine.evaluateManualCell(normalizedText: "10,000")
-        #expect(secondRead.shouldSendBuy)
+        #expect(secondRead.shouldTriggerBuy)
         #expect(secondRead.confirmationProgress == 2)
-        #expect(!secondRead.isArmedAfter)
+        #expect(secondRead.isArmedAfter)
     }
 
     @Test
@@ -220,18 +225,18 @@ struct TradingTriggerStateMachineTests {
         )
 
         let noise = stateMachine.evaluateManualCell(normalizedText: "1,6.1")
-        #expect(!noise.shouldSendBuy)
+        #expect(!noise.shouldTriggerBuy)
         #expect(noise.isAwaitingConfirmation)
 
         let cleared = stateMachine.evaluateManualCell(normalizedText: "")
-        #expect(!cleared.shouldSendBuy)
+        #expect(!cleared.shouldTriggerBuy)
         #expect(cleared.isArmedAfter)
 
         let firstReal = stateMachine.evaluateManualCell(normalizedText: "10,000")
-        #expect(!firstReal.shouldSendBuy)
+        #expect(!firstReal.shouldTriggerBuy)
 
         let secondReal = stateMachine.evaluateManualCell(normalizedText: "10,000")
-        #expect(secondReal.shouldSendBuy)
+        #expect(secondReal.shouldTriggerBuy)
     }
 
     @Test
@@ -239,11 +244,12 @@ struct TradingTriggerStateMachineTests {
         let stateMachine = TradingTriggerStateMachine()
 
         let first = stateMachine.evaluateManualSymbol(normalizedText: "ms ft", confidence: 0.82)
-        #expect(first.shouldSendSubscribe)
+        #expect(first.shouldTriggerSubscribe)
         #expect(first.normalizedSymbol == "MSFT")
+        stateMachine.commitManualSymbolTriggerSuccess(symbol: first.normalizedSymbol)
 
         let second = stateMachine.evaluateManualSymbol(normalizedText: "m.s-f t", confidence: 0.82)
-        #expect(!second.shouldSendSubscribe)
+        #expect(!second.shouldTriggerSubscribe)
         #expect(second.isDuplicate)
         #expect(second.normalizedSymbol == "MSFT")
 
@@ -251,16 +257,18 @@ struct TradingTriggerStateMachineTests {
         #expect(blankWhileAlreadyArmed.isArmedAfter)
 
         let third = stateMachine.evaluateManualSymbol(normalizedText: "aapl", confidence: 0.82)
-        #expect(!third.shouldSendSubscribe)
+        #expect(!third.shouldTriggerSubscribe)
         #expect(third.isChangeLocked)
         #expect(third.normalizedSymbol == "AAPL")
 
-        _ = stateMachine.evaluateManualCell(normalizedText: "15")
+        let buy = stateMachine.evaluateManualCell(normalizedText: "15")
+        #expect(buy.shouldTriggerBuy)
+        stateMachine.commitManualCellTriggerSuccess()
         let rearmed = stateMachine.evaluateManualCell(normalizedText: "")
         #expect(rearmed.isArmedAfter)
 
         let fourth = stateMachine.evaluateManualSymbol(normalizedText: "aapl", confidence: 0.82)
-        #expect(fourth.shouldSendSubscribe)
+        #expect(fourth.shouldTriggerSubscribe)
         #expect(fourth.normalizedSymbol == "AAPL")
     }
 
@@ -269,18 +277,21 @@ struct TradingTriggerStateMachineTests {
         let stateMachine = TradingTriggerStateMachine(manualSymbolTriggerConfirmationFrames: 1)
 
         let first = stateMachine.evaluateManualSymbol(normalizedText: "plrz", confidence: 0.82)
-        #expect(first.shouldSendSubscribe)
+        #expect(first.shouldTriggerSubscribe)
+        stateMachine.commitManualSymbolTriggerSuccess(symbol: first.normalizedSymbol)
 
-        _ = stateMachine.evaluateManualCell(normalizedText: "15")
+        let buy = stateMachine.evaluateManualCell(normalizedText: "15")
+        #expect(buy.shouldTriggerBuy)
+        stateMachine.commitManualCellTriggerSuccess()
         let rearmed = stateMachine.evaluateManualCell(normalizedText: "")
         #expect(rearmed.isArmedAfter)
 
         let lowConfidenceChange = stateMachine.evaluateManualSymbol(normalizedText: "plpz", confidence: 0.77)
-        #expect(!lowConfidenceChange.shouldSendSubscribe)
+        #expect(!lowConfidenceChange.shouldTriggerSubscribe)
         #expect(lowConfidenceChange.isChangeLocked)
 
         let highConfidenceChange = stateMachine.evaluateManualSymbol(normalizedText: "aapl", confidence: 0.80)
-        #expect(highConfidenceChange.shouldSendSubscribe)
+        #expect(highConfidenceChange.shouldTriggerSubscribe)
         #expect(highConfidenceChange.normalizedSymbol == "AAPL")
     }
 }
@@ -412,7 +423,7 @@ struct TriggerPipelineVerificationHarnessTests {
                     kind: .trigger,
                     frameNumber: 3,
                     region: "manual_cell",
-                    action: "buy_sent",
+                    action: "buy_triggered",
                     rawText: "15",
                     normalizedText: "15",
                     confidence: 0.9,
@@ -426,7 +437,7 @@ struct TriggerPipelineVerificationHarnessTests {
                     kind: .trigger,
                     frameNumber: 4,
                     region: "manual_symbol_cell",
-                    action: "subscribe_sent",
+                    action: "subscribe_triggered",
                     rawText: "ms ft",
                     normalizedText: "MS FT",
                     confidence: 0.8,
@@ -438,6 +449,97 @@ struct TriggerPipelineVerificationHarnessTests {
                 )
             ]
         )
+    }
+
+    @Test
+    func buyTriggerQueuesTransportOutcomeAndCommitsOnlyOnSuccess() {
+        let sender = ControlledTransportMessageSender()
+        let eventCollector = CapturingPipelineEventHandler()
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1,
+            messageSender: sender,
+            beep: {},
+            eventHandler: eventCollector.handle(_:)
+        )
+
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
+
+        #expect(sender.messages == [TradingWebSocketContract.buyMessage])
+        #expect(eventCollector.events.map(\.action) == ["buy_triggered"])
+
+        sender.succeedNext()
+        #expect(eventCollector.events.map(\.action) == ["buy_triggered", "buy_transport_succeeded"])
+
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
+        #expect(sender.messages == [TradingWebSocketContract.buyMessage])
+    }
+
+    @Test
+    func buyTransportFailureLeavesTriggerRetryable() {
+        let sender = ControlledTransportMessageSender()
+        let eventCollector = CapturingPipelineEventHandler()
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1,
+            messageSender: sender,
+            beep: {},
+            eventHandler: eventCollector.handle(_:)
+        )
+
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
+        sender.failNext()
+
+        #expect(eventCollector.events.map(\.action) == ["buy_triggered", "buy_transport_failed"])
+
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
+        #expect(sender.messages == [TradingWebSocketContract.buyMessage, TradingWebSocketContract.buyMessage])
+        #expect(eventCollector.events.map(\.action) == ["buy_triggered", "buy_transport_failed", "buy_triggered"])
+
+        sender.succeedNext()
+        #expect(eventCollector.events.map(\.action) == ["buy_triggered", "buy_transport_failed", "buy_triggered", "buy_transport_succeeded"])
+    }
+
+    @Test
+    func subscribeTriggerQueuesTransportOutcomeAndCommitsOnlyOnSuccess() {
+        let sender = ControlledTransportMessageSender()
+        let eventCollector = CapturingPipelineEventHandler()
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1,
+            manualSymbolTriggerConfirmationFrames: 1,
+            messageSender: sender,
+            beep: {},
+            eventHandler: eventCollector.handle(_:)
+        )
+
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "ms ft",
+            normalizedText: "MS FT",
+            confidence: 0.8
+        )
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "ms ft",
+            normalizedText: "MS FT",
+            confidence: 0.8
+        )
+
+        #expect(sender.messages == [#"{"subscribe":"MSFT"}"#])
+        #expect(eventCollector.events.map(\.action) == ["subscribe_triggered"])
+
+        sender.succeedNext()
+        #expect(eventCollector.events.map(\.action) == ["subscribe_triggered", "subscribe_transport_succeeded"])
+
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "ms ft",
+            normalizedText: "MS FT",
+            confidence: 0.8
+        )
+        #expect(sender.messages == [#"{"subscribe":"MSFT"}"#])
     }
 
     @Test
@@ -512,6 +614,49 @@ struct TriggerPipelineVerificationHarnessTests {
         #expect(eventCollector.events[1].parsedInteger == 10000)
     }
 
+    @Test
+    func unchangedManualSymbolSampledFrameConfirmsCachedRecognitionWithoutRerunningOCR() {
+        let sender = CapturingMessageSender()
+        let eventCollector = CapturingPipelineEventHandler()
+        let recognizer = RegionAwareCountingTextRecognizer(
+            results: [
+                .manualCell: OCRTextRecognition(rawText: "", confidence: 1.0),
+                .manualSymbolCell: OCRTextRecognition(rawText: "PLRZ", confidence: 0.9)
+            ]
+        )
+        let pipeline = LowLatencyOCRFramePipeline(
+            loggingEnabled: false,
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 2,
+            manualSymbolSamplingIntervalFrames: 30,
+            manualSymbolTriggerConfirmationFrames: 2,
+            recognizer: recognizer,
+            messageSender: sender,
+            beep: {},
+            eventHandler: eventCollector.handle(_:)
+        )
+        let pixelBuffer = makeSolidPixelBuffer(width: 48, height: 48, fillValue: 0)
+        let runtimeConfig = CaptureRuntimeConfig(
+            displayID: 0,
+            displayWidth: 48,
+            displayHeight: 48,
+            baseROI: PixelRect(x: 0, y: 0, width: 48, height: 48),
+            manualCellROI: PixelRect(x: 0, y: 0, width: 48, height: 48),
+            symbolROI: PixelRect(x: 0, y: 0, width: 48, height: 48),
+            manualSymbolCellROI: PixelRect(x: 0, y: 0, width: 48, height: 48)
+        )
+
+        for _ in 0..<30 {
+            pipeline.process(VideoFrame(pixelBuffer: pixelBuffer), runtimeConfig: runtimeConfig)
+        }
+
+        #expect(recognizer.callCount(for: .manualCell) == 1)
+        #expect(recognizer.callCount(for: .manualSymbolCell) == 1)
+        #expect(sender.messages == [#"{"subscribe":"PLRZ"}"#])
+        #expect(eventCollector.events.map(\.action).contains("subscribe_triggered"))
+        #expect(eventCollector.events.last?.frameNumber == 30)
+    }
+
     private final class CapturingMessageSender: TradingMessageSending, @unchecked Sendable {
         private let lock = NSLock()
         private(set) var messages: [String] = []
@@ -525,6 +670,41 @@ struct TriggerPipelineVerificationHarnessTests {
             messages.append(payload)
             lock.unlock()
             completion(.success(()))
+        }
+    }
+
+    private final class ControlledTransportMessageSender: TradingMessageSending, @unchecked Sendable {
+        private let lock = NSLock()
+        private(set) var messages: [String] = []
+        private var completions: [@Sendable (Result<Void, any Error>) -> Void] = []
+
+        var reportsTransportOutcomes: Bool { true }
+
+        func send(
+            _ payload: String,
+            event _: String,
+            completion: @escaping @Sendable (Result<Void, any Error>) -> Void
+        ) {
+            lock.lock()
+            messages.append(payload)
+            completions.append(completion)
+            lock.unlock()
+        }
+
+        func succeedNext() {
+            resolveNext(with: .success(()))
+        }
+
+        func failNext() {
+            resolveNext(with: .failure(TestTransportError.sendFailed))
+        }
+
+        private func resolveNext(with result: Result<Void, any Error>) {
+            let completion: (@Sendable (Result<Void, any Error>) -> Void)?
+            lock.lock()
+            completion = completions.isEmpty ? nil : completions.removeFirst()
+            lock.unlock()
+            completion?(result)
         }
     }
 
@@ -562,6 +742,35 @@ struct TriggerPipelineVerificationHarnessTests {
             lock.unlock()
             return result
         }
+    }
+
+    private final class RegionAwareCountingTextRecognizer: OCRTextRecognizing, @unchecked Sendable {
+        private let lock = NSLock()
+        private let results: [OCRRegionKind: OCRTextRecognition]
+        private var calls: [OCRRegionKind: Int] = [:]
+
+        init(results: [OCRRegionKind: OCRTextRecognition]) {
+            self.results = results
+        }
+
+        func callCount(for region: OCRRegionKind) -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return calls[region, default: 0]
+        }
+
+        func recognizeText(in pixelBuffer: CVPixelBuffer, region: OCRRegionKind) -> OCRTextRecognition {
+            _ = pixelBuffer
+            lock.lock()
+            calls[region, default: 0] += 1
+            let result = results[region] ?? OCRTextRecognition(rawText: "", confidence: 0)
+            lock.unlock()
+            return result
+        }
+    }
+
+    private enum TestTransportError: Error {
+        case sendFailed
     }
 
     private func makeSolidPixelBuffer(width: Int, height: Int, fillValue: UInt8) -> CVPixelBuffer {
@@ -657,7 +866,7 @@ struct OfflineVerificationEngineTests {
                     kind: .trigger,
                     frameNumber: 12,
                     region: "manual_cell",
-                    action: "buy_sent",
+                    action: "buy_triggered",
                     rawText: "15",
                     normalizedText: "15",
                     symbol: nil,
@@ -689,7 +898,7 @@ struct OfflineVerificationEngineTests {
                 kind: .trigger,
                 frameNumber: 12,
                 region: "manual_cell",
-                action: "buy_sent",
+                action: "buy_triggered",
                 rawText: "15",
                 normalizedText: "15",
                 confidence: 0.97,
@@ -736,7 +945,7 @@ struct OfflineVerificationEngineTests {
                     kind: .trigger,
                     frameNumber: nil,
                     region: "manual_cell",
-                    action: "buy_sent",
+                    action: "buy_triggered",
                     rawText: nil,
                     normalizedText: "15",
                     symbol: nil,
@@ -768,7 +977,7 @@ struct OfflineVerificationEngineTests {
                 kind: .trigger,
                 frameNumber: 12,
                 region: "manual_cell",
-                action: "buy_sent",
+                action: "buy_triggered",
                 rawText: "15",
                 normalizedText: "15",
                 confidence: 0.98,
@@ -790,6 +999,142 @@ struct OfflineVerificationEngineTests {
         #expect(report.recognition?.matched == false)
         #expect(report.trigger?.matched == true)
         #expect(report.recognition?.mismatches.first?.reason == "normalized_text_mismatch")
+    }
+
+    @Test
+    func verifyAllowsExtraActualTriggerEventsWhenExpectedOrderIsPreserved() {
+        let expected = OfflineExpectedOutput(
+            recognitionEvents: nil,
+            triggerEvents: [
+                OfflineExpectedOCRPipelineEvent(
+                    kind: .trigger,
+                    frameNumber: nil,
+                    region: "manual_cell",
+                    action: "buy_triggered",
+                    rawText: nil,
+                    normalizedText: "15",
+                    symbol: nil,
+                    parsedInteger: 15,
+                    presentationTimeSeconds: nil,
+                    presentationTimeToleranceSeconds: nil
+                )
+            ]
+        )
+
+        let triggerActual = [
+            OCRPipelineEvent(
+                kind: .trigger,
+                frameNumber: 12,
+                region: "manual_cell",
+                action: "buy_triggered",
+                rawText: "15",
+                normalizedText: "15",
+                confidence: 0.98,
+                symbol: nil,
+                parsedInteger: 15,
+                isDuplicate: false,
+                isZeroOrEmpty: false,
+                presentationTimeSeconds: 0.8
+            ),
+            OCRPipelineEvent(
+                kind: .trigger,
+                frameNumber: 12,
+                region: "manual_cell",
+                action: "buy_transport_succeeded",
+                rawText: "15",
+                normalizedText: "15",
+                confidence: 0.98,
+                symbol: nil,
+                parsedInteger: 15,
+                isDuplicate: false,
+                isZeroOrEmpty: false,
+                presentationTimeSeconds: 0.8
+            )
+        ]
+
+        let report = OfflineVerificationEngine.verify(
+            expected: expected,
+            actualRecognitionEvents: [],
+            actualTriggerEvents: triggerActual
+        )
+
+        #expect(report.matched)
+        #expect(report.trigger?.matched == true)
+        #expect(report.trigger?.mismatches.isEmpty == true)
+    }
+
+    @Test
+    func verifyFailsWhenExpectedTriggerOrderDoesNotMatchActualOrder() {
+        let expected = OfflineExpectedOutput(
+            recognitionEvents: nil,
+            triggerEvents: [
+                OfflineExpectedOCRPipelineEvent(
+                    kind: .trigger,
+                    frameNumber: nil,
+                    region: "manual_cell",
+                    action: "buy_transport_succeeded",
+                    rawText: nil,
+                    normalizedText: "15",
+                    symbol: nil,
+                    parsedInteger: 15,
+                    presentationTimeSeconds: nil,
+                    presentationTimeToleranceSeconds: nil
+                ),
+                OfflineExpectedOCRPipelineEvent(
+                    kind: .trigger,
+                    frameNumber: nil,
+                    region: "manual_cell",
+                    action: "buy_triggered",
+                    rawText: nil,
+                    normalizedText: "15",
+                    symbol: nil,
+                    parsedInteger: 15,
+                    presentationTimeSeconds: nil,
+                    presentationTimeToleranceSeconds: nil
+                )
+            ]
+        )
+
+        let triggerActual = [
+            OCRPipelineEvent(
+                kind: .trigger,
+                frameNumber: 12,
+                region: "manual_cell",
+                action: "buy_triggered",
+                rawText: "15",
+                normalizedText: "15",
+                confidence: 0.98,
+                symbol: nil,
+                parsedInteger: 15,
+                isDuplicate: false,
+                isZeroOrEmpty: false,
+                presentationTimeSeconds: 0.8
+            ),
+            OCRPipelineEvent(
+                kind: .trigger,
+                frameNumber: 12,
+                region: "manual_cell",
+                action: "buy_transport_succeeded",
+                rawText: "15",
+                normalizedText: "15",
+                confidence: 0.98,
+                symbol: nil,
+                parsedInteger: 15,
+                isDuplicate: false,
+                isZeroOrEmpty: false,
+                presentationTimeSeconds: 0.8
+            )
+        ]
+
+        let report = OfflineVerificationEngine.verify(
+            expected: expected,
+            actualRecognitionEvents: [],
+            actualTriggerEvents: triggerActual
+        )
+
+        #expect(!report.matched)
+        #expect(report.trigger?.matched == false)
+        #expect(report.trigger?.mismatches.first?.reason == "missing_actual_event")
     }
 }
 

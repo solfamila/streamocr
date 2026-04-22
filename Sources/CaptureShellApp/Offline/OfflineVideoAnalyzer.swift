@@ -224,146 +224,40 @@ enum OfflineVerificationEngine {
         actual: [OCRPipelineEvent]
     ) -> OfflineVerificationSectionReport {
         var mismatches: [OfflineVerificationMismatch] = []
-        let maxCount = max(expected.count, actual.count)
+        var searchStartIndex = 0
 
-        for index in 0..<maxCount {
-            let expectedEvent = expected.indices.contains(index) ? expected[index] : nil
-            let actualEvent = actual.indices.contains(index) ? actual[index] : nil
+        for (expectedIndex, expectedEvent) in expected.enumerated() {
+            var matchedActualIndex: Int?
+            var firstMismatchActual: OCRPipelineEvent?
+            var firstMismatchReason: String?
 
-            guard let expectedEvent, let actualEvent else {
-                mismatches.append(
-                    OfflineVerificationMismatch(
-                        index: index,
-                        reason: expectedEvent == nil ? "unexpected_actual_event" : "missing_actual_event",
-                        expected: expectedEvent,
-                        actual: actualEvent
-                    )
-                )
-                continue
-            }
-
-            if let kind = expectedEvent.kind, kind != actualEvent.kind {
-                mismatches.append(
-                    OfflineVerificationMismatch(
-                        index: index,
-                        reason: "kind_mismatch",
-                        expected: expectedEvent,
-                        actual: actualEvent
-                    )
-                )
-                continue
-            }
-
-            if let frameNumber = expectedEvent.frameNumber, frameNumber != actualEvent.frameNumber {
-                mismatches.append(
-                    OfflineVerificationMismatch(
-                        index: index,
-                        reason: "frame_number_mismatch",
-                        expected: expectedEvent,
-                        actual: actualEvent
-                    )
-                )
-                continue
-            }
-
-            if let region = expectedEvent.region, region != actualEvent.region {
-                mismatches.append(
-                    OfflineVerificationMismatch(
-                        index: index,
-                        reason: "region_mismatch",
-                        expected: expectedEvent,
-                        actual: actualEvent
-                    )
-                )
-                continue
-            }
-
-            if let action = expectedEvent.action, action != actualEvent.action {
-                mismatches.append(
-                    OfflineVerificationMismatch(
-                        index: index,
-                        reason: "action_mismatch",
-                        expected: expectedEvent,
-                        actual: actualEvent
-                    )
-                )
-                continue
-            }
-
-            if let rawText = expectedEvent.rawText, rawText != actualEvent.rawText {
-                mismatches.append(
-                    OfflineVerificationMismatch(
-                        index: index,
-                        reason: "raw_text_mismatch",
-                        expected: expectedEvent,
-                        actual: actualEvent
-                    )
-                )
-                continue
-            }
-
-            if let normalizedText = expectedEvent.normalizedText, normalizedText != actualEvent.normalizedText {
-                mismatches.append(
-                    OfflineVerificationMismatch(
-                        index: index,
-                        reason: "normalized_text_mismatch",
-                        expected: expectedEvent,
-                        actual: actualEvent
-                    )
-                )
-                continue
-            }
-
-            if let symbol = expectedEvent.symbol, symbol != actualEvent.symbol {
-                mismatches.append(
-                    OfflineVerificationMismatch(
-                        index: index,
-                        reason: "symbol_mismatch",
-                        expected: expectedEvent,
-                        actual: actualEvent
-                    )
-                )
-                continue
-            }
-
-            if let parsedInteger = expectedEvent.parsedInteger, parsedInteger != actualEvent.parsedInteger {
-                mismatches.append(
-                    OfflineVerificationMismatch(
-                        index: index,
-                        reason: "parsed_integer_mismatch",
-                        expected: expectedEvent,
-                        actual: actualEvent
-                    )
-                )
-                continue
-            }
-
-            if let expectedPTS = expectedEvent.presentationTimeSeconds {
-                let tolerance = max(0, expectedEvent.presentationTimeToleranceSeconds ?? 0.05)
-
-                guard let actualPTS = actualEvent.presentationTimeSeconds else {
-                    mismatches.append(
-                        OfflineVerificationMismatch(
-                            index: index,
-                            reason: "missing_presentation_time",
-                            expected: expectedEvent,
-                            actual: actualEvent
-                        )
-                    )
+            for actualIndex in searchStartIndex..<actual.count {
+                let actualEvent = actual[actualIndex]
+                if let mismatchReason = mismatchReason(expected: expectedEvent, actual: actualEvent) {
+                    if firstMismatchReason == nil {
+                        firstMismatchReason = mismatchReason
+                        firstMismatchActual = actualEvent
+                    }
                     continue
                 }
 
-                if abs(expectedPTS - actualPTS) > tolerance {
-                    mismatches.append(
-                        OfflineVerificationMismatch(
-                            index: index,
-                            reason: "presentation_time_mismatch",
-                            expected: expectedEvent,
-                            actual: actualEvent
-                        )
-                    )
-                }
+                matchedActualIndex = actualIndex
+                break
             }
+
+            guard let matchedActualIndex else {
+                mismatches.append(
+                    OfflineVerificationMismatch(
+                        index: expectedIndex,
+                        reason: firstMismatchReason ?? "missing_actual_event",
+                        expected: expectedEvent,
+                        actual: firstMismatchActual
+                    )
+                )
+                continue
+            }
+
+            searchStartIndex = matchedActualIndex + 1
         }
 
         return OfflineVerificationSectionReport(
@@ -372,5 +266,54 @@ enum OfflineVerificationEngine {
             actualCount: actual.count,
             mismatches: mismatches
         )
+    }
+
+    private static func mismatchReason(
+        expected: OfflineExpectedOCRPipelineEvent,
+        actual: OCRPipelineEvent
+    ) -> String? {
+        if let kind = expected.kind, kind != actual.kind {
+            return "kind_mismatch"
+        }
+
+        if let frameNumber = expected.frameNumber, frameNumber != actual.frameNumber {
+            return "frame_number_mismatch"
+        }
+
+        if let region = expected.region, region != actual.region {
+            return "region_mismatch"
+        }
+
+        if let action = expected.action, action != actual.action {
+            return "action_mismatch"
+        }
+
+        if let rawText = expected.rawText, rawText != actual.rawText {
+            return "raw_text_mismatch"
+        }
+
+        if let normalizedText = expected.normalizedText, normalizedText != actual.normalizedText {
+            return "normalized_text_mismatch"
+        }
+
+        if let symbol = expected.symbol, symbol != actual.symbol {
+            return "symbol_mismatch"
+        }
+
+        if let parsedInteger = expected.parsedInteger, parsedInteger != actual.parsedInteger {
+            return "parsed_integer_mismatch"
+        }
+
+        if let expectedPTS = expected.presentationTimeSeconds {
+            let tolerance = max(0, expected.presentationTimeToleranceSeconds ?? 0.05)
+            guard let actualPTS = actual.presentationTimeSeconds else {
+                return "missing_presentation_time"
+            }
+            if abs(expectedPTS - actualPTS) > tolerance {
+                return "presentation_time_mismatch"
+            }
+        }
+
+        return nil
     }
 }

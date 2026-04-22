@@ -3,14 +3,14 @@
 macOS capture and offline-analysis app for the trading stream OCR workflow.
 
 The OCR stack has been intentionally reduced to one method: deterministic
-Apple SD Gothic Neo font-template matching. There is no Vision OCR, Core ML OCR,
-or hybrid fallback path in the runtime.
+font-template matching. There is no Vision OCR, Core ML OCR, or hybrid fallback
+path in the runtime.
 
 Current status:
 - Live path captures the display with ScreenCaptureKit.
 - Offline MP4 analysis uses the same ROI/OCR/trigger pipeline as live capture.
 - Numeric position cells are read with Apple SD Gothic Neo digit templates.
-- Optional symbol cells are read with Apple SD Gothic Neo uppercase-letter templates.
+- Optional symbol cells are read with Microsoft Sans Serif uppercase-letter templates.
 - Offline verification can compare recognition events and downstream BUY/subscribe trigger events.
 
 ## Offline Workflow
@@ -62,6 +62,9 @@ The live command derives the nanocosmos HTTP `stream.mp4` URL from the `wss://`
 seed, decodes frames with AVFoundation, and feeds those frames through the same
 OCR pipeline as offline analysis. It is dry-run by default: BUY/subscribe
 messages are discarded unless `--send-trading-messages` is explicitly supplied.
+When live transport is enabled, `triggerEvents` include truthful OCR decisions
+like `buy_triggered` / `subscribe_triggered` plus transport outcomes such as
+`buy_transport_succeeded` and `subscribe_transport_failed`.
 
 ### Benchmark the PLRZ Fixture
 
@@ -70,7 +73,7 @@ scripts/benchmark-ocr.sh
 ```
 
 The script builds a release binary, runs the PLRZ offline fixture, writes the
-result JSON, and dumps the resolved Apple SD Gothic Neo templates for inspection.
+result JSON, and dumps the resolved font templates for inspection.
 
 ## JSON Templates
 
@@ -94,12 +97,27 @@ Each expected event can match on any subset of:
 - `presentationTimeSeconds`
 - `presentationTimeToleranceSeconds`
 
-That makes it possible to write strict regression fixtures or looser "only the meaningful fields matter" checks.
+Expected events are matched as an ordered subsequence of the actual output.
+That means extra actual events are allowed, but expected events still need to
+appear in order. Field-level matching is still partial, so fixtures can stay
+tight or loose depending on which fields they specify.
 
 ## OCR Design
 
-The recognizer renders Apple SD Gothic Neo glyph templates with Core Text, binarizes the selected ROI, segments the foreground into glyph-like columns, and matches each segment to the rendered template set.
+The recognizer renders Core Text glyph templates, binarizes the selected ROI,
+segments the foreground into glyph-like columns, and matches each segment to
+the rendered template set.
 
-For the numeric position cell, the allowed characters are `0-9`, comma, and period. For the symbol cell, the allowed characters are `A-Z`.
+For the numeric position cell, the allowed characters are `0-9`, comma, and
+period in Apple SD Gothic Neo. For the symbol cell, the allowed characters are
+`A-Z` in Microsoft Sans Serif.
 
-The pipeline still fingerprints each ROI so unchanged frames avoid repeated OCR work. If the numeric cell is unchanged, the cached recognition is replayed into the trigger state machine so multi-frame confirmation still works without rerunning OCR.
+The pipeline still fingerprints each ROI so unchanged frames avoid repeated OCR
+work. If the numeric cell or sampled symbol cell is unchanged, the cached
+recognition is replayed into the trigger state machine so multi-frame
+confirmation still works without rerunning OCR.
+
+In live JSON results, `playbackURL` is the actual AVAsset playback URL used by
+the player. Today that is the resolved playlist URL, so `playlistURL` and
+`playbackURL` will usually match while `streamURL` remains the resolved media
+segment URL.

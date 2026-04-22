@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Benchmark the Apple SD Gothic Neo font-template OCR path.
+# Benchmark the deterministic font-template OCR path.
 #
 # Usage: scripts/benchmark-ocr.sh [path/to/video.mp4]
 # Default video path: $HOME/Downloads/streamocr/pullback_first_2min_1080p.mp4
@@ -26,7 +26,7 @@ echo "==> swift build -c release"
 swift build -c release
 
 echo ""
-echo "==> OCR: Apple SD Gothic Neo font-template"
+echo "==> OCR: font-template matcher"
 echo "    Result:  $RESULT_JSON"
 echo "    Diag:    $DIAG_DIR (PNGs + font-info.txt)"
 mkdir -p "$DIAG_DIR"

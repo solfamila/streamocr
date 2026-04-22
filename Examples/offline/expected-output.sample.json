@@ -21,13 +21,13 @@
     {
       "kind": "trigger",
       "region": "manual_symbol_cell",
-      "action": "subscribe_sent",
+      "action": "subscribe_triggered",
       "symbol": "ATPC"
     },
     {
       "kind": "trigger",
       "region": "manual_cell",
-      "action": "buy_sent",
+      "action": "buy_triggered",
       "normalizedText": "15",
       "parsedInteger": 15
     }

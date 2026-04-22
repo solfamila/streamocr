@@ -184,7 +184,7 @@ struct ManualCellTriggerEvaluation {
     let isAwaitingConfirmation: Bool
     let confirmationProgress: Int
     let requiredConfirmationCount: Int
-    let shouldSendBuy: Bool
+    let shouldTriggerBuy: Bool
     let shouldBeep: Bool
     let wasArmed: Bool
     let isArmedAfter: Bool
@@ -197,7 +197,7 @@ struct ManualSymbolTriggerEvaluation {
     let isAwaitingConfirmation: Bool
     let confirmationProgress: Int
     let requiredConfirmationCount: Int
-    let shouldSendSubscribe: Bool
+    let shouldTriggerSubscribe: Bool
     let shouldBeep: Bool
 }
 
@@ -282,7 +282,7 @@ final class TradingTriggerStateMachine {
             pendingManualCellConfirmationCount = 0
         }
 
-        let shouldSendBuy =
+        let shouldTriggerBuy =
             manualCellIsArmed &&
             integerValue != nil &&
             !isZeroOrEmpty &&
@@ -298,10 +298,6 @@ final class TradingTriggerStateMachine {
             if !wasArmed {
                 manualSymbolChangeIsArmed = true
             }
-        } else if shouldSendBuy {
-            manualCellIsArmed = false
-            pendingManualCellIntegerValue = nil
-            pendingManualCellConfirmationCount = 0
         }
 
         if !isDuplicate {
@@ -317,11 +313,11 @@ final class TradingTriggerStateMachine {
                 manualCellIsArmed &&
                 integerValue != nil &&
                 !isZeroOrEmpty &&
-                !shouldSendBuy &&
+                !shouldTriggerBuy &&
                 confirmationProgress > 0,
             confirmationProgress: confirmationProgress,
             requiredConfirmationCount: manualCellTriggerConfirmationFrames,
-            shouldSendBuy: shouldSendBuy,
+            shouldTriggerBuy: shouldTriggerBuy,
             shouldBeep: !isDuplicate,
             wasArmed: wasArmed,
             isArmedAfter: manualCellIsArmed
@@ -356,18 +352,11 @@ final class TradingTriggerStateMachine {
             confirmationProgress = pendingManualSymbolConfirmationCount
         }
 
-        let shouldSendSubscribe =
+        let shouldTriggerSubscribe =
             !normalizedSymbol.isEmpty &&
             !isDuplicate &&
             !isChangeLocked &&
             confirmationProgress >= manualSymbolTriggerConfirmationFrames
-
-        if shouldSendSubscribe {
-            lastCommittedManualSymbol = normalizedSymbol
-            pendingManualSymbol = nil
-            pendingManualSymbolConfirmationCount = 0
-            manualSymbolChangeIsArmed = false
-        }
 
         return ManualSymbolTriggerEvaluation(
             normalizedSymbol: normalizedSymbol,
@@ -377,13 +366,26 @@ final class TradingTriggerStateMachine {
                 !normalizedSymbol.isEmpty &&
                 !isDuplicate &&
                 !isChangeLocked &&
-                !shouldSendSubscribe &&
+                !shouldTriggerSubscribe &&
                 confirmationProgress > 0,
             confirmationProgress: confirmationProgress,
             requiredConfirmationCount: manualSymbolTriggerConfirmationFrames,
-            shouldSendSubscribe: shouldSendSubscribe,
-            shouldBeep: shouldSendSubscribe
+            shouldTriggerSubscribe: shouldTriggerSubscribe,
+            shouldBeep: shouldTriggerSubscribe
         )
+    }
+
+    func commitManualCellTriggerSuccess() {
+        manualCellIsArmed = false
+        pendingManualCellIntegerValue = nil
+        pendingManualCellConfirmationCount = 0
+    }
+
+    func commitManualSymbolTriggerSuccess(symbol: String) {
+        lastCommittedManualSymbol = TradingWebSocketContract.normalizeSymbol(symbol)
+        pendingManualSymbol = nil
+        pendingManualSymbolConfirmationCount = 0
+        manualSymbolChangeIsArmed = false
     }
 }
 
@@ -405,6 +407,19 @@ private struct TriggerStageTimings {
     let ocrMilliseconds: Double
 }
 
+private struct PendingBuyTransport {
+    let integerValue: Int?
+    let triggerEvent: OCRPipelineEvent
+    let timings: TriggerStageTimings?
+    let triggerEvaluationMilliseconds: Double
+    let buyDecisionMilliseconds: Double
+}
+
+private struct PendingSubscribeTransport {
+    let symbol: String
+    let triggerEvent: OCRPipelineEvent
+}
+
 final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
     private let ciContext: CIContext
     private let usesMetal: Bool
@@ -416,7 +431,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
     private let messageSender: any TradingMessageSending
     private let beep: @Sendable () -> Void
     private let eventHandler: OCRPipelineEventHandler?
-    private let stateLock = NSLock()
+    private let stateLock = NSRecursiveLock()
     private let triggerStateMachine: TradingTriggerStateMachine
 
     private var frameCount = 0
@@ -424,6 +439,8 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
     private var lastFingerprintByRegion: [OCRRegionKind: UInt64] = [:]
     private var lastRecognitionByRegion: [OCRRegionKind: OCRRecognitionResult] = [:]
     private var unchangedStreakByRegion: [OCRRegionKind: Int] = [:]
+    private var pendingBuyTransport: PendingBuyTransport?
+    private var pendingSubscribeTransport: PendingSubscribeTransport?
 
     init(
         loggingEnabled: Bool = true,
@@ -476,6 +493,8 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         lastFingerprintByRegion.removeAll(keepingCapacity: true)
         lastRecognitionByRegion.removeAll(keepingCapacity: true)
         unchangedStreakByRegion.removeAll(keepingCapacity: true)
+        pendingBuyTransport = nil
+        pendingSubscribeTransport = nil
         triggerStateMachine.reset()
     }
 
@@ -668,7 +687,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         gatingMilliseconds: Double,
         shouldLogEvaluation: Bool
     ) {
-        guard region == .manualCell, let recognition = lastRecognitionByRegion[region] else {
+        guard let recognition = lastRecognitionByRegion[region] else {
             return
         }
 
@@ -733,98 +752,57 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         let triggerEvaluationMilliseconds = elapsedMilliseconds(since: triggerEvaluationStart)
         let buyDecisionStart = CFAbsoluteTimeGetCurrent()
         let action: String
+        let shouldDispatchTrigger: Bool
 
-        if evaluation.shouldSendBuy {
-            action = "buy_sent"
+        if evaluation.shouldTriggerBuy {
+            if pendingBuyTransport == nil {
+                action = "buy_triggered"
+                shouldDispatchTrigger = true
+            } else {
+                action = "transport_pending_duplicate_suppressed"
+                shouldDispatchTrigger = false
+            }
         } else if evaluation.isZeroOrEmpty {
             action = "armed"
+            shouldDispatchTrigger = false
         } else if evaluation.isAwaitingConfirmation {
             action = "confirmation_pending"
+            shouldDispatchTrigger = false
         } else if evaluation.isDuplicate {
             action = "duplicate_suppressed"
+            shouldDispatchTrigger = false
         } else {
             action = "already_triggered_waiting_for_rearm"
+            shouldDispatchTrigger = false
         }
         let buyDecisionMilliseconds = elapsedMilliseconds(since: buyDecisionStart)
 
-        if evaluation.shouldSendBuy {
-            if let timings {
-                let frameNumber = frameCount
-                let frameIngressToRegionMilliseconds = max(
-                    0,
-                    (timings.regionStartTimestamp - timings.frameIngressTimestamp) * 1_000
-                )
-                let sendStartTimestamp = CFAbsoluteTimeGetCurrent()
-                let frameToBuyMilliseconds = max(
-                    0,
-                    (sendStartTimestamp - timings.frameIngressTimestamp) * 1_000
-                )
-                let ocrToBuyMilliseconds = max(
-                    0,
-                    (sendStartTimestamp - timings.ocrDetectedTimestamp) * 1_000
-                )
-
-                messageSender.send(TradingWebSocketContract.buyMessage, event: "BUY") { result in
-                    let sendCompletionTimestamp = CFAbsoluteTimeGetCurrent()
-                    let wsSendDurationMilliseconds = max(0, (sendCompletionTimestamp - sendStartTimestamp) * 1_000)
-                    let wsSendCompletionMilliseconds = max(
-                        0,
-                        (sendCompletionTimestamp - timings.frameIngressTimestamp) * 1_000
-                    )
-
-                    let sendResult: String
-                    let sendErrorSuffix: String
-                    switch result {
-                    case .success:
-                        sendResult = "success"
-                        sendErrorSuffix = ""
-                    case let .failure(error):
-                        sendResult = "failure"
-                        sendErrorSuffix = " send_error=\"\(self.escapedForLog(error.localizedDescription))\""
-                    }
-
-                    if self.loggingEnabled {
-                        print(
-                            "[latency] frame=\(frameNumber) event=BUY send_result=\(sendResult) " +
-                                "frame_ingress_to_region_ms=\(self.format(frameIngressToRegionMilliseconds)) " +
-                                "crop_ms=\(self.format(timings.cropMilliseconds)) metal_ms=\(self.format(timings.metalMilliseconds)) " +
-                                "fingerprint_ms=\(self.format(timings.fingerprintMilliseconds)) " +
-                                "gating_ms=\(self.format(timings.gatingMilliseconds)) " +
-                                "ocr_ms=\(self.format(timings.ocrMilliseconds)) " +
-                                "trigger_eval_ms=\(self.format(triggerEvaluationMilliseconds)) " +
-                                "buy_decision_ms=\(self.format(buyDecisionMilliseconds)) " +
-                                "ws_send_start_ms=\(self.format(frameToBuyMilliseconds)) " +
-                                "ws_send_duration_ms=\(self.format(wsSendDurationMilliseconds)) " +
-                                "ws_send_completion_ms=\(self.format(wsSendCompletionMilliseconds)) " +
-                                "frame_to_buy_ms=\(self.format(frameToBuyMilliseconds)) " +
-                                "ocr_to_buy_ms=\(self.format(ocrToBuyMilliseconds)) " +
-                                "total_end_to_end_ms=\(self.format(wsSendCompletionMilliseconds))\(sendErrorSuffix)"
-                        )
-                    }
-                }
-            } else {
-                messageSender.send(TradingWebSocketContract.buyMessage, event: "BUY")
-            }
-
-            eventHandler?(
-                OCRPipelineEvent(
-                    kind: .trigger,
-                    frameNumber: frameCount,
-                    region: OCRRegionKind.manualCell.rawValue,
-                    action: action,
-                    rawText: recognition.rawText,
-                    normalizedText: evaluation.normalizedText,
-                    confidence: recognition.confidence,
-                    symbol: nil,
-                    parsedInteger: evaluation.integerValue,
-                    isDuplicate: evaluation.isDuplicate,
-                    isZeroOrEmpty: evaluation.isZeroOrEmpty,
-                    presentationTimeSeconds: timings?.presentationTimeSeconds
-                )
+        if shouldDispatchTrigger {
+            let triggerEvent = OCRPipelineEvent(
+                kind: .trigger,
+                frameNumber: frameCount,
+                region: OCRRegionKind.manualCell.rawValue,
+                action: action,
+                rawText: recognition.rawText,
+                normalizedText: evaluation.normalizedText,
+                confidence: recognition.confidence,
+                symbol: nil,
+                parsedInteger: evaluation.integerValue,
+                isDuplicate: evaluation.isDuplicate,
+                isZeroOrEmpty: evaluation.isZeroOrEmpty,
+                presentationTimeSeconds: timings?.presentationTimeSeconds
+            )
+            eventHandler?(triggerEvent)
+            startPendingBuyTransport(
+                triggerEvent: triggerEvent,
+                integerValue: evaluation.integerValue,
+                timings: timings,
+                triggerEvaluationMilliseconds: triggerEvaluationMilliseconds,
+                buyDecisionMilliseconds: buyDecisionMilliseconds
             )
         }
 
-        if evaluation.shouldBeep {
+        if shouldDispatchTrigger || evaluation.shouldBeep {
             beep()
         }
 
@@ -850,39 +828,53 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             confidence: recognition.confidence
         )
         let action: String
+        let shouldDispatchTrigger: Bool
 
-        if evaluation.shouldSendSubscribe {
-            action = "subscribe_sent"
-            let message = TradingWebSocketContract.subscribeMessage(symbol: evaluation.normalizedSymbol)
-            messageSender.send(message, event: "SUBSCRIBE")
-
-            eventHandler?(
-                OCRPipelineEvent(
-                    kind: .trigger,
-                    frameNumber: frameCount,
-                    region: OCRRegionKind.manualSymbolCell.rawValue,
-                    action: action,
-                    rawText: recognition.rawText,
-                    normalizedText: recognition.normalizedText,
-                    confidence: recognition.confidence,
-                    symbol: evaluation.normalizedSymbol,
-                    parsedInteger: nil,
-                    isDuplicate: evaluation.isDuplicate,
-                    isZeroOrEmpty: nil,
-                    presentationTimeSeconds: timings?.presentationTimeSeconds
-                )
-            )
+        if evaluation.shouldTriggerSubscribe {
+            if pendingSubscribeTransport == nil {
+                action = "subscribe_triggered"
+                shouldDispatchTrigger = true
+            } else {
+                action = "transport_pending_duplicate_suppressed"
+                shouldDispatchTrigger = false
+            }
         } else if evaluation.isDuplicate {
             action = "duplicate_suppressed"
+            shouldDispatchTrigger = false
         } else if evaluation.isChangeLocked {
             action = "locked_waiting_for_rearm"
+            shouldDispatchTrigger = false
         } else if evaluation.isAwaitingConfirmation {
             action = "confirmation_pending"
+            shouldDispatchTrigger = false
         } else {
             action = "symbol_empty_no_subscribe"
+            shouldDispatchTrigger = false
         }
 
-        if evaluation.shouldBeep {
+        if shouldDispatchTrigger {
+            let triggerEvent = OCRPipelineEvent(
+                kind: .trigger,
+                frameNumber: frameCount,
+                region: OCRRegionKind.manualSymbolCell.rawValue,
+                action: action,
+                rawText: recognition.rawText,
+                normalizedText: recognition.normalizedText,
+                confidence: recognition.confidence,
+                symbol: evaluation.normalizedSymbol,
+                parsedInteger: nil,
+                isDuplicate: evaluation.isDuplicate,
+                isZeroOrEmpty: nil,
+                presentationTimeSeconds: timings?.presentationTimeSeconds
+            )
+            eventHandler?(triggerEvent)
+            startPendingSubscribeTransport(
+                triggerEvent: triggerEvent,
+                symbol: evaluation.normalizedSymbol
+            )
+        }
+
+        if shouldDispatchTrigger || evaluation.shouldBeep {
             beep()
         }
 
@@ -893,6 +885,161 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
                     "symbol=\"\(escapedForLog(evaluation.normalizedSymbol))\" confidence=\(format(recognition.confidence, precision: 3)) " +
                     "duplicate=\(evaluation.isDuplicate) confirmation=\(evaluation.confirmationProgress)/\(evaluation.requiredConfirmationCount)"
             )
+        }
+    }
+
+    private func startPendingBuyTransport(
+        triggerEvent: OCRPipelineEvent,
+        integerValue: Int?,
+        timings: TriggerStageTimings?,
+        triggerEvaluationMilliseconds: Double,
+        buyDecisionMilliseconds: Double
+    ) {
+        pendingBuyTransport = PendingBuyTransport(
+            integerValue: integerValue,
+            triggerEvent: triggerEvent,
+            timings: timings,
+            triggerEvaluationMilliseconds: triggerEvaluationMilliseconds,
+            buyDecisionMilliseconds: buyDecisionMilliseconds
+        )
+
+        messageSender.send(TradingWebSocketContract.buyMessage, event: "BUY") { result in
+            self.handleBuyTransportResult(result)
+        }
+    }
+
+    private func handleBuyTransportResult(_ result: Result<Void, any Error>) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+
+        guard let pendingBuyTransport else {
+            return
+        }
+        self.pendingBuyTransport = nil
+
+        if messageSender.reportsTransportOutcomes {
+            let action = transportAction(for: result, success: "buy_transport_succeeded", failure: "buy_transport_failed")
+            eventHandler?(transportOutcomeEvent(from: pendingBuyTransport.triggerEvent, action: action))
+        }
+
+        if let timings = pendingBuyTransport.timings {
+            let sendCompletionTimestamp = CFAbsoluteTimeGetCurrent()
+            let frameIngressToRegionMilliseconds = max(
+                0,
+                (timings.regionStartTimestamp - timings.frameIngressTimestamp) * 1_000
+            )
+            let wsSendCompletionMilliseconds = max(
+                0,
+                (sendCompletionTimestamp - timings.frameIngressTimestamp) * 1_000
+            )
+            let ocrToCompletionMilliseconds = max(
+                0,
+                (sendCompletionTimestamp - timings.ocrDetectedTimestamp) * 1_000
+            )
+            let sendResult = transportResultLabel(for: result)
+            let sendErrorSuffix = transportErrorSuffix(for: result)
+
+            if loggingEnabled {
+                print(
+                    "[latency] frame=\(pendingBuyTransport.triggerEvent.frameNumber) event=BUY send_result=\(sendResult) " +
+                        "frame_ingress_to_region_ms=\(format(frameIngressToRegionMilliseconds)) " +
+                        "crop_ms=\(format(timings.cropMilliseconds)) metal_ms=\(format(timings.metalMilliseconds)) " +
+                        "fingerprint_ms=\(format(timings.fingerprintMilliseconds)) " +
+                        "gating_ms=\(format(timings.gatingMilliseconds)) " +
+                        "ocr_ms=\(format(timings.ocrMilliseconds)) " +
+                        "trigger_eval_ms=\(format(pendingBuyTransport.triggerEvaluationMilliseconds)) " +
+                        "buy_decision_ms=\(format(pendingBuyTransport.buyDecisionMilliseconds)) " +
+                        "ws_send_completion_ms=\(format(wsSendCompletionMilliseconds)) " +
+                        "ocr_to_completion_ms=\(format(ocrToCompletionMilliseconds)) " +
+                        "total_end_to_end_ms=\(format(wsSendCompletionMilliseconds))\(sendErrorSuffix)"
+                )
+            }
+        }
+
+        if case .success = result {
+            triggerStateMachine.commitManualCellTriggerSuccess()
+        }
+    }
+
+    private func startPendingSubscribeTransport(
+        triggerEvent: OCRPipelineEvent,
+        symbol: String
+    ) {
+        pendingSubscribeTransport = PendingSubscribeTransport(symbol: symbol, triggerEvent: triggerEvent)
+        let message = TradingWebSocketContract.subscribeMessage(symbol: symbol)
+        messageSender.send(message, event: "SUBSCRIBE") { result in
+            self.handleSubscribeTransportResult(result)
+        }
+    }
+
+    private func handleSubscribeTransportResult(_ result: Result<Void, any Error>) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+
+        guard let pendingSubscribeTransport else {
+            return
+        }
+        self.pendingSubscribeTransport = nil
+
+        if messageSender.reportsTransportOutcomes {
+            let action = transportAction(
+                for: result,
+                success: "subscribe_transport_succeeded",
+                failure: "subscribe_transport_failed"
+            )
+            eventHandler?(transportOutcomeEvent(from: pendingSubscribeTransport.triggerEvent, action: action))
+        }
+
+        if case .success = result {
+            triggerStateMachine.commitManualSymbolTriggerSuccess(symbol: pendingSubscribeTransport.symbol)
+        }
+    }
+
+    private func transportOutcomeEvent(from triggerEvent: OCRPipelineEvent, action: String) -> OCRPipelineEvent {
+        OCRPipelineEvent(
+            kind: .trigger,
+            frameNumber: triggerEvent.frameNumber,
+            region: triggerEvent.region,
+            action: action,
+            rawText: triggerEvent.rawText,
+            normalizedText: triggerEvent.normalizedText,
+            confidence: triggerEvent.confidence,
+            symbol: triggerEvent.symbol,
+            parsedInteger: triggerEvent.parsedInteger,
+            isDuplicate: triggerEvent.isDuplicate,
+            isZeroOrEmpty: triggerEvent.isZeroOrEmpty,
+            presentationTimeSeconds: triggerEvent.presentationTimeSeconds
+        )
+    }
+
+    private func transportAction(
+        for result: Result<Void, any Error>,
+        success: String,
+        failure: String
+    ) -> String {
+        switch result {
+        case .success:
+            success
+        case .failure:
+            failure
+        }
+    }
+
+    private func transportResultLabel(for result: Result<Void, any Error>) -> String {
+        switch result {
+        case .success:
+            "success"
+        case .failure:
+            "failure"
+        }
+    }
+
+    private func transportErrorSuffix(for result: Result<Void, any Error>) -> String {
+        switch result {
+        case .success:
+            ""
+        case let .failure(error):
+            " send_error=\"\(escapedForLog(error.localizedDescription))\""
         }
     }
 
