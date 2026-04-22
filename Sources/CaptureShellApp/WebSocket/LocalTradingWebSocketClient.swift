@@ -44,6 +44,7 @@ enum TradingWebSocketEndpoint {
 
 final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unchecked Sendable {
     private struct PendingSend {
+        let id: Int
         let payload: String
         let event: String
         let completion: @Sendable (Result<Void, any Error>) -> Void
@@ -52,49 +53,45 @@ final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unche
     private let endpointURL: URL
     private let lock = NSLock()
 
-    private lazy var session: URLSession = {
+    private var session: URLSession?
+
+    private func makeSession() -> URLSession {
         let delegateQueue = OperationQueue()
         delegateQueue.maxConcurrentOperationCount = 1
         delegateQueue.qualityOfService = .userInitiated
         return URLSession(configuration: .default, delegate: self, delegateQueue: delegateQueue)
-    }()
+    }
 
     private var task: URLSessionWebSocketTask?
     private var isConnected = false
     private var isConnecting = false
     private var isSending = false
+    private var currentSend: PendingSend?
     private var pendingSends: [PendingSend] = []
+    private var nextSendID = 0
 
-    init(endpointURL: URL = TradingWebSocketEndpoint.resolve()) {
+    init(endpointURL: URL = TradingWebSocketEndpoint.resolve(), connectOnInit: Bool = true) {
         self.endpointURL = endpointURL
         super.init()
-        connectIfNeeded()
+        if connectOnInit {
+            connectIfNeeded()
+        }
     }
 
     var reportsTransportOutcomes: Bool { true }
 
     deinit {
-        lock.lock()
-        let activeTask = task
-        let queuedSends = pendingSends
-        task = nil
-        isConnected = false
-        isConnecting = false
-        isSending = false
-        pendingSends.removeAll()
-        lock.unlock()
+        let cancelledSends = failOutstandingSends(with: WebSocketSendError.cancelled, cancelActiveTask: true)
+        session?.invalidateAndCancel()
 
-        activeTask?.cancel(with: .goingAway, reason: nil)
-        session.invalidateAndCancel()
-
-        for pending in queuedSends {
+        for pending in cancelledSends {
             pending.completion(.failure(WebSocketSendError.cancelled))
         }
     }
 
     func send(_ payload: String, event: String, completion: @escaping @Sendable (Result<Void, any Error>) -> Void) {
         lock.lock()
-        pendingSends.append(PendingSend(payload: payload, event: event, completion: completion))
+        pendingSends.append(makePendingSend(payload: payload, event: event, completion: completion))
         lock.unlock()
 
         connectIfNeeded()
@@ -110,13 +107,22 @@ final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unche
             }
             Thread.sleep(forTimeInterval: 0.01)
         }
-        return isIdle
+
+        if isIdle {
+            return true
+        }
+
+        let timedOutSends = failOutstandingSends(with: WebSocketSendError.timedOut, cancelActiveTask: true)
+        for pending in timedOutSends {
+            pending.completion(.failure(WebSocketSendError.timedOut))
+        }
+        return false
     }
 
     private var isIdle: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return pendingSends.isEmpty && !isSending && !isConnecting
+        return pendingSends.isEmpty && currentSend == nil && !isSending && !isConnecting
     }
 
     private var hasPendingSends: Bool {
@@ -129,6 +135,8 @@ final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unche
         let taskToStart: URLSessionWebSocketTask?
         lock.lock()
         if task == nil, !isConnecting {
+            let session = self.session ?? makeSession()
+            self.session = session
             let createdTask = session.webSocketTask(with: endpointURL)
             task = createdTask
             isConnecting = true
@@ -158,6 +166,7 @@ final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unche
         {
             isSending = true
             pendingSends.removeFirst()
+            currentSend = pending
             nextSend = (task, pending)
         } else {
             nextSend = nil
@@ -170,12 +179,12 @@ final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unche
 
         nextSend.task.send(.string(nextSend.pending.payload)) { error in
             if let error {
+                guard let failedSend = self.finishCurrentSendIfMatching(id: nextSend.pending.id) else {
+                    return
+                }
                 self.handleTransportError(task: nextSend.task, error: error)
-                print("[ws] send_failed event=\(nextSend.pending.event) error=\(error.localizedDescription)")
-                nextSend.pending.completion(.failure(error))
-                self.lock.lock()
-                self.isSending = false
-                self.lock.unlock()
+                print("[ws] send_failed event=\(failedSend.event) error=\(error.localizedDescription)")
+                failedSend.completion(.failure(error))
                 if self.hasPendingSends {
                     self.connectIfNeeded()
                     self.flushPendingSendsIfPossible()
@@ -183,11 +192,12 @@ final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unche
                 return
             }
 
-            print("[ws] sent event=\(nextSend.pending.event) payload=\(nextSend.pending.payload)")
-            nextSend.pending.completion(.success(()))
-            self.lock.lock()
-            self.isSending = false
-            self.lock.unlock()
+            guard let sentSend = self.finishCurrentSendIfMatching(id: nextSend.pending.id) else {
+                return
+            }
+
+            print("[ws] sent event=\(sentSend.event) payload=\(sentSend.payload)")
+            sentSend.completion(.success(()))
             self.flushPendingSendsIfPossible()
         }
     }
@@ -238,11 +248,79 @@ final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unche
             connectIfNeeded()
         }
     }
+
+    private func makePendingSend(
+        payload: String,
+        event: String,
+        completion: @escaping @Sendable (Result<Void, any Error>) -> Void
+    ) -> PendingSend {
+        let pending = PendingSend(id: nextSendID, payload: payload, event: event, completion: completion)
+        nextSendID += 1
+        return pending
+    }
+
+    private func finishCurrentSendIfMatching(id: Int) -> PendingSend? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let currentSend, currentSend.id == id else {
+            return nil
+        }
+        self.currentSend = nil
+        isSending = false
+        return currentSend
+    }
+
+    private func failOutstandingSends(with error: WebSocketSendError, cancelActiveTask: Bool) -> [PendingSend] {
+        let activeTask: URLSessionWebSocketTask?
+        let outstandingSends: [PendingSend]
+
+        lock.lock()
+        activeTask = cancelActiveTask ? task : nil
+        outstandingSends = (currentSend.map { [$0] } ?? []) + pendingSends
+        task = nil
+        isConnected = false
+        isConnecting = false
+        isSending = false
+        currentSend = nil
+        pendingSends.removeAll()
+        lock.unlock()
+
+        if cancelActiveTask {
+            activeTask?.cancel(with: .goingAway, reason: nil)
+            if !outstandingSends.isEmpty {
+                print("[ws] failing_outstanding_sends reason=\(error.localizedDescription)")
+            }
+        }
+
+        return outstandingSends
+    }
+
+    func enqueuePendingSendForTesting(
+        payload: String,
+        event: String,
+        completion: @escaping @Sendable (Result<Void, any Error>) -> Void
+    ) {
+        lock.lock()
+        pendingSends.append(makePendingSend(payload: payload, event: event, completion: completion))
+        lock.unlock()
+    }
+
+    func beginInFlightSendForTesting(
+        payload: String,
+        event: String,
+        completion: @escaping @Sendable (Result<Void, any Error>) -> Void
+    ) {
+        lock.lock()
+        currentSend = makePendingSend(payload: payload, event: event, completion: completion)
+        isSending = true
+        lock.unlock()
+    }
 }
 
 private enum WebSocketSendError: LocalizedError {
     case notConnected
     case cancelled
+    case timedOut
 
     var errorDescription: String? {
         switch self {
@@ -250,6 +328,8 @@ private enum WebSocketSendError: LocalizedError {
             "WebSocket is not connected."
         case .cancelled:
             "WebSocket sender was cancelled before pending messages were delivered."
+        case .timedOut:
+            "WebSocket sender timed out before pending messages were delivered."
         }
     }
 }

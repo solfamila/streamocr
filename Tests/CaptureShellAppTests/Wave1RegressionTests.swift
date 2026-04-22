@@ -36,6 +36,70 @@ struct TradingWebSocketContractTests {
     }
 }
 
+struct LocalTradingWebSocketClientTests {
+    @Test
+    func waitForPendingMessagesTimeoutFailsInFlightAndQueuedSends() throws {
+        let endpointURL = try #require(URL(string: "ws://localhost:65535"))
+        let client = LocalTradingWebSocketClient(endpointURL: endpointURL, connectOnInit: false)
+        let recorder = CompletionResultRecorder()
+
+        client.beginInFlightSendForTesting(payload: TradingWebSocketContract.buyMessage, event: "BUY") { result in
+            recorder.record(label: "BUY", result: result)
+        }
+        client.enqueuePendingSendForTesting(payload: #"{"subscribe":"PLRZ"}"#, event: "SUBSCRIBE") { result in
+            recorder.record(label: "SUBSCRIBE", result: result)
+        }
+
+        #expect(client.waitForPendingMessages(timeout: 0) == false)
+        #expect(
+            recorder.results == [
+                "BUY: WebSocket sender timed out before pending messages were delivered.",
+                "SUBSCRIBE: WebSocket sender timed out before pending messages were delivered."
+            ]
+        )
+    }
+
+    @Test
+    func deinitFailsInFlightAndQueuedSendsWithCancelledError() throws {
+        let endpointURL = try #require(URL(string: "ws://localhost:65535"))
+        let recorder = CompletionResultRecorder()
+
+        do {
+            let client = LocalTradingWebSocketClient(endpointURL: endpointURL, connectOnInit: false)
+            client.beginInFlightSendForTesting(payload: TradingWebSocketContract.buyMessage, event: "BUY") { result in
+                recorder.record(label: "BUY", result: result)
+            }
+            client.enqueuePendingSendForTesting(payload: #"{"subscribe":"PLRZ"}"#, event: "SUBSCRIBE") { result in
+                recorder.record(label: "SUBSCRIBE", result: result)
+            }
+            _ = client
+        }
+
+        #expect(
+            recorder.results == [
+                "BUY: WebSocket sender was cancelled before pending messages were delivered.",
+                "SUBSCRIBE: WebSocket sender was cancelled before pending messages were delivered."
+            ]
+        )
+    }
+}
+
+private final class CompletionResultRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var results: [String] = []
+
+    func record(label: String, result: Result<Void, any Error>) {
+        lock.lock()
+        defer { lock.unlock() }
+        switch result {
+        case .success:
+            results.append("\(label): success")
+        case let .failure(error):
+            results.append("\(label): \(error.localizedDescription)")
+        }
+    }
+}
+
 struct NanocosmosStreamResolverTests {
     @Test
     func derivesPlayablePlaylistCandidatesFromSeedURL() throws {
