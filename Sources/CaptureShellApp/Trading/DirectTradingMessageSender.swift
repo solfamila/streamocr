@@ -63,7 +63,12 @@ final class DirectTradingMessageSender: TradingMessageSending, @unchecked Sendab
         else {
             throw TradingRuntimeManagerError.actionFailed("Missing subscribe symbol in OCR payload.")
         }
-        return symbol
+
+        guard let normalized = TradingMessageContract.normalizedOCRSymbol(symbol), normalized == symbol else {
+            throw TradingRuntimeManagerError.actionFailed("Invalid subscribe symbol in OCR payload.")
+        }
+
+        return normalized
     }
 
     private var pendingOperationCount: Int {

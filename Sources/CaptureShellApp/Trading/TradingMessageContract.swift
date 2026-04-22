@@ -42,13 +42,18 @@ enum TradingMessageContract {
         var droppedDigitCount = 0
 
         for character in symbol.uppercased() {
-            if character.isLetter {
-                normalized.append(character)
+            if let asciiLetter = asciiUppercaseLetter(character) {
+                normalized.append(asciiLetter)
                 continue
             }
 
-            if character.isNumber {
+            if isDigit(character) {
                 droppedDigitCount += 1
+                droppedAlphanumericCount += 1
+                continue
+            }
+
+            if isNonASCIILetterOrDigit(character) {
                 droppedAlphanumericCount += 1
                 continue
             }
@@ -70,5 +75,32 @@ enum TradingMessageContract {
             return nil
         }
         return #"{"subscribe":"\#(normalized)"}"#
+    }
+
+    private static func asciiUppercaseLetter(_ character: Character) -> Character? {
+        guard
+            character.unicodeScalars.count == 1,
+            let scalar = character.unicodeScalars.first,
+            scalar.isASCII,
+            scalar.value >= 65,
+            scalar.value <= 90
+        else {
+            return nil
+        }
+        return character
+    }
+
+    private static func isDigit(_ character: Character) -> Bool {
+        String(character).rangeOfCharacter(from: .decimalDigits) != nil
+    }
+
+    private static func isNonASCIILetterOrDigit(_ character: Character) -> Bool {
+        guard !character.isASCII else {
+            return false
+        }
+
+        let characterString = String(character)
+        return characterString.rangeOfCharacter(from: .letters) != nil
+            || characterString.rangeOfCharacter(from: .decimalDigits) != nil
     }
 }

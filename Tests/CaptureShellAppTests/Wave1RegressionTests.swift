@@ -24,6 +24,17 @@ struct TradingMessageContractTests {
     }
 
     @Test
+    func subscribeMessageRejectsNonASCIILetters() {
+        #expect(TradingMessageContract.subscribeMessage(symbol: "ÅAPL") == nil)
+
+        let analysis = TradingMessageContract.analyzeSymbol("ÅAPL")
+        #expect(analysis.normalized == "APL")
+        #expect(analysis.droppedAlphanumericCount == 1)
+        #expect(analysis.droppedDigitCount == 0)
+        #expect(analysis.shouldRejectOCRCandidate)
+    }
+
+    @Test
     func normalizeSymbolRejectsDroppedAlphanumericOCRCandidates() {
         #expect(TradingMessageContract.normalizeSymbol("PLR2") == "")
         #expect(TradingMessageContract.normalizedOCRSymbol("P1LRZ") == nil)
