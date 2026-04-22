@@ -55,21 +55,26 @@ swift run CaptureShellApp \
   --seed-url 'wss://bintu-h5live.nanocosmos.de/h5live/stream/stream.mp4?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=433201&pid=72860723635' \
   --runtime-config /absolute/path/runtime-config.json \
   --run-seconds 5 \
-  --record-video /tmp/live-decoded.mp4 \
+  --record-video /tmp/live-source.mp4 \
+  --record-audio \
   --live-metadata-json /tmp/live-metadata.json \
   --result-json /tmp/live-result.json
 ```
 
 The live command derives the nanocosmos HTTP `stream.mp4` URL from the `wss://`
-seed, decodes frames with AVFoundation, and feeds those frames through the same
-OCR pipeline as offline analysis. It is dry-run by default: BUY/subscribe
-messages are discarded unless `--send-trading-messages` is explicitly supplied.
-If `--record-video` is set, the decoded frames are also written to an MP4 file
-while OCR is running. If `--live-metadata-json` is omitted but `--record-video`
-is set, a sibling `*.metadata.json` file is written automatically.
-When live transport is enabled, `triggerEvents` include truthful OCR decisions
-like `buy_triggered` / `subscribe_triggered` plus transport outcomes such as
-`buy_transport_succeeded` and `subscribe_transport_failed`.
+seed, prefers a direct `ffmpeg` decode path for live frames, and falls back to
+AVFoundation only if the direct decoder cannot produce video. Those decoded
+frames feed the same OCR pipeline as offline analysis. The CLI live analyzer is
+dry-run only: it records and analyzes, but does not place trades.
+If `--record-video` is set, the app starts a parallel ffmpeg recorder against
+the Nanocosmos source URL while OCR keeps decoding frames independently. That
+recorder is source-level, much closer to the Python forensics recorder than the
+older decoded-frame MP4 writer. If `--record-audio` is also supplied, the same
+source recording keeps the audio track instead of capturing and muxing audio
+separately. If `--live-metadata-json` is omitted but `--record-video` is set, a
+sibling `*.metadata.json` file is written automatically.
+The AppKit capture window is the path that routes OCR `BUY` / `SUBSCRIBE`
+signals directly into the in-process trading runtime.
 
 ### Benchmark the PLRZ Fixture
 
@@ -127,7 +132,8 @@ work. If the numeric cell or sampled symbol cell is unchanged, the cached
 recognition is replayed into the trigger state machine so multi-frame
 confirmation still works without rerunning OCR.
 
-In live JSON results, `playbackURL` is the actual AVAsset playback URL used by
-the player. That usually matches `playlistURL`, but the analyzer can fall back
-to a direct `stream.mp4` playback URL if playlist playback stalls. `streamURL`
+In live JSON results, `playbackURL` is the actual URL used by the active live
+decoder. With the direct decoder path, that is usually the resolved
+`stream.mp4?...` source derived from the seed. If the analyzer falls back to
+AVFoundation, `playbackURL` can be the playlist URL instead. `streamURL`
 remains the resolved media segment URL from the playlist.

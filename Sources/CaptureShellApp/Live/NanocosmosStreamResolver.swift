@@ -39,14 +39,20 @@ enum NanocosmosStreamResolver {
             do {
                 let playlistText = try fetchPlaylist(url: playlistURL, timeoutSeconds: timeoutSeconds)
                 let streamURL = try streamURL(fromPlaylist: playlistText, playlistURL: playlistURL)
+                let playbackURL = preferredPlaybackURL(
+                    playlistText: playlistText,
+                    playlistURL: playlistURL,
+                    streamURL: streamURL,
+                    directPlaybackCandidates: directPlaybackCandidates
+                )
                 let alternatePlaybackURLs = deduplicatedPlaybackURLs(
-                    [streamURL] + directPlaybackCandidates,
-                    excluding: [playlistURL]
+                    [playlistURL, streamURL] + directPlaybackCandidates,
+                    excluding: [playbackURL]
                 )
                 return ResolvedLiveStream(
                     seedURL: seedURL,
                     playlistURL: playlistURL,
-                    playbackURL: playlistURL,
+                    playbackURL: playbackURL,
                     alternatePlaybackURLs: alternatePlaybackURLs,
                     streamURL: streamURL,
                     playlistText: playlistText
@@ -139,6 +145,39 @@ enum NanocosmosStreamResolver {
         }
 
         return streamURL
+    }
+
+    static func preferredPlaybackURL(
+        playlistText: String,
+        playlistURL: URL,
+        streamURL: URL,
+        directPlaybackCandidates: [URL]
+    ) -> URL {
+        guard playlistLooksFinite(playlistText) else {
+            return playlistURL
+        }
+
+        if let originalStyleDirectCandidate = directPlaybackCandidates.first(where: { $0.absoluteString.contains("url=") }) {
+            return originalStyleDirectCandidate
+        }
+
+        if let firstDirectCandidate = directPlaybackCandidates.first {
+            return firstDirectCandidate
+        }
+
+        return streamURL
+    }
+
+    static func playlistLooksFinite(_ playlistText: String) -> Bool {
+        let lines = playlistText
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
+
+        if lines.contains("#EXT-X-ENDLIST") {
+            return true
+        }
+
+        return lines.contains(where: { $0 == "#EXT-X-PLAYLIST-TYPE:VOD" })
     }
 
     private static func fetchPlaylist(url: URL, timeoutSeconds: TimeInterval) throws -> String {

@@ -1,6 +1,6 @@
 import Foundation
 
-enum TradingWebSocketContractError: Error, LocalizedError {
+enum TradingMessageContractError: Error, LocalizedError {
     case invalidSymbol(String)
 
     var errorDescription: String? {
@@ -21,7 +21,7 @@ struct SymbolNormalizationAnalysis: Equatable, Sendable {
     }
 }
 
-enum TradingWebSocketContract {
+enum TradingMessageContract {
     static let buyMessage = #"{"action":"BUY"}"#
 
     static func normalizeSymbol(_ symbol: String) -> String {

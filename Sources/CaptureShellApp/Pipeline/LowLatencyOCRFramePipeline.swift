@@ -325,7 +325,7 @@ final class TradingTriggerStateMachine {
     }
 
     func evaluateManualSymbol(normalizedText: String, confidence: Double) -> ManualSymbolTriggerEvaluation {
-        let normalizedSymbol = TradingWebSocketContract.normalizedOCRSymbol(normalizedText) ?? ""
+        let normalizedSymbol = TradingMessageContract.normalizedOCRSymbol(normalizedText) ?? ""
         let isDuplicate = !normalizedSymbol.isEmpty && normalizedSymbol == lastCommittedManualSymbol
         let hasCommittedSymbol = lastCommittedManualSymbol != nil
         let isLowConfidenceChangedSymbol =
@@ -382,7 +382,7 @@ final class TradingTriggerStateMachine {
     }
 
     func commitManualSymbolTriggerSuccess(symbol: String) {
-        lastCommittedManualSymbol = TradingWebSocketContract.normalizeSymbol(symbol)
+        lastCommittedManualSymbol = TradingMessageContract.normalizeSymbol(symbol)
         pendingManualSymbol = nil
         pendingManualSymbolConfirmationCount = 0
         manualSymbolChangeIsArmed = false
@@ -405,6 +405,42 @@ private struct TriggerStageTimings {
     let fingerprintMilliseconds: Double
     let gatingMilliseconds: Double
     let ocrMilliseconds: Double
+}
+
+private struct ChangedRecognitionContext {
+    let frameNumber: Int
+    let region: OCRRegionKind
+    let fingerprint: UInt64
+    let frameIngressTimestamp: CFAbsoluteTime
+    let regionStartTimestamp: CFAbsoluteTime
+    let presentationTimeSeconds: Double?
+    let cropMilliseconds: Double
+    let metalMilliseconds: Double
+    let fingerprintMilliseconds: Double
+    let gatingMilliseconds: Double
+    let symbolGeneration: UInt64
+}
+
+private struct DeferredSymbolReplay {
+    let frameNumber: Int
+    let fingerprint: UInt64
+    let frameIngressTimestamp: CFAbsoluteTime
+    let regionStartTimestamp: CFAbsoluteTime
+    let presentationTimeSeconds: Double?
+    let cropMilliseconds: Double
+    let metalMilliseconds: Double
+    let fingerprintMilliseconds: Double
+    let gatingMilliseconds: Double
+    let shouldLogEvaluation: Bool
+    let symbolGeneration: UInt64
+}
+
+private final class AsyncPixelBufferBox: @unchecked Sendable {
+    let pixelBuffer: CVPixelBuffer
+
+    init(pixelBuffer: CVPixelBuffer) {
+        self.pixelBuffer = pixelBuffer
+    }
 }
 
 private struct PendingBuyTransport {
@@ -437,12 +473,15 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
     private let loggingEnabled: Bool
     private let unchangedLogCadence: Int
     private let manualSymbolSamplingIntervalFrames: Int
-    private let recognizer: any OCRTextRecognizing
+    private let asyncSymbolRecognitionEnabled: Bool
+    private let manualCellRecognizer: any OCRTextRecognizing
+    private let manualSymbolRecognizer: any OCRTextRecognizing
     private let messageSender: any TradingMessageSending
     private let beep: @Sendable () -> Void
     private let eventHandler: OCRPipelineEventHandler?
     private let stateLock = NSRecursiveLock()
     private let triggerStateMachine: TradingTriggerStateMachine
+    private let symbolRecognitionQueue = DispatchQueue(label: "capture-shell.symbol-ocr", qos: .userInitiated)
 
     private var frameCount = 0
     private var didLogBackend = false
@@ -451,6 +490,8 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
     private var unchangedStreakByRegion: [OCRRegionKind: Int] = [:]
     private var pendingBuyTransport: PendingBuyTransport?
     private var pendingSubscribeTransport: PendingSubscribeTransport?
+    private var symbolGeneration: UInt64 = 0
+    private var deferredSymbolReplay: DeferredSymbolReplay?
 
     init(
         loggingEnabled: Bool = true,
@@ -460,7 +501,9 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         manualSymbolSamplingIntervalFrames: Int = 30,
         manualSymbolTriggerConfirmationFrames: Int = 2,
         recognizer: any OCRTextRecognizing = FontTemplateTextRecognizer(),
-        messageSender: any TradingMessageSending = LocalTradingWebSocketClient(),
+        symbolRecognizer: (any OCRTextRecognizing)? = nil,
+        asyncSymbolRecognitionEnabled: Bool? = nil,
+        messageSender: any TradingMessageSending = DiscardingTradingMessageSender(),
         beep: @escaping @Sendable () -> Void = {
             DispatchQueue.main.async {
                 NSSound.beep()
@@ -488,7 +531,21 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             manualCellTriggerConfirmationFrames: manualCellTriggerConfirmationFrames,
             manualSymbolTriggerConfirmationFrames: manualSymbolTriggerConfirmationFrames
         )
-        self.recognizer = recognizer
+        manualCellRecognizer = recognizer
+        if let symbolRecognizer {
+            manualSymbolRecognizer = symbolRecognizer
+        } else if recognizer is FontTemplateTextRecognizer {
+            manualSymbolRecognizer = FontTemplateTextRecognizer()
+        } else {
+            manualSymbolRecognizer = recognizer
+        }
+        if let asyncSymbolRecognitionEnabled {
+            self.asyncSymbolRecognitionEnabled = asyncSymbolRecognitionEnabled
+        } else {
+            self.asyncSymbolRecognitionEnabled =
+                recognizer is FontTemplateTextRecognizer ||
+                manualSymbolRecognizer is FontTemplateTextRecognizer
+        }
         self.messageSender = messageSender
         self.beep = beep
         self.eventHandler = eventHandler
@@ -505,6 +562,8 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         unchangedStreakByRegion.removeAll(keepingCapacity: true)
         pendingBuyTransport = nil
         pendingSubscribeTransport = nil
+        symbolGeneration &+= 1
+        deferredSymbolReplay = nil
         triggerStateMachine.reset()
     }
 
@@ -533,6 +592,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             lastFingerprintByRegion.removeValue(forKey: .manualSymbolCell)
             lastRecognitionByRegion.removeValue(forKey: .manualSymbolCell)
             unchangedStreakByRegion.removeValue(forKey: .manualSymbolCell)
+            deferredSymbolReplay = nil
             triggerStateMachine.clearManualSymbolState()
         }
 
@@ -612,6 +672,24 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
                         "total_ms=\(format(totalMilliseconds))"
                 )
             }
+
+            if region == .manualSymbolCell, lastRecognitionByRegion[region] == nil {
+                deferredSymbolReplay = DeferredSymbolReplay(
+                    frameNumber: frameCount,
+                    fingerprint: fingerprint,
+                    frameIngressTimestamp: frameIngressTimestamp,
+                    regionStartTimestamp: regionStartTimestamp,
+                    presentationTimeSeconds: presentationTimeSeconds,
+                    cropMilliseconds: preprocessResult.cropMilliseconds,
+                    metalMilliseconds: preprocessResult.metalMilliseconds,
+                    fingerprintMilliseconds: fingerprintMilliseconds,
+                    gatingMilliseconds: gatingMilliseconds,
+                    shouldLogEvaluation: loggingEnabled && (streak == 1 || streak.isMultiple(of: unchangedLogCadence)),
+                    symbolGeneration: symbolGeneration
+                )
+                return
+            }
+
             replayCachedRecognitionForTriggerIfNeeded(
                 region: region,
                 frameIngressTimestamp: frameIngressTimestamp,
@@ -626,62 +704,45 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             return
         }
 
+        if region == .manualSymbolCell {
+            deferredSymbolReplay = nil
+        }
         lastFingerprintByRegion[region] = fingerprint
         unchangedStreakByRegion[region] = 0
         let gatingMilliseconds = elapsedMilliseconds(since: gatingStart)
-
-        let ocrStart = CFAbsoluteTimeGetCurrent()
-        let recognition = recognizeText(in: preprocessResult.pixelBuffer, region: region)
-        let ocrMilliseconds = elapsedMilliseconds(since: ocrStart)
-        let ocrDetectedTimestamp = CFAbsoluteTimeGetCurrent()
-        let totalMilliseconds = elapsedMilliseconds(since: regionStartTimestamp)
-        lastRecognitionByRegion[region] = recognition
-
-        let escapedNormalizedText = escapedForLog(recognition.normalizedText)
-        let escapedRawText = escapedForLog(recognition.rawText)
-        if loggingEnabled {
-            print(
-                    "[ocr] frame=\(frameCount) region=\(region.rawValue) gate=changed skip_ocr=false " +
-                    "fingerprint=\(fingerprintHex(fingerprint)) crop_ms=\(format(preprocessResult.cropMilliseconds)) " +
-                    "metal_ms=\(format(preprocessResult.metalMilliseconds)) fingerprint_ms=\(format(fingerprintMilliseconds)) " +
-                    "gating_ms=\(format(gatingMilliseconds)) " +
-                    "ocr_ms=\(format(ocrMilliseconds)) total_ms=\(format(totalMilliseconds)) " +
-                    "raw_text=\"\(escapedRawText)\" normalized_text=\"\(escapedNormalizedText)\" " +
-                    "confidence=\(format(recognition.confidence, precision: 3))"
-            )
-        }
-
-        eventHandler?(
-            OCRPipelineEvent(
-                kind: .recognition,
-                frameNumber: frameCount,
-                region: region.rawValue,
-                action: "ocr_changed",
-                rawText: recognition.rawText,
-                normalizedText: recognition.normalizedText,
-                confidence: recognition.confidence,
-                symbol: region == .manualSymbolCell ? TradingWebSocketContract.normalizedOCRSymbol(recognition.normalizedText) : nil,
-                parsedInteger: region == .manualCell ? ManualCellIntegerPolicy.parseInteger(recognition.normalizedText) : nil,
-                isDuplicate: nil,
-                isZeroOrEmpty: nil,
-                presentationTimeSeconds: presentationTimeSeconds
-            )
+        let context = ChangedRecognitionContext(
+            frameNumber: frameCount,
+            region: region,
+            fingerprint: fingerprint,
+            frameIngressTimestamp: frameIngressTimestamp,
+            regionStartTimestamp: regionStartTimestamp,
+            presentationTimeSeconds: presentationTimeSeconds,
+            cropMilliseconds: preprocessResult.cropMilliseconds,
+            metalMilliseconds: preprocessResult.metalMilliseconds,
+            fingerprintMilliseconds: fingerprintMilliseconds,
+            gatingMilliseconds: gatingMilliseconds,
+            symbolGeneration: symbolGeneration
         )
 
-        handleTriggerBehavior(
-            for: region,
+        if region == .manualSymbolCell, asyncSymbolRecognitionEnabled {
+            enqueueAsyncSymbolRecognition(pixelBuffer: preprocessResult.pixelBuffer, context: context)
+            return
+        }
+
+        let ocrStart = CFAbsoluteTimeGetCurrent()
+        let recognition = recognizeText(
+            in: preprocessResult.pixelBuffer,
+            region: region,
+            recognizer: recognizer(for: region)
+        )
+        let ocrMilliseconds = elapsedMilliseconds(since: ocrStart)
+        let ocrDetectedTimestamp = CFAbsoluteTimeGetCurrent()
+
+        processChangedRecognition(
             recognition: recognition,
-            timings: TriggerStageTimings(
-                frameIngressTimestamp: frameIngressTimestamp,
-                regionStartTimestamp: regionStartTimestamp,
-                ocrDetectedTimestamp: ocrDetectedTimestamp,
-                presentationTimeSeconds: presentationTimeSeconds,
-                cropMilliseconds: preprocessResult.cropMilliseconds,
-                metalMilliseconds: preprocessResult.metalMilliseconds,
-                fingerprintMilliseconds: fingerprintMilliseconds,
-                gatingMilliseconds: gatingMilliseconds,
-                ocrMilliseconds: ocrMilliseconds
-            ),
+            context: context,
+            ocrMilliseconds: ocrMilliseconds,
+            ocrDetectedTimestamp: ocrDetectedTimestamp,
             shouldLogEvaluation: loggingEnabled
         )
     }
@@ -704,6 +765,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         let now = CFAbsoluteTimeGetCurrent()
         handleTriggerBehavior(
             for: region,
+            frameNumber: frameCount,
             recognition: recognition,
             timings: TriggerStageTimings(
                 frameIngressTimestamp: frameIngressTimestamp,
@@ -720,7 +782,20 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         )
     }
 
-    private func recognizeText(in pixelBuffer: CVPixelBuffer, region: OCRRegionKind) -> OCRRecognitionResult {
+    private func recognizer(for region: OCRRegionKind) -> any OCRTextRecognizing {
+        switch region {
+        case .manualCell:
+            manualCellRecognizer
+        case .manualSymbolCell:
+            manualSymbolRecognizer
+        }
+    }
+
+    private func recognizeText(
+        in pixelBuffer: CVPixelBuffer,
+        region: OCRRegionKind,
+        recognizer: any OCRTextRecognizing
+    ) -> OCRRecognitionResult {
         let recognition = recognizer.recognizeText(in: pixelBuffer, region: region)
         let normalizedText = OCRNormalizationPolicy.normalize(recognition.rawText, for: region)
         return OCRRecognitionResult(
@@ -730,8 +805,161 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         )
     }
 
+    private func enqueueAsyncSymbolRecognition(
+        pixelBuffer: CVPixelBuffer,
+        context: ChangedRecognitionContext
+    ) {
+        let pixelBufferBox = AsyncPixelBufferBox(pixelBuffer: pixelBuffer)
+        let recognizer = manualSymbolRecognizer
+        symbolRecognitionQueue.async { [weak self] in
+            guard let self else {
+                return
+            }
+
+            let ocrStart = CFAbsoluteTimeGetCurrent()
+            let recognition = self.recognizeText(
+                in: pixelBufferBox.pixelBuffer,
+                region: .manualSymbolCell,
+                recognizer: recognizer
+            )
+            let ocrMilliseconds = self.elapsedMilliseconds(since: ocrStart)
+            let ocrDetectedTimestamp = CFAbsoluteTimeGetCurrent()
+
+            self.finishAsyncSymbolRecognition(
+                recognition: recognition,
+                context: context,
+                ocrMilliseconds: ocrMilliseconds,
+                ocrDetectedTimestamp: ocrDetectedTimestamp
+            )
+        }
+    }
+
+    private func finishAsyncSymbolRecognition(
+        recognition: OCRRecognitionResult,
+        context: ChangedRecognitionContext,
+        ocrMilliseconds: Double,
+        ocrDetectedTimestamp: CFAbsoluteTime
+    ) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+
+        guard context.symbolGeneration == symbolGeneration else {
+            return
+        }
+
+        guard lastFingerprintByRegion[context.region] == context.fingerprint else {
+            return
+        }
+
+        processChangedRecognition(
+            recognition: recognition,
+            context: context,
+            ocrMilliseconds: ocrMilliseconds,
+            ocrDetectedTimestamp: ocrDetectedTimestamp,
+            shouldLogEvaluation: loggingEnabled
+        )
+        flushDeferredSymbolReplayIfNeeded(recognition: recognition)
+    }
+
+    private func processChangedRecognition(
+        recognition: OCRRecognitionResult,
+        context: ChangedRecognitionContext,
+        ocrMilliseconds: Double,
+        ocrDetectedTimestamp: CFAbsoluteTime,
+        shouldLogEvaluation: Bool
+    ) {
+        let totalMilliseconds = max(0, (ocrDetectedTimestamp - context.regionStartTimestamp) * 1_000)
+        lastRecognitionByRegion[context.region] = recognition
+
+        let escapedNormalizedText = escapedForLog(recognition.normalizedText)
+        let escapedRawText = escapedForLog(recognition.rawText)
+        if loggingEnabled {
+            print(
+                "[ocr] frame=\(context.frameNumber) region=\(context.region.rawValue) gate=changed skip_ocr=false " +
+                    "fingerprint=\(fingerprintHex(context.fingerprint)) crop_ms=\(format(context.cropMilliseconds)) " +
+                    "metal_ms=\(format(context.metalMilliseconds)) fingerprint_ms=\(format(context.fingerprintMilliseconds)) " +
+                    "gating_ms=\(format(context.gatingMilliseconds)) " +
+                    "ocr_ms=\(format(ocrMilliseconds)) total_ms=\(format(totalMilliseconds)) " +
+                    "raw_text=\"\(escapedRawText)\" normalized_text=\"\(escapedNormalizedText)\" " +
+                    "confidence=\(format(recognition.confidence, precision: 3))"
+            )
+        }
+
+        eventHandler?(
+            OCRPipelineEvent(
+                kind: .recognition,
+                frameNumber: context.frameNumber,
+                region: context.region.rawValue,
+                action: "ocr_changed",
+                rawText: recognition.rawText,
+                normalizedText: recognition.normalizedText,
+                confidence: recognition.confidence,
+                symbol: context.region == .manualSymbolCell ? TradingMessageContract.normalizedOCRSymbol(recognition.normalizedText) : nil,
+                parsedInteger: context.region == .manualCell ? ManualCellIntegerPolicy.parseInteger(recognition.normalizedText) : nil,
+                isDuplicate: nil,
+                isZeroOrEmpty: nil,
+                presentationTimeSeconds: context.presentationTimeSeconds
+            )
+        )
+
+        handleTriggerBehavior(
+            for: context.region,
+            frameNumber: context.frameNumber,
+            recognition: recognition,
+            timings: TriggerStageTimings(
+                frameIngressTimestamp: context.frameIngressTimestamp,
+                regionStartTimestamp: context.regionStartTimestamp,
+                ocrDetectedTimestamp: ocrDetectedTimestamp,
+                presentationTimeSeconds: context.presentationTimeSeconds,
+                cropMilliseconds: context.cropMilliseconds,
+                metalMilliseconds: context.metalMilliseconds,
+                fingerprintMilliseconds: context.fingerprintMilliseconds,
+                gatingMilliseconds: context.gatingMilliseconds,
+                ocrMilliseconds: ocrMilliseconds
+            ),
+            shouldLogEvaluation: shouldLogEvaluation
+        )
+    }
+
+    private func flushDeferredSymbolReplayIfNeeded(recognition: OCRRecognitionResult) {
+        guard let deferredSymbolReplay else {
+            return
+        }
+
+        guard deferredSymbolReplay.symbolGeneration == symbolGeneration else {
+            self.deferredSymbolReplay = nil
+            return
+        }
+
+        guard lastFingerprintByRegion[.manualSymbolCell] == deferredSymbolReplay.fingerprint else {
+            self.deferredSymbolReplay = nil
+            return
+        }
+
+        self.deferredSymbolReplay = nil
+        let now = CFAbsoluteTimeGetCurrent()
+        handleTriggerBehavior(
+            for: .manualSymbolCell,
+            frameNumber: deferredSymbolReplay.frameNumber,
+            recognition: recognition,
+            timings: TriggerStageTimings(
+                frameIngressTimestamp: deferredSymbolReplay.frameIngressTimestamp,
+                regionStartTimestamp: deferredSymbolReplay.regionStartTimestamp,
+                ocrDetectedTimestamp: now,
+                presentationTimeSeconds: deferredSymbolReplay.presentationTimeSeconds,
+                cropMilliseconds: deferredSymbolReplay.cropMilliseconds,
+                metalMilliseconds: deferredSymbolReplay.metalMilliseconds,
+                fingerprintMilliseconds: deferredSymbolReplay.fingerprintMilliseconds,
+                gatingMilliseconds: deferredSymbolReplay.gatingMilliseconds,
+                ocrMilliseconds: 0
+            ),
+            shouldLogEvaluation: deferredSymbolReplay.shouldLogEvaluation
+        )
+    }
+
     private func handleTriggerBehavior(
         for region: OCRRegionKind,
+        frameNumber: Int,
         recognition: OCRRecognitionResult,
         timings: TriggerStageTimings?,
         shouldLogEvaluation: Bool
@@ -739,12 +967,14 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         switch region {
         case .manualCell:
             handleManualCellBehavior(
+                frameNumber: frameNumber,
                 recognition: recognition,
                 timings: timings,
                 shouldLogEvaluation: shouldLogEvaluation
             )
         case .manualSymbolCell:
             handleManualSymbolBehavior(
+                frameNumber: frameNumber,
                 recognition: recognition,
                 timings: timings,
                 shouldLogEvaluation: shouldLogEvaluation
@@ -753,6 +983,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
     }
 
     private func handleManualCellBehavior(
+        frameNumber: Int,
         recognition: OCRRecognitionResult,
         timings: TriggerStageTimings?,
         shouldLogEvaluation: Bool
@@ -796,7 +1027,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         if shouldDispatchTrigger {
             let triggerEvent = OCRPipelineEvent(
                 kind: .trigger,
-                frameNumber: frameCount,
+                frameNumber: frameNumber,
                 region: OCRRegionKind.manualCell.rawValue,
                 action: action,
                 rawText: recognition.rawText,
@@ -824,7 +1055,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
 
         if shouldLogEvaluation {
             print(
-                "[trigger] frame=\(frameCount) region=\(OCRRegionKind.manualCell.rawValue) action=\(action) " +
+                "[trigger] frame=\(frameNumber) region=\(OCRRegionKind.manualCell.rawValue) action=\(action) " +
                     "raw_text=\"\(escapedForLog(recognition.rawText))\" normalized_text=\"\(escapedForLog(evaluation.normalizedText))\" " +
                     "confidence=\(format(recognition.confidence, precision: 3)) parsed_int=\(evaluation.integerValue.map(String.init) ?? "nil") " +
                     "confirmation=\(evaluation.confirmationProgress)/\(evaluation.requiredConfirmationCount) " +
@@ -835,6 +1066,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
     }
 
     private func handleManualSymbolBehavior(
+        frameNumber: Int,
         recognition: OCRRecognitionResult,
         timings: TriggerStageTimings?,
         shouldLogEvaluation: Bool
@@ -876,7 +1108,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         if shouldDispatchTrigger {
             let triggerEvent = OCRPipelineEvent(
                 kind: .trigger,
-                frameNumber: frameCount,
+                frameNumber: frameNumber,
                 region: OCRRegionKind.manualSymbolCell.rawValue,
                 action: action,
                 rawText: recognition.rawText,
@@ -901,7 +1133,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
 
         if shouldLogEvaluation {
             print(
-                "[trigger] frame=\(frameCount) region=\(OCRRegionKind.manualSymbolCell.rawValue) action=\(action) " +
+                "[trigger] frame=\(frameNumber) region=\(OCRRegionKind.manualSymbolCell.rawValue) action=\(action) " +
                     "raw_text=\"\(escapedForLog(recognition.rawText))\" normalized_text=\"\(escapedForLog(recognition.normalizedText))\" " +
                     "symbol=\"\(escapedForLog(evaluation.normalizedSymbol))\" confidence=\(format(recognition.confidence, precision: 3)) " +
                     "duplicate=\(evaluation.isDuplicate) confirmation=\(evaluation.confirmationProgress)/\(evaluation.requiredConfirmationCount)"
@@ -924,7 +1156,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             buyDecisionMilliseconds: buyDecisionMilliseconds
         )
 
-        messageSender.send(TradingWebSocketContract.buyMessage, event: "BUY") { result in
+        messageSender.send(TradingMessageContract.buyMessage, event: "BUY") { result in
             self.handleBuyTransportResult(result)
         }
     }
@@ -970,7 +1202,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
                         "ocr_ms=\(format(timings.ocrMilliseconds)) " +
                         "trigger_eval_ms=\(format(pendingBuyTransport.triggerEvaluationMilliseconds)) " +
                         "buy_decision_ms=\(format(pendingBuyTransport.buyDecisionMilliseconds)) " +
-                        "ws_send_completion_ms=\(format(wsSendCompletionMilliseconds)) " +
+                        "transport_completion_ms=\(format(wsSendCompletionMilliseconds)) " +
                         "ocr_to_completion_ms=\(format(ocrToCompletionMilliseconds)) " +
                         "total_end_to_end_ms=\(format(wsSendCompletionMilliseconds))\(sendErrorSuffix)"
                 )
@@ -987,8 +1219,8 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         symbol: String
     ) {
         pendingSubscribeTransport = PendingSubscribeTransport(symbol: symbol, triggerEvent: triggerEvent)
-        guard let message = TradingWebSocketContract.subscribeMessage(symbol: symbol) else {
-            handleSubscribeTransportResult(.failure(TradingWebSocketContractError.invalidSymbol(symbol)))
+        guard let message = TradingMessageContract.subscribeMessage(symbol: symbol) else {
+            handleSubscribeTransportResult(.failure(TradingMessageContractError.invalidSymbol(symbol)))
             return
         }
         messageSender.send(message, event: "SUBSCRIBE") { result in
@@ -1161,6 +1393,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         )
         handleTriggerBehavior(
             for: region,
+            frameNumber: frameCount,
             recognition: recognition,
             timings: syntheticTimings,
             shouldLogEvaluation: loggingEnabled

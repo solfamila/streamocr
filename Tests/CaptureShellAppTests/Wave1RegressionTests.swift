@@ -5,144 +5,34 @@ import Foundation
 import Testing
 @testable import CaptureShellApp
 
-struct TradingWebSocketContractTests {
+struct TradingMessageContractTests {
     @Test
     func buyMessageMatchesContract() {
-        #expect(TradingWebSocketContract.buyMessage == #"{"action":"BUY"}"#)
+        #expect(TradingMessageContract.buyMessage == #"{"action":"BUY"}"#)
     }
 
     @Test
     func subscribeMessageTrimsAndUppercasesSymbol() {
         #expect(
-            TradingWebSocketContract.subscribeMessage(symbol: "  msft\n") == #"{"subscribe":"MSFT"}"#
+            TradingMessageContract.subscribeMessage(symbol: "  msft\n") == #"{"subscribe":"MSFT"}"#
         )
     }
 
     @Test
     func subscribeMessageRejectsLaunderedSymbolInput() {
-        #expect(TradingWebSocketContract.subscribeMessage(symbol: " m s-f.t 1 ") == nil)
+        #expect(TradingMessageContract.subscribeMessage(symbol: " m s-f.t 1 ") == nil)
     }
 
     @Test
     func normalizeSymbolRejectsDroppedAlphanumericOCRCandidates() {
-        #expect(TradingWebSocketContract.normalizeSymbol("PLR2") == "")
-        #expect(TradingWebSocketContract.normalizedOCRSymbol("P1LRZ") == nil)
+        #expect(TradingMessageContract.normalizeSymbol("PLR2") == "")
+        #expect(TradingMessageContract.normalizedOCRSymbol("P1LRZ") == nil)
 
-        let analysis = TradingWebSocketContract.analyzeSymbol("P1LRZ")
+        let analysis = TradingMessageContract.analyzeSymbol("P1LRZ")
         #expect(analysis.normalized == "PLRZ")
         #expect(analysis.droppedAlphanumericCount == 1)
         #expect(analysis.droppedDigitCount == 1)
         #expect(analysis.shouldRejectOCRCandidate)
-    }
-}
-
-struct LocalTradingWebSocketClientTests {
-    @Test
-    func waitForPendingMessagesWaitsForCompletionCallbackToReturn() throws {
-        let endpointURL = try #require(URL(string: "ws://localhost:65535"))
-        let client = LocalTradingWebSocketClient(endpointURL: endpointURL, connectOnInit: false)
-        let recorder = CompletionResultRecorder()
-        let didEnterCompletion = DispatchSemaphore(value: 0)
-        let allowCompletionToReturn = DispatchSemaphore(value: 0)
-        let didFinishCompletion = DispatchSemaphore(value: 0)
-
-        client.beginInFlightSendForTesting(payload: TradingWebSocketContract.buyMessage, event: "BUY") { result in
-            recorder.record(label: "BUY", result: result)
-            didEnterCompletion.signal()
-            _ = allowCompletionToReturn.wait(timeout: .now() + 1)
-        }
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            client.completeCurrentSendForTesting(result: .success(()))
-            didFinishCompletion.signal()
-        }
-
-        #expect(didEnterCompletion.wait(timeout: .now() + 1) == .success)
-        #expect(client.waitForPendingMessages(timeout: 0) == false)
-
-        allowCompletionToReturn.signal()
-
-        #expect(didFinishCompletion.wait(timeout: .now() + 1) == .success)
-        #expect(client.waitForPendingMessages(timeout: 0) == true)
-        #expect(recorder.snapshot() == ["BUY: success"])
-    }
-
-    @Test
-    func waitForPendingMessagesIgnoresConnectingStateWithoutMessages() throws {
-        let endpointURL = try #require(URL(string: "ws://localhost:65535"))
-        let client = LocalTradingWebSocketClient(endpointURL: endpointURL, connectOnInit: false)
-
-        client.setConnectingForTesting(true)
-
-        #expect(client.waitForPendingMessages(timeout: 0) == true)
-    }
-
-    @Test
-    func waitForPendingMessagesTimeoutFailsInFlightAndQueuedSends() throws {
-        let endpointURL = try #require(URL(string: "ws://localhost:65535"))
-        let client = LocalTradingWebSocketClient(endpointURL: endpointURL, connectOnInit: false)
-        let recorder = CompletionResultRecorder()
-
-        client.beginInFlightSendForTesting(payload: TradingWebSocketContract.buyMessage, event: "BUY") { result in
-            recorder.record(label: "BUY", result: result)
-        }
-        client.enqueuePendingSendForTesting(payload: #"{"subscribe":"PLRZ"}"#, event: "SUBSCRIBE") { result in
-            recorder.record(label: "SUBSCRIBE", result: result)
-        }
-
-        #expect(client.waitForPendingMessages(timeout: 0) == false)
-        #expect(
-            recorder.snapshot() == [
-                "BUY: WebSocket sender timed out before pending messages were delivered.",
-                "SUBSCRIBE: WebSocket sender timed out before pending messages were delivered."
-            ]
-        )
-    }
-
-    @Test
-    func deinitFailsInFlightAndQueuedSendsWithCancelledError() throws {
-        let endpointURL = try #require(URL(string: "ws://localhost:65535"))
-        let recorder = CompletionResultRecorder()
-
-        do {
-            let client = LocalTradingWebSocketClient(endpointURL: endpointURL, connectOnInit: false)
-            client.beginInFlightSendForTesting(payload: TradingWebSocketContract.buyMessage, event: "BUY") { result in
-                recorder.record(label: "BUY", result: result)
-            }
-            client.enqueuePendingSendForTesting(payload: #"{"subscribe":"PLRZ"}"#, event: "SUBSCRIBE") { result in
-                recorder.record(label: "SUBSCRIBE", result: result)
-            }
-            _ = client
-        }
-
-        #expect(
-            recorder.snapshot() == [
-                "BUY: WebSocket sender was cancelled before pending messages were delivered.",
-                "SUBSCRIBE: WebSocket sender was cancelled before pending messages were delivered."
-            ]
-        )
-    }
-}
-
-private final class CompletionResultRecorder: @unchecked Sendable {
-    private let lock = NSLock()
-    private var results: [String] = []
-
-    func record(label: String, result: Result<Void, any Error>) {
-        lock.lock()
-        defer { lock.unlock() }
-        switch result {
-        case .success:
-            results.append("\(label): success")
-        case let .failure(error):
-            results.append("\(label): \(error.localizedDescription)")
-        }
-    }
-
-    func snapshot() -> [String] {
-        lock.lock()
-        defer { lock.unlock() }
-        return results
     }
 }
 
@@ -188,6 +78,158 @@ struct NanocosmosStreamResolverTests {
         #expect(streamURL.absoluteString.contains("url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay"))
         #expect(streamURL.absoluteString.contains("stream=COeCf-9jp1Q"))
         #expect(streamURL.absoluteString.contains("h5pltc=4181112"))
+    }
+
+    @Test
+    func finitePlaylistPrefersDirectPlaybackURL() throws {
+        let playlistURL = try #require(URL(string: "https://bintu-h5live.nanocosmos.de/h5live/http/playlist.m3u8?stream=COeCf-9jp1Q&cid=42674&pid=63178402599"))
+        let streamURL = try #require(URL(string: "https://bintu-h5live.nanocosmos.de/h5live/http/stream.mp4?stream=COeCf-9jp1Q&cid=42674&pid=63178402599&h5pltc=2425224"))
+        let directCandidate = try #require(URL(string: "https://bintu-h5live.nanocosmos.de/h5live/http/stream.mp4?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=42674&pid=63178402599"))
+        let finitePlaylist = """
+        #EXTM3U
+        #EXT-X-PLAYLIST-TYPE:VOD
+        #EXT-X-TARGETDURATION:1
+        #EXTINF:1.0,
+        stream.mp4?stream=COeCf-9jp1Q&cid=42674&pid=63178402599&h5pltc=2425224
+        #EXT-X-ENDLIST
+        """
+
+        let playbackURL = NanocosmosStreamResolver.preferredPlaybackURL(
+            playlistText: finitePlaylist,
+            playlistURL: playlistURL,
+            streamURL: streamURL,
+            directPlaybackCandidates: [directCandidate]
+        )
+
+        #expect(playbackURL == directCandidate)
+    }
+
+    @Test
+    func rollingPlaylistKeepsPlaylistPlaybackURL() throws {
+        let playlistURL = try #require(URL(string: "https://bintu-h5live.nanocosmos.de/h5live/http/playlist.m3u8?stream=COeCf-9jp1Q&cid=42674&pid=63178402599"))
+        let streamURL = try #require(URL(string: "https://bintu-h5live.nanocosmos.de/h5live/http/stream.mp4?stream=COeCf-9jp1Q&cid=42674&pid=63178402599&h5pltc=2425224"))
+        let rollingPlaylist = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:1
+        #EXTINF:1.0,
+        stream.mp4?stream=COeCf-9jp1Q&cid=42674&pid=63178402599&h5pltc=2425224
+        """
+
+        let playbackURL = NanocosmosStreamResolver.preferredPlaybackURL(
+            playlistText: rollingPlaylist,
+            playlistURL: playlistURL,
+            streamURL: streamURL,
+            directPlaybackCandidates: []
+        )
+
+        #expect(playbackURL == playlistURL)
+    }
+
+    @Test
+    func recordingSourceURLPrefersOriginalDirectSeedCandidate() throws {
+        let seedURL = try #require(URL(string: "wss://bintu-h5live.nanocosmos.de/h5live/stream/stream.mp4?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=42674&pid=63178402599"))
+        let playlistURL = try #require(URL(string: "https://bintu-h5live.nanocosmos.de/h5live/http/playlist.m3u8?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=42674&pid=63178402599"))
+        let streamURL = try #require(URL(string: "https://bintu-h5live.nanocosmos.de/h5live/http/stream.mp4?stream=COeCf-9jp1Q&cid=42674&pid=63178402599&h5pltc=2425224"))
+        let resolved = ResolvedLiveStream(
+            seedURL: seedURL,
+            playlistURL: playlistURL,
+            playbackURL: playlistURL,
+            alternatePlaybackURLs: [],
+            streamURL: streamURL,
+            playlistText: "#EXTM3U"
+        )
+
+        let recordingURL = LiveMediaCaptureCoordinator.preferredRecordingSourceURL(seedURL: seedURL, resolved: resolved)
+
+        #expect(recordingURL.absoluteString.contains("url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay"))
+        #expect(recordingURL.path.lowercased().contains("/stream.mp4"))
+    }
+}
+
+struct LiveFFmpegVideoDecoderTests {
+    @Test
+    func preferredDirectSourceURLsPreferOriginalDirectCandidate() throws {
+        let seedURL = try #require(URL(string: "wss://bintu-h5live.nanocosmos.de/h5live/stream/stream.mp4?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=42674&pid=63178402599"))
+
+        let candidates = LiveFFmpegVideoDecoder.preferredDirectSourceURLs(seedURL: seedURL)
+
+        #expect(candidates.first?.absoluteString == "https://bintu-h5live.nanocosmos.de/h5live/http/stream.mp4?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=42674&pid=63178402599")
+    }
+
+    @Test
+    func preferredSourceURLsPreferOriginalDirectCandidate() throws {
+        let seedURL = try #require(URL(string: "wss://bintu-h5live.nanocosmos.de/h5live/stream/stream.mp4?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=42674&pid=63178402599"))
+        let playlistURL = try #require(URL(string: "https://bintu-h5live.nanocosmos.de/h5live/http/playlist.m3u8?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=42674&pid=63178402599"))
+        let streamURL = try #require(URL(string: "https://bintu-h5live.nanocosmos.de/h5live/http/stream.mp4?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=42674&pid=63178402599&h5pltc=5460542"))
+        let resolved = ResolvedLiveStream(
+            seedURL: seedURL,
+            playlistURL: playlistURL,
+            playbackURL: playlistURL,
+            alternatePlaybackURLs: [],
+            streamURL: streamURL,
+            playlistText: "#EXTM3U"
+        )
+
+        let candidates = LiveFFmpegVideoDecoder.preferredSourceURLs(seedURL: seedURL, resolved: resolved)
+
+        #expect(candidates.first?.absoluteString == "https://bintu-h5live.nanocosmos.de/h5live/http/stream.mp4?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=42674&pid=63178402599")
+    }
+
+    @Test
+    func parsesRationalFrameRates() {
+        #expect(LiveFFmpegVideoDecoder.parseFrameRate("60000/1001").map { abs($0 - 59.94005994) < 0.0001 } == true)
+        #expect(LiveFFmpegVideoDecoder.parseFrameRate("60") == 60)
+        #expect(LiveFFmpegVideoDecoder.parseFrameRate("0/0") == nil)
+    }
+}
+
+struct LiveMediaCaptureCoordinatorTests {
+    @Test
+    func recordArgumentsDisableAudioWhenNotRequested() {
+        let arguments = LiveSourceStreamRecorder.recordArguments(
+            sourceURL: URL(string: "https://example.com/stream.mp4")!,
+            outputURL: URL(fileURLWithPath: "/tmp/output.mp4"),
+            includeAudio: false,
+            loggingEnabled: false,
+            runSeconds: 30
+        )
+
+        #expect(arguments.contains("-an"))
+        #expect(!arguments.contains("0:a:0?"))
+        #expect(arguments.contains("/tmp/output.mp4"))
+    }
+
+    @Test
+    func recordArgumentsIncludeOptionalAudioMapWhenRequested() {
+        let arguments = LiveSourceStreamRecorder.recordArguments(
+            sourceURL: URL(string: "https://example.com/stream.mp4")!,
+            outputURL: URL(fileURLWithPath: "/tmp/output.mp4"),
+            includeAudio: true,
+            loggingEnabled: false,
+            runSeconds: 30
+        )
+
+        #expect(arguments.contains("0:a:0?"))
+        #expect(arguments.contains("-c:a"))
+        #expect(!arguments.contains("-an"))
+    }
+
+    @Test
+    func estimatedFrameCountUsesNbFramesThenFallsBackToDurationAndFPS() {
+        #expect(
+            LiveSourceStreamRecorder.estimatedFrameCount(
+                nbFramesText: "236",
+                avgFrameRateText: "30/1",
+                durationSeconds: 7.8
+            ) == 236
+        )
+        #expect(
+            LiveSourceStreamRecorder.estimatedFrameCount(
+                nbFramesText: nil,
+                avgFrameRateText: "30000/1001",
+                durationSeconds: 7.82
+            ) == 234
+        )
     }
 }
 
@@ -450,8 +492,8 @@ struct TriggerPipelineVerificationHarnessTests {
 
         #expect(
             sender.messages == [
-                TradingWebSocketContract.buyMessage,
-                TradingWebSocketContract.buyMessage
+                TradingMessageContract.buyMessage,
+                TradingMessageContract.buyMessage
             ]
         )
     }
@@ -497,7 +539,7 @@ struct TriggerPipelineVerificationHarnessTests {
         #expect(
             sender.messages == [
                 #"{"subscribe":"MSFT"}"#,
-                TradingWebSocketContract.buyMessage,
+                TradingMessageContract.buyMessage,
                 #"{"subscribe":"AAPL"}"#
             ]
         )
@@ -599,14 +641,14 @@ struct TriggerPipelineVerificationHarnessTests {
         pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
         pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
 
-        #expect(sender.messages == [TradingWebSocketContract.buyMessage])
+        #expect(sender.messages == [TradingMessageContract.buyMessage])
         #expect(eventCollector.events.map(\.action) == ["buy_triggered"])
 
         sender.succeedNext()
         #expect(eventCollector.events.map(\.action) == ["buy_triggered", "buy_transport_succeeded"])
 
         pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
-        #expect(sender.messages == [TradingWebSocketContract.buyMessage])
+        #expect(sender.messages == [TradingMessageContract.buyMessage])
     }
 
     @Test
@@ -627,7 +669,7 @@ struct TriggerPipelineVerificationHarnessTests {
         #expect(eventCollector.events.map(\.action) == ["buy_triggered", "buy_transport_failed"])
 
         pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
-        #expect(sender.messages == [TradingWebSocketContract.buyMessage, TradingWebSocketContract.buyMessage])
+        #expect(sender.messages == [TradingMessageContract.buyMessage, TradingMessageContract.buyMessage])
         #expect(eventCollector.events.map(\.action) == ["buy_triggered", "buy_transport_failed", "buy_triggered"])
 
         sender.succeedNext()
@@ -651,7 +693,7 @@ struct TriggerPipelineVerificationHarnessTests {
         sender.succeedNext()
         pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "20", normalizedText: "20", confidence: 0.9)
 
-        #expect(sender.messages == [TradingWebSocketContract.buyMessage, TradingWebSocketContract.buyMessage])
+        #expect(sender.messages == [TradingMessageContract.buyMessage, TradingMessageContract.buyMessage])
         #expect(eventCollector.events.map(\.action) == ["buy_triggered", "buy_transport_succeeded", "buy_triggered"])
     }
 
@@ -672,7 +714,7 @@ struct TriggerPipelineVerificationHarnessTests {
         sender.succeedNext()
         pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
 
-        #expect(sender.messages == [TradingWebSocketContract.buyMessage])
+        #expect(sender.messages == [TradingMessageContract.buyMessage])
         #expect(eventCollector.events.map(\.action) == ["buy_triggered", "buy_transport_succeeded"])
     }
 
@@ -742,7 +784,7 @@ struct TriggerPipelineVerificationHarnessTests {
             normalizedText: "15",
             confidence: 0.9
         )
-        sender.succeedNext(matchingPayload: TradingWebSocketContract.buyMessage)
+        sender.succeedNext(matchingPayload: TradingMessageContract.buyMessage)
         pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "", normalizedText: "", confidence: 0.9)
         sender.succeedNext(matchingPayload: #"{"subscribe":"PLRZ"}"#)
         pipeline.processTriggerEventForTesting(
@@ -755,7 +797,7 @@ struct TriggerPipelineVerificationHarnessTests {
         #expect(
             sender.messages == [
                 #"{"subscribe":"PLRZ"}"#,
-                TradingWebSocketContract.buyMessage,
+                TradingMessageContract.buyMessage,
                 #"{"subscribe":"AAPL"}"#
             ]
         )
@@ -843,42 +885,6 @@ struct TriggerPipelineVerificationHarnessTests {
     }
 
     @Test
-    func recorderFinishValidationThrowsOnTimeout() {
-        let outputURL = URL(fileURLWithPath: "/tmp/live-decoded-timeout.mp4")
-        var didCancel = false
-
-        #expect(throws: LiveDecodedVideoRecorderError.self) {
-            try LiveDecodedVideoRecorder.validateFinishState(
-                waitResult: .timedOut,
-                writerStatus: .writing,
-                writerErrorDescription: nil,
-                outputURL: outputURL,
-                cancelWriting: { didCancel = true }
-            )
-        }
-
-        #expect(didCancel)
-    }
-
-    @Test
-    func recorderFinishValidationRequiresCompletedWriterState() {
-        let outputURL = URL(fileURLWithPath: "/tmp/live-decoded-incomplete.mp4")
-        var didCancel = false
-
-        #expect(throws: LiveDecodedVideoRecorderError.self) {
-            try LiveDecodedVideoRecorder.validateFinishState(
-                waitResult: .success,
-                writerStatus: .writing,
-                writerErrorDescription: nil,
-                outputURL: outputURL,
-                cancelWriting: { didCancel = true }
-            )
-        }
-
-        #expect(didCancel)
-    }
-
-    @Test
     func manualCellRequiresConfirmationBeforeSendingBuy() {
         let sender = CapturingMessageSender()
         let pipeline = LowLatencyOCRFramePipeline(
@@ -908,7 +914,7 @@ struct TriggerPipelineVerificationHarnessTests {
             confidence: 1.0
         )
 
-        #expect(sender.messages == [TradingWebSocketContract.buyMessage])
+        #expect(sender.messages == [TradingMessageContract.buyMessage])
     }
 
     @Test
@@ -942,7 +948,7 @@ struct TriggerPipelineVerificationHarnessTests {
         pipeline.process(VideoFrame(pixelBuffer: pixelBuffer), runtimeConfig: runtimeConfig)
 
         #expect(recognizer.callCount == 1)
-        #expect(sender.messages == [TradingWebSocketContract.buyMessage])
+        #expect(sender.messages == [TradingMessageContract.buyMessage])
         #expect(eventCollector.events.count == 2)
         #expect(eventCollector.events[0].kind == .recognition)
         #expect(eventCollector.events[1].kind == .trigger)

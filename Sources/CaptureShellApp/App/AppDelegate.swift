@@ -3,10 +3,19 @@ import Foundation
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let captureController = DisplayCaptureController(
+    private let tradingRuntimeManager = TradingRuntimeManager()
+    private lazy var legacyTradingWindowController = LegacyTradingWindowController(
+        manager: tradingRuntimeManager,
+        onOpenSetup: { [weak self] in
+            self?.showSetupWindow()
+        }
+    )
+    private lazy var captureController = DisplayCaptureController(
         permissionManager: ScreenRecordingPermissionManager(),
         timingLogger: FrameTimingLogger(),
-        pipeline: LowLatencyOCRFramePipeline()
+        pipeline: LowLatencyOCRFramePipeline(
+            messageSender: DirectTradingMessageSender(manager: tradingRuntimeManager)
+        )
     )
 
     private let runtimeConfigStore = RuntimeConfigStore()
@@ -28,9 +37,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let clearSymbolSelectionsButton = NSButton(title: "Clear Symbol ROI/Cell", target: nil, action: nil)
     private let saveConfigButton = NSButton(title: "Save Runtime Config", target: nil, action: nil)
     private let loadConfigButton = NSButton(title: "Load Runtime Config", target: nil, action: nil)
+    private let openTradingGUIButton = NSButton(title: "Open Trading GUI", target: nil, action: nil)
 
     private let activeRegionsLabel = NSTextField(labelWithString: "")
     private let configPathLabel = NSTextField(labelWithString: "")
+
+    private let tradingRuntimeButton = NSButton(title: "Start Trading Runtime", target: nil, action: nil)
+    private let applyTradingConnectionButton = NSButton(title: "Apply Trading Connection", target: nil, action: nil)
+    private let applyTradingRiskButton = NSButton(title: "Apply Trading Risk", target: nil, action: nil)
+    private let subscribeButton = NSButton(title: "Subscribe", target: nil, action: nil)
+    private let buyButton = NSButton(title: "Buy", target: nil, action: nil)
+    private let closeButton = NSButton(title: "Close Long", target: nil, action: nil)
+    private let cancelAllButton = NSButton(title: "Cancel All", target: nil, action: nil)
+    private let armControllerButton = NSButton(title: "Arm Controller", target: nil, action: nil)
+    private let killSwitchButton = NSButton(title: "Enable Kill Switch", target: nil, action: nil)
+
+    private let tradingStatusLabel = NSTextField(labelWithString: "Trading runtime stopped.")
+    private let accountStatusLabel = NSTextField(labelWithString: "Account: --")
+    private let controllerStatusLabel = NSTextField(labelWithString: "Controller: --")
+    private let marketStatusLabel = NSTextField(labelWithString: "Market: --")
+
+    private let hostField = NSTextField(frame: .zero)
+    private let portField = NSTextField(frame: .zero)
+    private let clientIDField = NSTextField(frame: .zero)
+    private let symbolField = NSTextField(frame: .zero)
+    private let quantityField = NSTextField(frame: .zero)
+    private let bufferField = NSTextField(frame: .zero)
+    private let maxPositionField = NSTextField(frame: .zero)
+    private let staleQuoteField = NSTextField(frame: .zero)
+    private let maxOrderField = NSTextField(frame: .zero)
+    private let maxOpenField = NSTextField(frame: .zero)
+
+    private let tradingMessagesTextView = NSTextView(frame: .zero)
 
     private var displays: [DisplayTarget] = []
     private var isCapturing = false
@@ -40,9 +78,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installAppMenu()
         configureUI()
         bindCaptureCallbacks()
+        bindTradingCallbacks()
 
         configPathLabel.stringValue = "Config file: \(runtimeConfigStore.configURL.path)"
         updateRegionSummaryUI()
+        loadTradingConfiguration()
+        syncTradingInputsToRuntime()
+        tradingRuntimeManager.refreshDashboard()
 
         Task {
             await refreshDisplays()
@@ -53,6 +95,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task {
             await captureController.stopCapture()
         }
+        tradingRuntimeManager.shutdown()
     }
 
     @objc
@@ -213,7 +256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func configureUI() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 900, height: 560),
+            contentRect: NSRect(x: 0, y: 0, width: 1100, height: 640),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -248,6 +291,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         configPathLabel.textColor = .secondaryLabelColor
         configPathLabel.lineBreakMode = .byTruncatingMiddle
 
+        configureTradingField(hostField, placeholder: "127.0.0.1", width: 140)
+        configureTradingField(portField, placeholder: "7496", width: 80)
+        configureTradingField(clientIDField, placeholder: "101", width: 80)
+        configureTradingField(symbolField, placeholder: "PLRZ", width: 120)
+        configureTradingField(quantityField, placeholder: "1", width: 80)
+        configureTradingField(bufferField, placeholder: "0.01", width: 80)
+        configureTradingField(maxPositionField, placeholder: "40000", width: 110)
+        configureTradingField(staleQuoteField, placeholder: "1500", width: 90)
+        configureTradingField(maxOrderField, placeholder: "15000", width: 110)
+        configureTradingField(maxOpenField, placeholder: "50000", width: 110)
+
+        tradingStatusLabel.lineBreakMode = .byWordWrapping
+        tradingStatusLabel.maximumNumberOfLines = 3
+        accountStatusLabel.textColor = .secondaryLabelColor
+        controllerStatusLabel.textColor = .secondaryLabelColor
+        marketStatusLabel.textColor = .secondaryLabelColor
+
+        tradingMessagesTextView.isEditable = false
+        tradingMessagesTextView.isSelectable = true
+        tradingMessagesTextView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        tradingMessagesTextView.backgroundColor = .textBackgroundColor
+        let tradingMessagesScrollView = NSScrollView()
+        tradingMessagesScrollView.translatesAutoresizingMaskIntoConstraints = false
+        tradingMessagesScrollView.documentView = tradingMessagesTextView
+        tradingMessagesScrollView.hasVerticalScroller = true
+        tradingMessagesScrollView.borderType = .bezelBorder
+        tradingMessagesScrollView.heightAnchor.constraint(equalToConstant: 180).isActive = true
+
         requestPermissionButton.target = self
         requestPermissionButton.action = #selector(requestPermissionTapped)
 
@@ -280,6 +351,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         loadConfigButton.target = self
         loadConfigButton.action = #selector(loadRuntimeConfigTapped)
+        openTradingGUIButton.target = self
+        openTradingGUIButton.action = #selector(openTradingGUITapped)
+
+        tradingRuntimeButton.target = self
+        tradingRuntimeButton.action = #selector(tradingRuntimeTapped)
+        applyTradingConnectionButton.target = self
+        applyTradingConnectionButton.action = #selector(applyTradingConnectionTapped)
+        applyTradingRiskButton.target = self
+        applyTradingRiskButton.action = #selector(applyTradingRiskTapped)
+        subscribeButton.target = self
+        subscribeButton.action = #selector(subscribeTapped)
+        buyButton.target = self
+        buyButton.action = #selector(buyTapped)
+        closeButton.target = self
+        closeButton.action = #selector(closeTapped)
+        cancelAllButton.target = self
+        cancelAllButton.action = #selector(cancelAllTapped)
+        armControllerButton.target = self
+        armControllerButton.action = #selector(armControllerTapped)
+        killSwitchButton.target = self
+        killSwitchButton.action = #selector(killSwitchTapped)
+
+        [hostField, portField, clientIDField, symbolField, quantityField, bufferField, maxPositionField, staleQuoteField, maxOrderField, maxOpenField].forEach {
+            $0.target = self
+            $0.action = #selector(tradingInputChanged)
+        }
 
         let captureButtonsRow = NSStackView(views: [requestPermissionButton, refreshDisplaysButton, startStopButton])
         captureButtonsRow.orientation = .horizontal
@@ -289,12 +386,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         roiButtonsRow.orientation = .horizontal
         roiButtonsRow.spacing = 10
 
-        let configButtonsRow = NSStackView(views: [clearSymbolSelectionsButton, saveConfigButton, loadConfigButton])
+        let configButtonsRow = NSStackView(views: [clearSymbolSelectionsButton, saveConfigButton, loadConfigButton, openTradingGUIButton])
         configButtonsRow.orientation = .horizontal
         configButtonsRow.spacing = 10
 
         let regionsHeader = NSTextField(labelWithString: "Active Runtime Regions")
         regionsHeader.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+
+        let nextStepLabel = NSTextField(
+            labelWithString: "After ROI selection, open the old trading GUI. OCR BUY/SUBSCRIBE now route directly into that in-process trading runtime."
+        )
+        nextStepLabel.textColor = .secondaryLabelColor
+        nextStepLabel.lineBreakMode = .byWordWrapping
+        nextStepLabel.maximumNumberOfLines = 3
+
+        let connectionRow = NSStackView(views: [
+            makeTradingLabeledField(title: "Host", field: hostField),
+            makeTradingLabeledField(title: "Port", field: portField),
+            makeTradingLabeledField(title: "Client ID", field: clientIDField),
+            applyTradingConnectionButton,
+            tradingRuntimeButton
+        ])
+        connectionRow.orientation = .horizontal
+        connectionRow.spacing = 10
+
+        let inputRow = NSStackView(views: [
+            makeTradingLabeledField(title: "Symbol", field: symbolField),
+            makeTradingLabeledField(title: "Qty", field: quantityField),
+            makeTradingLabeledField(title: "Buffer", field: bufferField),
+            makeTradingLabeledField(title: "Max Position $", field: maxPositionField),
+            subscribeButton
+        ])
+        inputRow.orientation = .horizontal
+        inputRow.spacing = 10
+
+        let riskRow = NSStackView(views: [
+            makeTradingLabeledField(title: "Stale Quote ms", field: staleQuoteField),
+            makeTradingLabeledField(title: "Max Order $", field: maxOrderField),
+            makeTradingLabeledField(title: "Max Open $", field: maxOpenField),
+            applyTradingRiskButton
+        ])
+        riskRow.orientation = .horizontal
+        riskRow.spacing = 10
+
+        let actionRow = NSStackView(views: [buyButton, closeButton, cancelAllButton, armControllerButton, killSwitchButton])
+        actionRow.orientation = .horizontal
+        actionRow.spacing = 10
+
+        let tradingMessagesHeader = NSTextField(labelWithString: "Trading Messages")
+        tradingMessagesHeader.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
 
         let stack = NSStackView(
             views: [
@@ -307,7 +447,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 configPathLabel,
                 regionsHeader,
                 activeRegionsLabel,
-                statusLabel
+                statusLabel,
+                nextStepLabel
             ]
         )
         stack.orientation = .vertical
@@ -324,6 +465,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ])
 
         self.window = window
+    }
+
+    private func configureTradingField(_ field: NSTextField, placeholder: String, width: CGFloat) {
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.placeholderString = placeholder
+        field.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        field.controlSize = .regular
+        field.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        field.widthAnchor.constraint(equalToConstant: width).isActive = true
+    }
+
+    private func makeTradingLabeledField(title: String, field: NSTextField) -> NSStackView {
+        let label = NSTextField(labelWithString: title)
+        label.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        let stack = NSStackView(views: [label, field])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+        return stack
     }
 
     private func bindCaptureCallbacks() {
@@ -367,9 +527,235 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func bindTradingCallbacks() {
+        tradingRuntimeManager.onDashboardChanged = { [weak self] dashboard in
+            self?.refreshTradingUI(dashboard)
+            self?.legacyTradingWindowController.updateDashboard(dashboard)
+        }
+    }
+
+    @objc
+    private func openTradingGUITapped() {
+        syncTradingInputsToRuntime()
+        legacyTradingWindowController.showWindowAndStart()
+    }
+
+    private func showSetupWindow() {
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     private func refreshDisplays() async {
         statusLabel.stringValue = "Loading display targets..."
         await captureController.reloadDisplays()
+    }
+
+    private func loadTradingConfiguration() {
+        do {
+            let connection = try tradingRuntimeManager.currentConnectionConfig()
+            hostField.stringValue = connection.host
+            portField.stringValue = String(connection.port)
+            clientIDField.stringValue = String(connection.clientId)
+        } catch {
+            tradingStatusLabel.stringValue = "Failed to load trading connection config: \(error.localizedDescription)"
+        }
+
+        do {
+            let risk = try tradingRuntimeManager.currentRiskControls()
+            staleQuoteField.stringValue = String(risk.staleQuoteThresholdMs)
+            maxOrderField.stringValue = String(format: "%.0f", risk.maxOrderNotional)
+            maxOpenField.stringValue = String(format: "%.0f", risk.maxOpenNotional)
+        } catch {
+            tradingStatusLabel.stringValue = "Failed to load trading risk controls: \(error.localizedDescription)"
+        }
+    }
+
+    @objc
+    private func tradingRuntimeTapped() {
+        if tradingRuntimeManager.isStarted {
+            tradingRuntimeManager.shutdown()
+            tradingStatusLabel.stringValue = "Trading runtime stopped."
+            return
+        }
+
+        syncTradingInputsToRuntime()
+        let connected = tradingRuntimeManager.start()
+        tradingStatusLabel.stringValue = connected
+            ? "Trading runtime started and connected to TWS."
+            : "Trading runtime started, but TWS is not connected yet."
+    }
+
+    @objc
+    private func tradingInputChanged() {
+        syncTradingInputsToRuntime()
+    }
+
+    @objc
+    private func applyTradingConnectionTapped() {
+        do {
+            var config = try tradingRuntimeManager.currentConnectionConfig()
+            config.host = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            config.port = max(1, Int(portField.intValue))
+            config.clientId = max(1, Int(clientIDField.intValue))
+            try tradingRuntimeManager.updateConnectionConfig(config)
+            tradingStatusLabel.stringValue = "Trading connection settings applied."
+        } catch {
+            tradingStatusLabel.stringValue = "Failed to apply connection settings: \(error.localizedDescription)"
+        }
+    }
+
+    @objc
+    private func applyTradingRiskTapped() {
+        do {
+            var risk = try tradingRuntimeManager.currentRiskControls()
+            risk.staleQuoteThresholdMs = max(250, Int(staleQuoteField.intValue))
+            risk.maxOrderNotional = max(100, maxOrderField.doubleValue)
+            risk.maxOpenNotional = max(risk.maxOrderNotional, maxOpenField.doubleValue)
+            try tradingRuntimeManager.updateRiskControls(risk)
+            tradingStatusLabel.stringValue = "Trading risk controls applied."
+        } catch {
+            tradingStatusLabel.stringValue = "Failed to apply risk controls: \(error.localizedDescription)"
+        }
+    }
+
+    @objc
+    private func subscribeTapped() {
+        syncTradingInputsToRuntime()
+        do {
+            let response = try tradingRuntimeManager.requestSubscription(
+                symbol: symbolField.stringValue,
+                recalcQtyFromFirstAsk: false
+            )
+            tradingStatusLabel.stringValue = "Subscribed to \(response.normalizedSymbol ?? symbolField.stringValue)."
+        } catch {
+            tradingStatusLabel.stringValue = "Subscribe failed: \(error.localizedDescription)"
+        }
+    }
+
+    @objc
+    private func buyTapped() {
+        syncTradingInputsToRuntime()
+        do {
+            _ = try tradingRuntimeManager.submitBuy(source: "GUI Button", note: "Buy Limit button pressed")
+            tradingStatusLabel.stringValue = "BUY submitted."
+        } catch {
+            tradingStatusLabel.stringValue = "Buy failed: \(error.localizedDescription)"
+        }
+    }
+
+    @objc
+    private func closeTapped() {
+        syncTradingInputsToRuntime()
+        do {
+            _ = try tradingRuntimeManager.submitClose(source: "GUI Button", note: "Close Long button pressed")
+            tradingStatusLabel.stringValue = "Close submitted."
+        } catch {
+            tradingStatusLabel.stringValue = "Close failed: \(error.localizedDescription)"
+        }
+    }
+
+    @objc
+    private func cancelAllTapped() {
+        do {
+            let response = try tradingRuntimeManager.cancelAll()
+            let count = response.orderIds?.count ?? 0
+            tradingStatusLabel.stringValue = count > 0
+                ? "Cancel requested for \(count) order(s)."
+                : "No pending orders to cancel."
+        } catch {
+            tradingStatusLabel.stringValue = "Cancel all failed: \(error.localizedDescription)"
+        }
+    }
+
+    @objc
+    private func armControllerTapped() {
+        let nextArmed = !tradingRuntimeManager.dashboard.panel.status.controllerArmed
+        tradingRuntimeManager.setControllerArmed(nextArmed)
+        tradingStatusLabel.stringValue = nextArmed ? "Controller armed." : "Controller disarmed."
+    }
+
+    @objc
+    private func killSwitchTapped() {
+        let nextEnabled = !tradingRuntimeManager.dashboard.panel.status.tradingKillSwitch
+        tradingRuntimeManager.setTradingKillSwitch(nextEnabled)
+        tradingStatusLabel.stringValue = nextEnabled ? "Kill switch enabled." : "Kill switch disabled."
+    }
+
+    private func syncTradingInputsToRuntime() {
+        tradingRuntimeManager.setUIInputs(
+            symbolInput: symbolField.stringValue,
+            subscribedSymbol: tradingRuntimeManager.dashboard.inputs.subscribedSymbol,
+            subscribed: tradingRuntimeManager.dashboard.inputs.subscribed,
+            quantityInput: max(1, Int(quantityField.intValue)),
+            priceBuffer: max(0, bufferField.doubleValue),
+            maxPositionDollars: max(1000, maxPositionField.doubleValue),
+            selectedTraceId: tradingRuntimeManager.dashboard.inputs.selectedTraceId
+        )
+    }
+
+    private func refreshTradingUI(_ dashboard: TradingDashboardSnapshot) {
+        if !isFieldBeingEdited(symbolField) {
+            symbolField.stringValue = dashboard.inputs.symbolInput
+        }
+        if !isFieldBeingEdited(quantityField) {
+            quantityField.stringValue = String(dashboard.inputs.quantityInput)
+        }
+        if !isFieldBeingEdited(bufferField) {
+            bufferField.stringValue = String(format: "%.2f", dashboard.inputs.priceBuffer)
+        }
+        if !isFieldBeingEdited(maxPositionField) {
+            maxPositionField.stringValue = String(format: "%.0f", dashboard.inputs.maxPositionDollars)
+        }
+
+        tradingRuntimeButton.title = tradingRuntimeManager.isStarted ? "Stop Trading Runtime" : "Start Trading Runtime"
+        accountStatusLabel.stringValue = "Account: \(dashboard.panel.status.accountText)"
+        controllerStatusLabel.stringValue = dashboard.panel.status.controllerEnabled
+            ? "Controller: \(dashboard.panel.status.controllerConnected ? "Connected" : "Disconnected") \(dashboard.panel.status.controllerDeviceName)"
+            : "Controller: disabled"
+        marketStatusLabel.stringValue = String(
+            format: "Market %@  bid %.2f  ask %.2f  last %.2f  pos %.0f",
+            dashboard.inputs.subscribedSymbol.isEmpty ? "--" : dashboard.inputs.subscribedSymbol,
+            dashboard.panel.symbol.bidPrice,
+            dashboard.panel.symbol.askPrice,
+            dashboard.panel.symbol.lastPrice,
+            dashboard.panel.symbol.currentPositionQty
+        )
+
+        let connectedText: String
+        if dashboard.panel.status.connected && dashboard.panel.status.sessionReady {
+            connectedText = "Connected / ready"
+        } else if dashboard.panel.status.connected {
+            connectedText = "Connected / syncing"
+        } else if tradingRuntimeManager.isStarted {
+            connectedText = "Started / disconnected"
+        } else {
+            connectedText = "Stopped"
+        }
+
+        tradingStatusLabel.stringValue = "Trading: \(connectedText)"
+        if !dashboard.panel.status.startupRecoveryBanner.isEmpty {
+            tradingStatusLabel.stringValue += " | \(dashboard.panel.status.startupRecoveryBanner)"
+        }
+
+        subscribeButton.isEnabled = tradingRuntimeManager.isStarted
+        buyButton.isEnabled = tradingRuntimeManager.isStarted && dashboard.panel.canBuy
+        closeButton.isEnabled = tradingRuntimeManager.isStarted && dashboard.panel.canClosePosition
+        cancelAllButton.isEnabled = tradingRuntimeManager.isStarted && dashboard.panel.hasCancelableOrders
+        armControllerButton.isEnabled = dashboard.panel.status.controllerEnabled && dashboard.panel.status.controllerConnected
+        armControllerButton.title = dashboard.panel.status.controllerArmed ? "Disarm Controller" : "Arm Controller"
+        killSwitchButton.title = dashboard.panel.status.tradingKillSwitch ? "Disable Kill Switch" : "Enable Kill Switch"
+
+        let nextMessages = dashboard.messagesText.isEmpty ? "No trading messages yet." : dashboard.messagesText
+        if tradingMessagesTextView.string != nextMessages {
+            tradingMessagesTextView.string = nextMessages
+        }
+    }
+
+    private func isFieldBeingEdited(_ field: NSTextField) -> Bool {
+        guard let editor = field.currentEditor(), let window = field.window else {
+            return false
+        }
+        return window.firstResponder == editor
     }
 
     private func updateRegionSummaryUI() {

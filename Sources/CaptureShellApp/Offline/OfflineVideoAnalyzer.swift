@@ -181,17 +181,6 @@ final class PipelineEventCollector: @unchecked Sendable {
     }
 }
 
-final class DiscardingTradingMessageSender: TradingMessageSending, @unchecked Sendable {
-    func send(
-        _ payload: String,
-        event _: String,
-        completion: @escaping @Sendable (Result<Void, any Error>) -> Void
-    ) {
-        _ = payload
-        completion(.success(()))
-    }
-}
-
 enum RuntimeConfigFileIO {
     static func load(from url: URL) throws -> CaptureRuntimeConfig {
         let data = try Data(contentsOf: url)

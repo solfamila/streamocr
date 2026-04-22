@@ -14,8 +14,8 @@ enum LiveAnalysisCommand {
                 runSeconds: request.runSeconds,
                 pollFPS: request.pollFPS,
                 loggingEnabled: request.verbose,
-                sendTradingMessages: request.sendTradingMessages,
                 recordVideoURL: request.recordVideoURL,
+                recordAudio: request.recordAudio,
                 metadataURL: request.metadataURL
             )
 
@@ -75,6 +75,10 @@ enum LiveAnalysisCommand {
         }
 
         let recordVideoURL = value(for: "--record-video").map { URL(fileURLWithPath: $0) }
+        let recordAudio = arguments.contains("--record-audio")
+        if recordAudio, recordVideoURL == nil {
+            throw LiveAnalysisCommandError.missingRecordVideoForAudio
+        }
         let explicitMetadataURL = value(for: "--live-metadata-json").map { URL(fileURLWithPath: $0) }
         let metadataURL = explicitMetadataURL ?? recordVideoURL.map(defaultMetadataURL(for:))
 
@@ -87,7 +91,7 @@ enum LiveAnalysisCommand {
             runSeconds: runSeconds,
             pollFPS: pollFPS,
             verbose: arguments.contains("--verbose"),
-            sendTradingMessages: arguments.contains("--send-trading-messages")
+            recordAudio: recordAudio
         )
     }
 
@@ -107,12 +111,13 @@ private struct LiveAnalysisRequest {
     let runSeconds: Double
     let pollFPS: Double
     let verbose: Bool
-    let sendTradingMessages: Bool
+    let recordAudio: Bool
 }
 
 private enum LiveAnalysisCommandError: Error, LocalizedError {
     case missingArgument(String)
     case invalidNumber(String, String)
+    case missingRecordVideoForAudio
 
     var errorDescription: String? {
         switch self {
@@ -120,6 +125,8 @@ private enum LiveAnalysisCommandError: Error, LocalizedError {
             return "Missing required argument \(flag). Example: --live-analyze --seed-url 'wss://...' --run-seconds 5 --runtime-config /path/runtime-config.json --record-video /tmp/live.mp4"
         case let .invalidNumber(flag, value):
             return "Invalid \(flag) value '\(value)'. Use a positive number."
+        case .missingRecordVideoForAudio:
+            return "--record-audio requires --record-video /path/output.mp4."
         }
     }
 }

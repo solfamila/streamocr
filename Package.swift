@@ -14,8 +14,26 @@ let package = Package(
         .package(url: "https://github.com/swiftlang/swift-testing.git", from: "0.99.0")
     ],
     targets: [
+        .target(
+            name: "TradingRuntimeBridge",
+            publicHeadersPath: "include",
+            cxxSettings: [
+                .headerSearchPath("Imported/long"),
+                .headerSearchPath("Imported/third_party/ibapi_client_legacy"),
+                .headerSearchPath("Imported/nlohmann_json/single_include"),
+                .define("TWS_ORDER_STATUS_PERMID_IS_INT", to: "1"),
+                .define("TWS_NEEDS_DECIMAL_FUNCTIONS_SHIM", to: "1")
+            ],
+            linkerSettings: [
+                .linkedFramework("AppKit"),
+                .linkedFramework("GameController")
+            ]
+        ),
         .executableTarget(
             name: "CaptureShellApp",
+            dependencies: [
+                "TradingRuntimeBridge"
+            ],
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("AppKit"),
@@ -23,6 +41,7 @@ let package = Package(
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("CoreMedia"),
                 .linkedFramework("CoreVideo"),
+                .linkedFramework("GameController"),
                 .linkedFramework("Metal"),
                 .linkedFramework("QuartzCore"),
                 .linkedFramework("ScreenCaptureKit")
@@ -35,5 +54,6 @@ let package = Package(
                 .product(name: "Testing", package: "swift-testing")
             ]
         )
-    ]
+    ],
+    cxxLanguageStandard: .cxx20
 )
