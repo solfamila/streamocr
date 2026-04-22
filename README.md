@@ -7,7 +7,7 @@ font-template matching. There is no Vision OCR, Core ML OCR, or hybrid fallback
 path in the runtime.
 
 Current status:
-- Live path captures the display with ScreenCaptureKit.
+- Live stream analysis decodes network video with AVFoundation and can optionally save a decoded MP4 artifact.
 - Offline MP4 analysis uses the same ROI/OCR/trigger pipeline as live capture.
 - Numeric position cells are read with Apple SD Gothic Neo digit templates.
 - Optional symbol cells are read with Microsoft Sans Serif uppercase-letter templates.
@@ -55,6 +55,8 @@ swift run CaptureShellApp \
   --seed-url 'wss://bintu-h5live.nanocosmos.de/h5live/stream/stream.mp4?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=433201&pid=72860723635' \
   --runtime-config /absolute/path/runtime-config.json \
   --run-seconds 5 \
+  --record-video /tmp/live-decoded.mp4 \
+  --live-metadata-json /tmp/live-metadata.json \
   --result-json /tmp/live-result.json
 ```
 
@@ -62,6 +64,9 @@ The live command derives the nanocosmos HTTP `stream.mp4` URL from the `wss://`
 seed, decodes frames with AVFoundation, and feeds those frames through the same
 OCR pipeline as offline analysis. It is dry-run by default: BUY/subscribe
 messages are discarded unless `--send-trading-messages` is explicitly supplied.
+If `--record-video` is set, the decoded frames are also written to an MP4 file
+while OCR is running. If `--live-metadata-json` is omitted but `--record-video`
+is set, a sibling `*.metadata.json` file is written automatically.
 When live transport is enabled, `triggerEvents` include truthful OCR decisions
 like `buy_triggered` / `subscribe_triggered` plus transport outcomes such as
 `buy_transport_succeeded` and `subscribe_transport_failed`.
@@ -112,12 +117,17 @@ For the numeric position cell, the allowed characters are `0-9`, comma, and
 period in Apple SD Gothic Neo. For the symbol cell, the allowed characters are
 `A-Z` in Microsoft Sans Serif.
 
+OCR-side symbol normalization is intentionally stricter than transport-side
+symbol formatting. If OCR had to drop any alphanumeric character to get from
+the raw read to a ticker, that candidate is rejected instead of being laundered
+into a plausible symbol.
+
 The pipeline still fingerprints each ROI so unchanged frames avoid repeated OCR
 work. If the numeric cell or sampled symbol cell is unchanged, the cached
 recognition is replayed into the trigger state machine so multi-frame
 confirmation still works without rerunning OCR.
 
 In live JSON results, `playbackURL` is the actual AVAsset playback URL used by
-the player. Today that is the resolved playlist URL, so `playlistURL` and
-`playbackURL` will usually match while `streamURL` remains the resolved media
-segment URL.
+the player. That usually matches `playlistURL`, but the analyzer can fall back
+to a direct `stream.mp4` playback URL if playlist playback stalls. `streamURL`
+remains the resolved media segment URL from the playlist.

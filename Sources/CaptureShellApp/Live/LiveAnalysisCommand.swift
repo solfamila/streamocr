@@ -14,7 +14,9 @@ enum LiveAnalysisCommand {
                 runSeconds: request.runSeconds,
                 pollFPS: request.pollFPS,
                 loggingEnabled: request.verbose,
-                sendTradingMessages: request.sendTradingMessages
+                sendTradingMessages: request.sendTradingMessages,
+                recordVideoURL: request.recordVideoURL,
+                metadataURL: request.metadataURL
             )
 
             let encoder = JSONEncoder()
@@ -72,15 +74,27 @@ enum LiveAnalysisCommand {
             pollFPS = 60
         }
 
+        let recordVideoURL = value(for: "--record-video").map { URL(fileURLWithPath: $0) }
+        let explicitMetadataURL = value(for: "--live-metadata-json").map { URL(fileURLWithPath: $0) }
+        let metadataURL = explicitMetadataURL ?? recordVideoURL.map(defaultMetadataURL(for:))
+
         return LiveAnalysisRequest(
             seedURL: seedURL,
             runtimeConfigURL: value(for: "--runtime-config").map { URL(fileURLWithPath: $0) },
             resultURL: value(for: "--result-json").map { URL(fileURLWithPath: $0) },
+            recordVideoURL: recordVideoURL,
+            metadataURL: metadataURL,
             runSeconds: runSeconds,
             pollFPS: pollFPS,
             verbose: arguments.contains("--verbose"),
             sendTradingMessages: arguments.contains("--send-trading-messages")
         )
+    }
+
+    private static func defaultMetadataURL(for recordingURL: URL) -> URL {
+        let directory = recordingURL.deletingLastPathComponent()
+        let fileName = recordingURL.deletingPathExtension().lastPathComponent
+        return directory.appendingPathComponent("\(fileName).metadata.json")
     }
 }
 
@@ -88,6 +102,8 @@ private struct LiveAnalysisRequest {
     let seedURL: URL
     let runtimeConfigURL: URL?
     let resultURL: URL?
+    let recordVideoURL: URL?
+    let metadataURL: URL?
     let runSeconds: Double
     let pollFPS: Double
     let verbose: Bool
@@ -101,7 +117,7 @@ private enum LiveAnalysisCommandError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case let .missingArgument(flag):
-            return "Missing required argument \(flag). Example: --live-analyze --seed-url 'wss://...' --run-seconds 5 --runtime-config /path/runtime-config.json"
+            return "Missing required argument \(flag). Example: --live-analyze --seed-url 'wss://...' --run-seconds 5 --runtime-config /path/runtime-config.json --record-video /tmp/live.mp4"
         case let .invalidNumber(flag, value):
             return "Invalid \(flag) value '\(value)'. Use a positive number."
         }

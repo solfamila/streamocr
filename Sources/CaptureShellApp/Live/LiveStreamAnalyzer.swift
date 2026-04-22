@@ -27,10 +27,12 @@ struct LiveStreamAnalysisResult: Codable, Equatable, Sendable {
     let playbackURL: String
     let streamURL: String
     let runtimeConfigPath: String?
+    let metadataPath: String?
     let requestedRunSeconds: Double
     let elapsedSeconds: Double
     let frameCount: Int
     let frameSize: String
+    let recording: LiveDecodedRecordingSummary?
     let recognitionEvents: [OCRPipelineEvent]
     let triggerEvents: [OCRPipelineEvent]
 }
@@ -43,6 +45,8 @@ final class LiveStreamAnalyzer {
         pollFPS: Double = 60,
         loggingEnabled: Bool = false,
         sendTradingMessages: Bool = false,
+        recordVideoURL: URL? = nil,
+        metadataURL: URL? = nil,
         resolverTimeoutSeconds: TimeInterval = 10
     ) throws -> LiveStreamAnalysisResult {
         let start = Date()
@@ -65,6 +69,8 @@ final class LiveStreamAnalyzer {
         var frameSize = "unknown"
         var adjustedConfigByFrameSize: [String: CaptureRuntimeConfig] = [:]
         var lastResolved: ResolvedLiveStream?
+        var lastPlaybackURL: URL?
+        let recorder = recordVideoURL.map(LiveDecodedVideoRecorder.init)
 
         while Date() < runDeadline {
             do {
@@ -74,10 +80,11 @@ final class LiveStreamAnalyzer {
                 )
                 lastResolved = resolved
 
-                let decoded = try decodeSession(
+                let sessionResult = try decodeSession(
                     resolved: resolved,
                     runtimeConfig: runtimeConfig,
                     pipeline: pipeline,
+                    recorder: recorder,
                     runDeadline: runDeadline,
                     pollInterval: pollInterval,
                     loggingEnabled: loggingEnabled,
@@ -85,9 +92,10 @@ final class LiveStreamAnalyzer {
                     frameSize: &frameSize,
                     adjustedConfigByFrameSize: &adjustedConfigByFrameSize
                 )
+                lastPlaybackURL = sessionResult.playbackURL
 
-                if loggingEnabled, decoded > 0, Date() < runDeadline {
-                    print("[live] reconnecting after decoded_frames=\(decoded)")
+                if loggingEnabled, sessionResult.decodedFrameCount > 0, Date() < runDeadline {
+                    print("[live] reconnecting after decoded_frames=\(sessionResult.decodedFrameCount)")
                 }
             } catch {
                 if frameCount > 0 {
@@ -106,14 +114,38 @@ final class LiveStreamAnalyzer {
 
         let resolvedForResult = lastResolved
         guard frameCount > 0 else {
-            throw LiveStreamAnalyzerError.noFramesDecoded(resolvedForResult?.playlistURL ?? seedURL)
+            throw LiveStreamAnalyzerError.noFramesDecoded(lastPlaybackURL ?? resolvedForResult?.playbackURL ?? seedURL)
         }
 
-        _ = messageSender.waitForPendingMessages(timeout: 2)
+        let didFlushPendingMessages = messageSender.waitForPendingMessages(timeout: 2)
+        if loggingEnabled, !didFlushPendingMessages {
+            print("[live] timed_out_waiting_for_transport_callbacks timeout_seconds=2.00")
+        }
 
-        let recognitionEvents = eventCollector.events.filter { $0.kind == .recognition }
-        let triggerEvents = eventCollector.events.filter { $0.kind == .trigger }
-        let playbackURL = resolvedForResult?.playlistURL.absoluteString ?? ""
+        let allEvents = eventCollector.snapshot()
+        let recognitionEvents = allEvents.filter { $0.kind == .recognition }
+        let triggerEvents = allEvents.filter { $0.kind == .trigger }
+        let recording = try recorder?.finish()
+        let playbackURL = (lastPlaybackURL ?? resolvedForResult?.playbackURL)?.absoluteString ?? ""
+        let metadataPath = metadataURL?.path
+        let elapsedSeconds = Date().timeIntervalSince(start)
+        let metadata = LiveRunMetadata(
+            seedURL: (resolvedForResult?.seedURL ?? seedURL).absoluteString,
+            playlistURL: resolvedForResult?.playlistURL.absoluteString ?? "",
+            playbackURL: playbackURL,
+            streamURL: resolvedForResult?.streamURL.absoluteString ?? "",
+            runtimeConfigPath: runtimeConfigURL?.path,
+            requestedRunSeconds: runSeconds,
+            elapsedSeconds: elapsedSeconds,
+            frameCount: frameCount,
+            frameSize: frameSize,
+            recognitionEventCount: recognitionEvents.count,
+            triggerEventCount: triggerEvents.count,
+            recording: recording
+        )
+        if let metadataURL {
+            try LiveMetadataFileIO.save(metadata, to: metadataURL)
+        }
 
         return LiveStreamAnalysisResult(
             seedURL: (resolvedForResult?.seedURL ?? seedURL).absoluteString,
@@ -121,10 +153,12 @@ final class LiveStreamAnalyzer {
             playbackURL: playbackURL,
             streamURL: resolvedForResult?.streamURL.absoluteString ?? "",
             runtimeConfigPath: runtimeConfigURL?.path,
+            metadataPath: metadataPath,
             requestedRunSeconds: runSeconds,
-            elapsedSeconds: Date().timeIntervalSince(start),
+            elapsedSeconds: elapsedSeconds,
             frameCount: frameCount,
             frameSize: frameSize,
+            recording: recording,
             recognitionEvents: recognitionEvents,
             triggerEvents: triggerEvents
         )
@@ -134,6 +168,50 @@ final class LiveStreamAnalyzer {
         resolved: ResolvedLiveStream,
         runtimeConfig: CaptureRuntimeConfig?,
         pipeline: LowLatencyOCRFramePipeline,
+        recorder: LiveDecodedVideoRecorder?,
+        runDeadline: Date,
+        pollInterval: TimeInterval,
+        loggingEnabled: Bool,
+        frameCount: inout Int,
+        frameSize: inout String,
+        adjustedConfigByFrameSize: inout [String: CaptureRuntimeConfig]
+    ) throws -> DecodeSessionResult {
+        let playbackCandidates = [resolved.playbackURL] + resolved.alternatePlaybackURLs
+        var failures: [String] = []
+
+        for playbackURL in playbackCandidates {
+            do {
+                let decodedFrameCount = try decodePlaybackSession(
+                    playbackURL: playbackURL,
+                    resolved: resolved,
+                    runtimeConfig: runtimeConfig,
+                    pipeline: pipeline,
+                    recorder: recorder,
+                    runDeadline: runDeadline,
+                    pollInterval: pollInterval,
+                    loggingEnabled: loggingEnabled,
+                    frameCount: &frameCount,
+                    frameSize: &frameSize,
+                    adjustedConfigByFrameSize: &adjustedConfigByFrameSize
+                )
+                if decodedFrameCount > 0 {
+                    return DecodeSessionResult(decodedFrameCount: decodedFrameCount, playbackURL: playbackURL)
+                }
+                failures.append("\(playbackURL.absoluteString): no frames decoded")
+            } catch {
+                failures.append("\(playbackURL.absoluteString): \(error.localizedDescription)")
+            }
+        }
+
+        throw LiveStreamAnalyzerError.playerFailed(failures.joined(separator: " | "))
+    }
+
+    private func decodePlaybackSession(
+        playbackURL: URL,
+        resolved _: ResolvedLiveStream,
+        runtimeConfig: CaptureRuntimeConfig?,
+        pipeline: LowLatencyOCRFramePipeline,
+        recorder: LiveDecodedVideoRecorder?,
         runDeadline: Date,
         pollInterval: TimeInterval,
         loggingEnabled: Bool,
@@ -144,7 +222,6 @@ final class LiveStreamAnalyzer {
         let output = AVPlayerItemVideoOutput(pixelBufferAttributes: nil)
         output.suppressesPlayerRendering = true
 
-        let playbackURL = resolved.playlistURL
         let asset = AVURLAsset(url: playbackURL)
         let item = AVPlayerItem(asset: asset)
         item.add(output)
@@ -189,6 +266,7 @@ final class LiveStreamAnalyzer {
                 lastFrameDate = Date()
 
                 let frame = VideoFrame(pixelBuffer: pixelBuffer, presentationTimeStamp: itemTime, nominalFrameRate: nil)
+                try recorder?.append(frame)
                 frameSize = frame.sizeSummary
                 let adjustedRuntimeConfig = adjustedConfig(
                     for: frame,
@@ -230,4 +308,9 @@ final class LiveStreamAnalyzer {
             return adjusted
         }
     }
+}
+
+private struct DecodeSessionResult {
+    let decodedFrameCount: Int
+    let playbackURL: URL
 }

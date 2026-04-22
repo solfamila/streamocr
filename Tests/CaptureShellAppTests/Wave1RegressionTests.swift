@@ -24,6 +24,18 @@ struct TradingWebSocketContractTests {
             TradingWebSocketContract.subscribeMessage(symbol: " m s-f.t 1 ") == #"{"subscribe":"MSFT"}"#
         )
     }
+
+    @Test
+    func normalizeSymbolRejectsDroppedAlphanumericOCRCandidates() {
+        #expect(TradingWebSocketContract.normalizeSymbol("PLR2") == "")
+        #expect(TradingWebSocketContract.normalizedOCRSymbol("P1LRZ") == nil)
+
+        let analysis = TradingWebSocketContract.analyzeSymbol("P1LRZ")
+        #expect(analysis.normalized == "PLRZ")
+        #expect(analysis.droppedAlphanumericCount == 1)
+        #expect(analysis.droppedDigitCount == 1)
+        #expect(analysis.shouldRejectOCRCandidate)
+    }
 }
 
 struct NanocosmosStreamResolverTests {
@@ -34,6 +46,19 @@ struct NanocosmosStreamResolverTests {
         let candidates = try NanocosmosStreamResolver.derivePlaylistCandidates(seedURL: seed)
 
         #expect(candidates.map(\.absoluteString).contains("https://bintu-h5live.nanocosmos.de/h5live/http/playlist.m3u8?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=433201&pid=72860723635"))
+    }
+
+    @Test
+    func derivesDirectPlaybackCandidatesFromSeedURL() throws {
+        let seed = try #require(URL(string: "wss://bintu-h5live.nanocosmos.de/h5live/stream/stream.mp4?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=433201&pid=72860723635"))
+
+        let candidates = try NanocosmosStreamResolver.deriveDirectPlaybackCandidates(seedURL: seed)
+
+        #expect(
+            candidates.map(\.absoluteString).contains(
+                "https://bintu-h5live.nanocosmos.de/h5live/http/stream.mp4?stream=COeCf-9jp1Q&cid=433201&pid=72860723635"
+            )
+        )
     }
 
     @Test
@@ -502,6 +527,27 @@ struct TriggerPipelineVerificationHarnessTests {
     }
 
     @Test
+    func staleBuyTransportSuccessDoesNotDisarmAfterManualCellRearm() {
+        let sender = ControlledTransportMessageSender()
+        let eventCollector = CapturingPipelineEventHandler()
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1,
+            messageSender: sender,
+            beep: {},
+            eventHandler: eventCollector.handle(_:)
+        )
+
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "", normalizedText: "", confidence: 0.9)
+        sender.succeedNext()
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "20", normalizedText: "20", confidence: 0.9)
+
+        #expect(sender.messages == [TradingWebSocketContract.buyMessage, TradingWebSocketContract.buyMessage])
+        #expect(eventCollector.events.map(\.action) == ["buy_triggered", "buy_transport_succeeded", "buy_triggered"])
+    }
+
+    @Test
     func subscribeTriggerQueuesTransportOutcomeAndCommitsOnlyOnSuccess() {
         let sender = ControlledTransportMessageSender()
         let eventCollector = CapturingPipelineEventHandler()
@@ -540,6 +586,83 @@ struct TriggerPipelineVerificationHarnessTests {
             confidence: 0.8
         )
         #expect(sender.messages == [#"{"subscribe":"MSFT"}"#])
+    }
+
+    @Test
+    func staleSubscribeTransportSuccessDoesNotRelockAfterManualCellRearm() {
+        let sender = ControlledTransportMessageSender()
+        let eventCollector = CapturingPipelineEventHandler()
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1,
+            manualSymbolTriggerConfirmationFrames: 1,
+            messageSender: sender,
+            beep: {},
+            eventHandler: eventCollector.handle(_:)
+        )
+
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "plrz",
+            normalizedText: "PLRZ",
+            confidence: 0.9
+        )
+        pipeline.processTriggerEventForTesting(
+            region: .manualCell,
+            rawText: "15",
+            normalizedText: "15",
+            confidence: 0.9
+        )
+        sender.succeedNext(matchingPayload: TradingWebSocketContract.buyMessage)
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "", normalizedText: "", confidence: 0.9)
+        sender.succeedNext(matchingPayload: #"{"subscribe":"PLRZ"}"#)
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "aapl",
+            normalizedText: "AAPL",
+            confidence: 0.9
+        )
+
+        #expect(
+            sender.messages == [
+                #"{"subscribe":"PLRZ"}"#,
+                TradingWebSocketContract.buyMessage,
+                #"{"subscribe":"AAPL"}"#
+            ]
+        )
+        #expect(
+            eventCollector.events.map(\.action) == [
+                "subscribe_triggered",
+                "buy_triggered",
+                "buy_transport_succeeded",
+                "subscribe_transport_succeeded",
+                "subscribe_triggered"
+            ]
+        )
+    }
+
+    @Test
+    func manualSymbolTriggerRejectsDigitLaunderedOCRCandidate() {
+        let sender = ControlledTransportMessageSender()
+        let eventCollector = CapturingPipelineEventHandler()
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1,
+            manualSymbolTriggerConfirmationFrames: 1,
+            messageSender: sender,
+            beep: {},
+            eventHandler: eventCollector.handle(_:)
+        )
+
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "PLR2",
+            normalizedText: "PLR2",
+            confidence: 0.95
+        )
+
+        #expect(sender.messages.isEmpty)
+        #expect(eventCollector.events.isEmpty)
     }
 
     @Test
@@ -676,9 +799,14 @@ struct TriggerPipelineVerificationHarnessTests {
     private final class ControlledTransportMessageSender: TradingMessageSending, @unchecked Sendable {
         private let lock = NSLock()
         private(set) var messages: [String] = []
-        private var completions: [@Sendable (Result<Void, any Error>) -> Void] = []
+        private var pendingMessages: [PendingMessage] = []
 
         var reportsTransportOutcomes: Bool { true }
+
+        private struct PendingMessage {
+            let payload: String
+            let completion: @Sendable (Result<Void, any Error>) -> Void
+        }
 
         func send(
             _ payload: String,
@@ -687,12 +815,16 @@ struct TriggerPipelineVerificationHarnessTests {
         ) {
             lock.lock()
             messages.append(payload)
-            completions.append(completion)
+            pendingMessages.append(PendingMessage(payload: payload, completion: completion))
             lock.unlock()
         }
 
         func succeedNext() {
             resolveNext(with: .success(()))
+        }
+
+        func succeedNext(matchingPayload payload: String) {
+            resolveNext(matchingPayload: payload, with: .success(()))
         }
 
         func failNext() {
@@ -702,7 +834,19 @@ struct TriggerPipelineVerificationHarnessTests {
         private func resolveNext(with result: Result<Void, any Error>) {
             let completion: (@Sendable (Result<Void, any Error>) -> Void)?
             lock.lock()
-            completion = completions.isEmpty ? nil : completions.removeFirst()
+            completion = pendingMessages.isEmpty ? nil : pendingMessages.removeFirst().completion
+            lock.unlock()
+            completion?(result)
+        }
+
+        private func resolveNext(matchingPayload payload: String, with result: Result<Void, any Error>) {
+            let completion: (@Sendable (Result<Void, any Error>) -> Void)?
+            lock.lock()
+            if let index = pendingMessages.firstIndex(where: { $0.payload == payload }) {
+                completion = pendingMessages.remove(at: index).completion
+            } else {
+                completion = nil
+            }
             lock.unlock()
             completion?(result)
         }

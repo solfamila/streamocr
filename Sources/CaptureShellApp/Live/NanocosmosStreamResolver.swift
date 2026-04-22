@@ -3,6 +3,8 @@ import Foundation
 struct ResolvedLiveStream: Sendable {
     let seedURL: URL
     let playlistURL: URL
+    let playbackURL: URL
+    let alternatePlaybackURLs: [URL]
     let streamURL: URL
     let playlistText: String
 }
@@ -30,15 +32,22 @@ enum NanocosmosStreamResolverError: Error, LocalizedError {
 enum NanocosmosStreamResolver {
     static func resolve(seedURL: URL, timeoutSeconds: TimeInterval = 10) throws -> ResolvedLiveStream {
         let candidates = try derivePlaylistCandidates(seedURL: seedURL)
+        let directPlaybackCandidates = try deriveDirectPlaybackCandidates(seedURL: seedURL)
         var failures: [String] = []
 
         for playlistURL in candidates {
             do {
                 let playlistText = try fetchPlaylist(url: playlistURL, timeoutSeconds: timeoutSeconds)
                 let streamURL = try streamURL(fromPlaylist: playlistText, playlistURL: playlistURL)
+                let alternatePlaybackURLs = deduplicatedPlaybackURLs(
+                    [streamURL] + directPlaybackCandidates,
+                    excluding: [playlistURL]
+                )
                 return ResolvedLiveStream(
                     seedURL: seedURL,
                     playlistURL: playlistURL,
+                    playbackURL: playlistURL,
+                    alternatePlaybackURLs: alternatePlaybackURLs,
                     streamURL: streamURL,
                     playlistText: playlistText
                 )
@@ -51,28 +60,7 @@ enum NanocosmosStreamResolver {
     }
 
     static func derivePlaylistCandidates(seedURL: URL) throws -> [URL] {
-        guard
-            let components = URLComponents(url: seedURL, resolvingAgainstBaseURL: false),
-            let host = components.host?.lowercased(),
-            host.contains("nanocosmos") || host.contains("nanostream") || host.contains("bintu"),
-            components.path.lowercased().contains("/h5live/")
-        else {
-            throw NanocosmosStreamResolverError.invalidSeedURL(seedURL)
-        }
-
-        let lowercasedPath = components.path.lowercased()
-        guard let h5liveRange = lowercasedPath.range(of: "/h5live/") else {
-            throw NanocosmosStreamResolverError.invalidSeedURL(seedURL)
-        }
-
-        let h5liveOffset = lowercasedPath.distance(from: lowercasedPath.startIndex, to: h5liveRange.lowerBound)
-        let h5liveIndex = components.path.index(components.path.startIndex, offsetBy: h5liveOffset)
-        let prefix = String(components.path[..<h5liveIndex])
-        let targetPath = prefix + "/h5live/http/playlist.m3u8"
-        let originalItems = components.queryItems ?? []
-        let withoutURLItems = originalItems.filter { $0.name.lowercased() != "url" }
-        let preferredKeys: Set<String> = ["stream", "cid", "pid", "token", "expires", "options", "tag", "jwtoken"]
-        let minimalItems = withoutURLItems.filter { preferredKeys.contains($0.name.lowercased()) }
+        let (components, originalItems, minimalItems, withoutURLItems) = try playbackComponents(seedURL: seedURL)
 
         let queryVariants: [[URLQueryItem]] = [
             [],
@@ -86,11 +74,43 @@ enum NanocosmosStreamResolver {
         for queryItems in queryVariants {
             var playlistComponents = components
             playlistComponents.scheme = "https"
-            playlistComponents.path = targetPath
+            playlistComponents.path = playlistTargetPath(from: components.path)
             setPercentEncodedQueryItems(queryItems, on: &playlistComponents)
             playlistComponents.fragment = nil
 
             guard let url = playlistComponents.url else {
+                continue
+            }
+            if seen.insert(url.absoluteString).inserted {
+                result.append(url)
+            }
+        }
+
+        guard !result.isEmpty else {
+            throw NanocosmosStreamResolverError.invalidSeedURL(seedURL)
+        }
+        return result
+    }
+
+    static func deriveDirectPlaybackCandidates(seedURL: URL) throws -> [URL] {
+        let (components, originalItems, minimalItems, withoutURLItems) = try playbackComponents(seedURL: seedURL)
+        let queryVariants: [[URLQueryItem]] = [
+            minimalItems,
+            originalItems,
+            withoutURLItems,
+            [],
+        ]
+
+        var result: [URL] = []
+        var seen = Set<String>()
+        for queryItems in queryVariants {
+            var playbackComponents = components
+            playbackComponents.scheme = "https"
+            playbackComponents.path = playbackTargetPath(from: components.path)
+            setPercentEncodedQueryItems(queryItems, on: &playbackComponents)
+            playbackComponents.fragment = nil
+
+            guard let url = playbackComponents.url else {
                 continue
             }
             if seen.insert(url.absoluteString).inserted {
@@ -165,6 +185,64 @@ enum NanocosmosStreamResolver {
         }
         session.invalidateAndCancel()
         return try box.load().get()
+    }
+
+    private static func playbackComponents(seedURL: URL) throws -> (URLComponents, [URLQueryItem], [URLQueryItem], [URLQueryItem]) {
+        guard
+            let components = URLComponents(url: seedURL, resolvingAgainstBaseURL: false),
+            let host = components.host?.lowercased(),
+            host.contains("nanocosmos") || host.contains("nanostream") || host.contains("bintu"),
+            components.path.lowercased().contains("/h5live/")
+        else {
+            throw NanocosmosStreamResolverError.invalidSeedURL(seedURL)
+        }
+
+        let originalItems = components.queryItems ?? []
+        let withoutURLItems = originalItems.filter { $0.name.lowercased() != "url" }
+        let preferredKeys: Set<String> = ["stream", "cid", "pid", "token", "expires", "options", "tag", "jwtoken"]
+        let minimalItems = withoutURLItems.filter { preferredKeys.contains($0.name.lowercased()) }
+
+        return (components, originalItems, minimalItems, withoutURLItems)
+    }
+
+    private static func playlistTargetPath(from path: String) -> String {
+        let lowercasedPath = path.lowercased()
+        guard let h5liveRange = lowercasedPath.range(of: "/h5live/") else {
+            return path
+        }
+        let h5liveOffset = lowercasedPath.distance(from: lowercasedPath.startIndex, to: h5liveRange.lowerBound)
+        let h5liveIndex = path.index(path.startIndex, offsetBy: h5liveOffset)
+        let prefix = String(path[..<h5liveIndex])
+        return prefix + "/h5live/http/playlist.m3u8"
+    }
+
+    private static func playbackTargetPath(from path: String) -> String {
+        let lowercasedPath = path.lowercased()
+        guard let h5liveRange = lowercasedPath.range(of: "/h5live/") else {
+            return path
+        }
+        let h5liveOffset = lowercasedPath.distance(from: lowercasedPath.startIndex, to: h5liveRange.lowerBound)
+        let h5liveIndex = path.index(path.startIndex, offsetBy: h5liveOffset)
+        let prefix = String(path[..<h5liveIndex])
+        return prefix + "/h5live/http/stream.mp4"
+    }
+
+    private static func deduplicatedPlaybackURLs(_ urls: [URL], excluding excluded: [URL]) -> [URL] {
+        let excludedStrings = Set(excluded.map(\.absoluteString))
+        var seen = Set<String>()
+        var deduplicated: [URL] = []
+
+        for url in urls {
+            let absoluteString = url.absoluteString
+            guard !excludedStrings.contains(absoluteString) else {
+                continue
+            }
+            if seen.insert(absoluteString).inserted {
+                deduplicated.append(url)
+            }
+        }
+
+        return deduplicated
     }
 
     private static func resolveSegmentLine(_ segmentLine: String, playlistURL: URL) -> URL? {

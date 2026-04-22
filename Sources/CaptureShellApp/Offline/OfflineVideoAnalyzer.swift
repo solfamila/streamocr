@@ -139,8 +139,9 @@ final class OfflineVideoAnalyzer {
             throw OfflineVideoAnalyzerError.assetReaderFailed(message)
         }
 
-        let recognitionEvents = eventCollector.events.filter { $0.kind == .recognition }
-        let triggerEvents = eventCollector.events.filter { $0.kind == .trigger }
+        let allEvents = eventCollector.snapshot()
+        let recognitionEvents = allEvents.filter { $0.kind == .recognition }
+        let triggerEvents = allEvents.filter { $0.kind == .trigger }
         let verification = try expectedOutputURL.map {
             let expectedOutput = try OfflineExpectedOutputIO.load(from: $0)
             return OfflineVerificationEngine.verify(
@@ -171,6 +172,12 @@ final class PipelineEventCollector: @unchecked Sendable {
         lock.lock()
         events.append(event)
         lock.unlock()
+    }
+
+    func snapshot() -> [OCRPipelineEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
     }
 }
 

@@ -170,25 +170,24 @@ final class LocalTradingWebSocketClient: NSObject, TradingMessageSending, @unche
 
         nextSend.task.send(.string(nextSend.pending.payload)) { error in
             if let error {
-                self.lock.lock()
-                self.isSending = false
-                self.lock.unlock()
-
                 self.handleTransportError(task: nextSend.task, error: error)
                 print("[ws] send_failed event=\(nextSend.pending.event) error=\(error.localizedDescription)")
                 nextSend.pending.completion(.failure(error))
+                self.lock.lock()
+                self.isSending = false
+                self.lock.unlock()
                 if self.hasPendingSends {
                     self.connectIfNeeded()
+                    self.flushPendingSendsIfPossible()
                 }
                 return
             }
 
+            print("[ws] sent event=\(nextSend.pending.event) payload=\(nextSend.pending.payload)")
+            nextSend.pending.completion(.success(()))
             self.lock.lock()
             self.isSending = false
             self.lock.unlock()
-
-            print("[ws] sent event=\(nextSend.pending.event) payload=\(nextSend.pending.payload)")
-            nextSend.pending.completion(.success(()))
             self.flushPendingSendsIfPossible()
         }
     }

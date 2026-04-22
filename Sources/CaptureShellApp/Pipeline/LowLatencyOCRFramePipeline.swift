@@ -325,7 +325,7 @@ final class TradingTriggerStateMachine {
     }
 
     func evaluateManualSymbol(normalizedText: String, confidence: Double) -> ManualSymbolTriggerEvaluation {
-        let normalizedSymbol = TradingWebSocketContract.normalizeSymbol(normalizedText)
+        let normalizedSymbol = TradingWebSocketContract.normalizedOCRSymbol(normalizedText) ?? ""
         let isDuplicate = !normalizedSymbol.isEmpty && normalizedSymbol == lastCommittedManualSymbol
         let hasCommittedSymbol = lastCommittedManualSymbol != nil
         let isLowConfidenceChangedSymbol =
@@ -413,11 +413,21 @@ private struct PendingBuyTransport {
     let timings: TriggerStageTimings?
     let triggerEvaluationMilliseconds: Double
     let buyDecisionMilliseconds: Double
+    var isStale = false
+
+    func matches(integerValue: Int?) -> Bool {
+        self.integerValue == integerValue
+    }
 }
 
 private struct PendingSubscribeTransport {
     let symbol: String
     let triggerEvent: OCRPipelineEvent
+    var isStale = false
+
+    func matches(symbol: String) -> Bool {
+        self.symbol == symbol
+    }
 }
 
 final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
@@ -650,7 +660,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
                 rawText: recognition.rawText,
                 normalizedText: recognition.normalizedText,
                 confidence: recognition.confidence,
-                symbol: region == .manualSymbolCell ? TradingWebSocketContract.normalizeSymbol(recognition.normalizedText) : nil,
+                symbol: region == .manualSymbolCell ? TradingWebSocketContract.normalizedOCRSymbol(recognition.normalizedText) : nil,
                 parsedInteger: region == .manualCell ? ManualCellIntegerPolicy.parseInteger(recognition.normalizedText) : nil,
                 isDuplicate: nil,
                 isZeroOrEmpty: nil,
@@ -749,18 +759,24 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
     ) {
         let triggerEvaluationStart = CFAbsoluteTimeGetCurrent()
         let evaluation = triggerStateMachine.evaluateManualCell(normalizedText: recognition.normalizedText)
+        invalidatePendingBuyTransportIfNeeded(evaluation: evaluation)
+        invalidatePendingSubscribeTransportIfNeeded(manualCellEvaluation: evaluation)
         let triggerEvaluationMilliseconds = elapsedMilliseconds(since: triggerEvaluationStart)
         let buyDecisionStart = CFAbsoluteTimeGetCurrent()
         let action: String
         let shouldDispatchTrigger: Bool
 
         if evaluation.shouldTriggerBuy {
-            if pendingBuyTransport == nil {
+            if let pendingBuyTransport {
+                if pendingBuyTransport.matches(integerValue: evaluation.integerValue) {
+                    action = "transport_pending_duplicate_suppressed"
+                } else {
+                    action = "transport_pending_suppressed"
+                }
+                shouldDispatchTrigger = false
+            } else {
                 action = "buy_triggered"
                 shouldDispatchTrigger = true
-            } else {
-                action = "transport_pending_duplicate_suppressed"
-                shouldDispatchTrigger = false
             }
         } else if evaluation.isZeroOrEmpty {
             action = "armed"
@@ -827,16 +843,21 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             normalizedText: recognition.normalizedText,
             confidence: recognition.confidence
         )
+        invalidatePendingSubscribeTransportIfNeeded(evaluation: evaluation)
         let action: String
         let shouldDispatchTrigger: Bool
 
         if evaluation.shouldTriggerSubscribe {
-            if pendingSubscribeTransport == nil {
+            if let pendingSubscribeTransport {
+                if pendingSubscribeTransport.matches(symbol: evaluation.normalizedSymbol) {
+                    action = "transport_pending_duplicate_suppressed"
+                } else {
+                    action = "transport_pending_suppressed"
+                }
+                shouldDispatchTrigger = false
+            } else {
                 action = "subscribe_triggered"
                 shouldDispatchTrigger = true
-            } else {
-                action = "transport_pending_duplicate_suppressed"
-                shouldDispatchTrigger = false
             }
         } else if evaluation.isDuplicate {
             action = "duplicate_suppressed"
@@ -956,7 +977,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             }
         }
 
-        if case .success = result {
+        if case .success = result, !pendingBuyTransport.isStale {
             triggerStateMachine.commitManualCellTriggerSuccess()
         }
     }
@@ -990,9 +1011,58 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             eventHandler?(transportOutcomeEvent(from: pendingSubscribeTransport.triggerEvent, action: action))
         }
 
-        if case .success = result {
+        if case .success = result, !pendingSubscribeTransport.isStale {
             triggerStateMachine.commitManualSymbolTriggerSuccess(symbol: pendingSubscribeTransport.symbol)
         }
+    }
+
+    private func invalidatePendingBuyTransportIfNeeded(evaluation: ManualCellTriggerEvaluation) {
+        guard var pendingBuyTransport, !pendingBuyTransport.isStale else {
+            return
+        }
+
+        let candidateChanged =
+            evaluation.isZeroOrEmpty ||
+            (
+                evaluation.integerValue != nil &&
+                !pendingBuyTransport.matches(integerValue: evaluation.integerValue)
+            )
+
+        guard candidateChanged else {
+            return
+        }
+
+        pendingBuyTransport.isStale = true
+        self.pendingBuyTransport = pendingBuyTransport
+    }
+
+    private func invalidatePendingSubscribeTransportIfNeeded(evaluation: ManualSymbolTriggerEvaluation) {
+        guard var pendingSubscribeTransport, !pendingSubscribeTransport.isStale else {
+            return
+        }
+
+        guard
+            !evaluation.normalizedSymbol.isEmpty,
+            !pendingSubscribeTransport.matches(symbol: evaluation.normalizedSymbol)
+        else {
+            return
+        }
+
+        pendingSubscribeTransport.isStale = true
+        self.pendingSubscribeTransport = pendingSubscribeTransport
+    }
+
+    private func invalidatePendingSubscribeTransportIfNeeded(manualCellEvaluation: ManualCellTriggerEvaluation) {
+        guard var pendingSubscribeTransport, !pendingSubscribeTransport.isStale else {
+            return
+        }
+
+        guard !manualCellEvaluation.wasArmed, manualCellEvaluation.isArmedAfter else {
+            return
+        }
+
+        pendingSubscribeTransport.isStale = true
+        self.pendingSubscribeTransport = pendingSubscribeTransport
     }
 
     private func transportOutcomeEvent(from triggerEvent: OCRPipelineEvent, action: String) -> OCRPipelineEvent {
