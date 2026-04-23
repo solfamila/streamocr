@@ -4,7 +4,7 @@ import Foundation
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let tradingRuntimeManager = TradingRuntimeManager()
-    private lazy var legacyTradingWindowController = LegacyTradingWindowController(
+    private lazy var tradingWindowController = TradingWindowController(
         manager: tradingRuntimeManager,
         onOpenSetup: { [weak self] in
             self?.showSetupWindow()
@@ -530,14 +530,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func bindTradingCallbacks() {
         tradingRuntimeManager.onDashboardChanged = { [weak self] dashboard in
             self?.refreshTradingUI(dashboard)
-            self?.legacyTradingWindowController.updateDashboard(dashboard)
+            self?.tradingWindowController.updateDashboard(dashboard)
         }
     }
 
     @objc
     private func openTradingGUITapped() {
         syncTradingInputsToRuntime()
-        legacyTradingWindowController.showWindowAndStart()
+        tradingWindowController.showWindowAndStart()
     }
 
     private func showSetupWindow() {

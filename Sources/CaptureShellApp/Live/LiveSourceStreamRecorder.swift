@@ -1,167 +1,124 @@
+import AVFoundation
 import Foundation
 
 enum LiveSourceStreamRecorderError: Error, LocalizedError {
-    case ffmpegLaunchFailed(String)
-    case ffmpegProcessFailed(String)
-    case ffmpegTimedOut(String)
+    case recordingTimedOut(String)
+    case recordingFailed(String)
 
     var errorDescription: String? {
         switch self {
-        case let .ffmpegLaunchFailed(message):
-            return "Failed to launch ffmpeg source recorder: \(message)"
-        case let .ffmpegProcessFailed(message):
-            return "ffmpeg source recorder failed: \(message)"
-        case let .ffmpegTimedOut(message):
-            return "Timed out waiting for ffmpeg source recorder: \(message)"
+        case let .recordingTimedOut(message):
+            return "Timed out waiting for native source recorder: \(message)"
+        case let .recordingFailed(message):
+            return "Native source recorder failed: \(message)"
         }
     }
 }
 
-final class LiveSourceStreamRecorder {
+final class LiveSourceStreamRecorder: @unchecked Sendable {
     private let outputURL: URL
-    private let includeAudio: Bool
     private let loggingEnabled: Bool
-    private let stderr = Pipe()
-    private var process: Process?
 
-    init(outputURL: URL, includeAudio: Bool, loggingEnabled: Bool) {
+    private let lock = NSLock()
+    private let completionSemaphore = DispatchSemaphore(value: 0)
+    private var result: Result<NanocosmosCapturedChunk, Error>?
+    private var didStart = false
+
+    init(outputURL: URL, loggingEnabled: Bool) {
         self.outputURL = outputURL
-        self.includeAudio = includeAudio
         self.loggingEnabled = loggingEnabled
     }
 
     func start(sourceURL: URL, runSeconds: Double) throws {
         let fileManager = FileManager.default
-        try fileManager.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fileManager.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
         if fileManager.fileExists(atPath: outputURL.path) {
             try fileManager.removeItem(at: outputURL)
         }
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = Self.recordArguments(
-            sourceURL: sourceURL,
-            outputURL: outputURL,
-            includeAudio: includeAudio,
-            loggingEnabled: loggingEnabled,
-            runSeconds: runSeconds
-        )
-        process.standardOutput = Pipe()
-        process.standardError = stderr
+        lock.lock()
+        didStart = true
+        result = nil
+        lock.unlock()
 
-        do {
-            try process.run()
-        } catch {
-            throw LiveSourceStreamRecorderError.ffmpegLaunchFailed(error.localizedDescription)
+        let captureWindowSeconds = max(0.05, runSeconds)
+        let firstByteTimeoutSeconds = min(max(captureWindowSeconds, 4), 12)
+        let outputURL = self.outputURL
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let captureResult: Result<NanocosmosCapturedChunk, Error>
+            do {
+                let capturedChunk = try NanocosmosStreamingChunkPuller().captureChunk(
+                    sourceURL: sourceURL,
+                    destinationURL: outputURL,
+                    firstByteTimeoutSeconds: firstByteTimeoutSeconds,
+                    captureWindowSeconds: captureWindowSeconds
+                )
+                captureResult = .success(capturedChunk)
+            } catch {
+                captureResult = .failure(error)
+            }
+
+            self.lock.lock()
+            self.result = captureResult
+            self.lock.unlock()
+            self.completionSemaphore.signal()
         }
-
-        self.process = process
     }
 
     func finish(timeout: TimeInterval) throws -> LiveRecordingSummary? {
-        guard let process else {
+        lock.lock()
+        let started = didStart
+        let currentResult = result
+        lock.unlock()
+
+        guard started else {
             return nil
         }
 
-        let semaphore = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in
-            semaphore.signal()
+        if currentResult == nil,
+           completionSemaphore.wait(timeout: .now() + timeout) == .timedOut {
+            throw LiveSourceStreamRecorderError.recordingTimedOut(outputURL.path)
         }
 
-        if !process.isRunning {
-            semaphore.signal()
+        lock.lock()
+        let finalResult = result
+        didStart = false
+        result = nil
+        lock.unlock()
+
+        guard let finalResult else {
+            throw LiveSourceStreamRecorderError.recordingFailed("missing_result")
         }
 
-        let waitResult = semaphore.wait(timeout: .now() + timeout)
-        if waitResult == .timedOut {
-            process.terminate()
-            if semaphore.wait(timeout: .now() + 2) == .timedOut {
-                process.interrupt()
+        switch finalResult {
+        case .failure(let error):
+            throw LiveSourceStreamRecorderError.recordingFailed(error.localizedDescription)
+        case .success:
+            guard FileManager.default.fileExists(atPath: outputURL.path) else {
+                return nil
             }
-            self.process = nil
-            throw LiveSourceStreamRecorderError.ffmpegTimedOut(outputURL.path)
+            return Self.probeSummary(outputURL: outputURL, loggingEnabled: loggingEnabled)
         }
-
-        self.process = nil
-
-        let stderrText = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-        guard process.terminationStatus == 0 else {
-            let message = stderrText.isEmpty ? "terminationStatus=\(process.terminationStatus)" : stderrText
-            throw LiveSourceStreamRecorderError.ffmpegProcessFailed(message)
-        }
-
-        guard FileManager.default.fileExists(atPath: outputURL.path) else {
-            return nil
-        }
-
-        return Self.probeSummary(outputURL: outputURL, loggingEnabled: loggingEnabled)
-    }
-
-    static func recordArguments(
-        sourceURL: URL,
-        outputURL: URL,
-        includeAudio: Bool,
-        loggingEnabled: Bool,
-        runSeconds: Double
-    ) -> [String] {
-        var arguments = [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-loglevel", loggingEnabled ? "info" : "error",
-            "-rw_timeout", "5000000",
-            "-reconnect", "1",
-            "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "2",
-            "-fflags", "+genpts",
-            "-t", String(format: "%.3f", max(0.05, runSeconds)),
-            "-i", sourceURL.absoluteString,
-            "-map", "0:v:0",
-        ]
-
-        if includeAudio {
-            arguments += ["-map", "0:a:0?"]
-        } else {
-            arguments += ["-an"]
-        }
-
-        arguments += [
-            "-sn",
-            "-dn",
-            "-c:v", "copy",
-        ]
-        if includeAudio {
-            arguments += ["-c:a", "copy"]
-        }
-        arguments += [
-            "-movflags", "+faststart",
-            "-avoid_negative_ts", "make_zero",
-            outputURL.path
-        ]
-        return arguments
     }
 
     static func estimatedFrameCount(
-        nbFramesText: String?,
-        avgFrameRateText: String?,
+        nominalFrameRate: Double?,
         durationSeconds: Double?
     ) -> Int {
-        if let nbFrames = nbFramesText.flatMap(Int.init), nbFrames > 0 {
-            return nbFrames
-        }
-
         guard
             let durationSeconds,
             durationSeconds > 0,
-            let fps = LiveFFmpegVideoDecoder.parseFrameRate(avgFrameRateText),
-            fps > 0
+            let nominalFrameRate,
+            nominalFrameRate > 0
         else {
             return 0
         }
 
-        return max(0, Int((durationSeconds * fps).rounded()))
+        return max(0, Int((durationSeconds * nominalFrameRate).rounded()))
     }
 
     private static func probeSummary(outputURL: URL, loggingEnabled: Bool) -> LiveRecordingSummary {
@@ -178,106 +135,35 @@ final class LiveSourceStreamRecorder {
             fileSizeBytes: fileSizeBytes
         )
 
-        let process = Process()
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = [
-            "ffprobe",
-            "-v", "error",
-            "-print_format", "json",
-            "-show_entries", "stream=width,height,avg_frame_rate,nb_frames,start_time,duration:format=duration,size",
-            outputURL.path
-        ]
-        process.standardOutput = stdout
-        process.standardError = stderr
-
-        do {
-            try process.run()
-        } catch {
+        let asset = AVURLAsset(url: outputURL)
+        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
             if loggingEnabled {
-                print("[live] ffprobe_summary_failed launch_error=\"\(error.localizedDescription)\"")
+                print("[live] native_recording_summary_failed missing_video_track=\"\(outputURL.path)\"")
             }
             return fallback
         }
 
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            if loggingEnabled {
-                let errorText = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? "terminationStatus=\(process.terminationStatus)"
-                print("[live] ffprobe_summary_failed error=\"\(errorText)\"")
-            }
-            return fallback
-        }
-
-        guard
-            let object = try? JSONSerialization.jsonObject(with: stdout.fileHandleForReading.readDataToEndOfFile()) as? [String: Any]
-        else {
-            return fallback
-        }
-
-        let stream = (object["streams"] as? [[String: Any]])?.first
-        let format = object["format"] as? [String: Any]
-        let width = stream?["width"] as? Int ?? 0
-        let height = stream?["height"] as? Int ?? 0
-        let startTime = parseDouble(stream?["start_time"])
-        let durationSeconds = parseDouble(stream?["duration"]) ?? parseDouble(format?["duration"])
-        let avgFrameRateText = stream?["avg_frame_rate"] as? String
-        let nbFramesText = stringify(stream?["nb_frames"])
+        let durationSeconds = {
+            let seconds = CMTimeGetSeconds(asset.duration)
+            return seconds.isFinite ? max(0, seconds) : nil
+        }()
+        let naturalSize = videoTrack.naturalSize.applying(videoTrack.preferredTransform)
+        let nominalFrameRate = videoTrack.nominalFrameRate > 0 ? Double(videoTrack.nominalFrameRate) : nil
         let frameCount = estimatedFrameCount(
-            nbFramesText: nbFramesText,
-            avgFrameRateText: avgFrameRateText,
+            nominalFrameRate: nominalFrameRate,
             durationSeconds: durationSeconds
         )
-        let lastPresentationTimeSeconds: Double? = {
-            guard let durationSeconds else { return nil }
-            return max(0, (startTime ?? 0) + durationSeconds)
-        }()
 
         return LiveRecordingSummary(
             outputPath: outputURL.path,
             frameCount: frameCount,
             droppedFrameCount: 0,
-            width: width,
-            height: height,
-            firstPresentationTimeSeconds: startTime,
-            lastPresentationTimeSeconds: lastPresentationTimeSeconds,
+            width: Int(naturalSize.width.magnitude.rounded()),
+            height: Int(naturalSize.height.magnitude.rounded()),
+            firstPresentationTimeSeconds: durationSeconds.map { _ in 0 },
+            lastPresentationTimeSeconds: durationSeconds,
             durationSeconds: durationSeconds,
-            fileSizeBytes: parseInt64(format?["size"]) ?? fileSizeBytes
+            fileSizeBytes: fileSizeBytes
         )
-    }
-
-    private static func parseDouble(_ value: Any?) -> Double? {
-        switch value {
-        case let number as NSNumber:
-            return number.doubleValue
-        case let text as String:
-            return Double(text)
-        default:
-            return nil
-        }
-    }
-
-    private static func parseInt64(_ value: Any?) -> Int64? {
-        switch value {
-        case let number as NSNumber:
-            return number.int64Value
-        case let text as String:
-            return Int64(text)
-        default:
-            return nil
-        }
-    }
-
-    private static func stringify(_ value: Any?) -> String? {
-        switch value {
-        case let text as String:
-            return text
-        case let number as NSNumber:
-            return number.stringValue
-        default:
-            return nil
-        }
     }
 }

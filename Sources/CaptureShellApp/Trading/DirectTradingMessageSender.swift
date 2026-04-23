@@ -85,7 +85,12 @@ final class DirectTradingMessageSender: TradingMessageSending, @unchecked Sendab
 
     private func finishPendingOperation() {
         lock.lock()
-        pendingOperations = max(0, pendingOperations - 1)
+        #if DEBUG
+        precondition(pendingOperations > 0, "finishPendingOperation called with no pending operations")
+        #endif
+        if pendingOperations > 0 {
+            pendingOperations -= 1
+        }
         lock.unlock()
     }
 }

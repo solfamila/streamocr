@@ -7,6 +7,13 @@ import ImageIO
 import UniformTypeIdentifiers
 #endif
 
+private enum FontTemplateMatcherConstants {
+    static let maskBinarizationThreshold: UInt8 = 128
+    static let diagnosticForegroundPixelThreshold = 20
+    static let templateTargetGlyphHeightRatio: CGFloat = 0.72
+    static let jaccardTieThreshold = 0.035
+}
+
 /// Deterministic text recognizer that matches a binarized ROI against
 /// Core Text–rendered templates of the target UI font.
 ///
@@ -183,7 +190,7 @@ final class FontTemplateTextRecognizer: OCRTextRecognizing, @unchecked Sendable 
             for x in 0..<width {
                 // OCRRegionPreprocessor writes BGRA 0/255 post-binarize; use red channel.
                 let luma = row[x * 4 + 2]
-                pixels[y * width + x] = luma >= 128 ? 1 : 0
+                pixels[y * width + x] = luma >= FontTemplateMatcherConstants.maskBinarizationThreshold ? 1 : 0
             }
         }
 
@@ -205,7 +212,7 @@ final class FontTemplateTextRecognizer: OCRTextRecognizing, @unchecked Sendable 
         defer { diagnosticLock.unlock() }
         if diagnosticDumpDone { return }
         // Wait until we see actual content so the dumped mask is meaningful.
-        if mask.foregroundCount() < 20 { return }
+        if mask.foregroundCount() < FontTemplateMatcherConstants.diagnosticForegroundPixelThreshold { return }
         diagnosticDumpDone = true
 
         let dirURL = URL(fileURLWithPath: dir)
@@ -316,8 +323,7 @@ struct FontTemplateSet: Sendable {
         // Calibrate font size once so that the reference glyph's
         // bounding-box height is ~0.72 * targetHeight (matches Apple SD Gothic Neo's
         // tabular numerals when rendered on-screen against the trading panel).
-        let targetCapRatio: CGFloat = 0.72
-        let target = CGFloat(targetHeight) * targetCapRatio
+        let target = CGFloat(targetHeight) * FontTemplateMatcherConstants.templateTargetGlyphHeightRatio
 
         guard
             let (font, fontName) = resolveFont(from: options.preferredFontNames)
@@ -363,7 +369,7 @@ struct FontTemplateSet: Sendable {
             : sortedAdvances[sortedAdvances.count / 2]
         let sortedHeights = glyphHeights.sorted()
         let medianHeight = sortedHeights.isEmpty
-            ? CGFloat(targetHeight) * targetCapRatio
+            ? CGFloat(targetHeight) * FontTemplateMatcherConstants.templateTargetGlyphHeightRatio
             : sortedHeights[sortedHeights.count / 2]
 
         return FontTemplateSet(
@@ -503,7 +509,7 @@ struct FontTemplateSet: Sendable {
         for y in 0..<targetHeight {
             let srcRow = bytes.advanced(by: y * bitmapWidth)
             for x in 0..<bitmapWidth {
-                rawMask[y * bitmapWidth + x] = srcRow[x] >= 128 ? 1 : 0
+                rawMask[y * bitmapWidth + x] = srcRow[x] >= FontTemplateMatcherConstants.maskBinarizationThreshold ? 1 : 0
             }
         }
 
@@ -623,9 +629,11 @@ enum FontTemplateMatcher {
         let start: Int
         let endInclusive: Int
         let area: Int
-        let height: Int
+        let top: Int
+        let bottom: Int
 
         var width: Int { endInclusive - start + 1 }
+        var height: Int { bottom >= top ? bottom - top + 1 : 0 }
     }
 
     private static func foregroundSegments(in mask: BinaryMask, mergeGap: Int) -> [Segment] {
@@ -655,14 +663,22 @@ enum FontTemplateMatcher {
                 }
                 index += 1
             }
-            let bounds = verticalBounds(mask: mask, start: start, endInclusive: end)
             let area = (start...end).reduce(0) { $0 + columnCounts[$1] }
+            var top = mask.height
+            var bottom = -1
+            for x in start...end where columnCounts[x] > 0 {
+                for y in 0..<mask.height where mask.pixels[y * mask.width + x] == 1 {
+                    if y < top { top = y }
+                    if y > bottom { bottom = y }
+                }
+            }
             segments.append(
                 Segment(
                     start: start,
                     endInclusive: end,
                     area: area,
-                    height: bounds.map { $0.bottom - $0.top + 1 } ?? 0
+                    top: top,
+                    bottom: bottom
                 )
             )
         }
@@ -706,29 +722,12 @@ enum FontTemplateMatcher {
                     start: s,
                     endInclusive: e,
                     area: area,
-                    height: bottom >= top ? bottom - top + 1 : 0
+                    top: top,
+                    bottom: bottom
                 )
             )
         }
         return result
-    }
-
-    private static func verticalBounds(
-        mask: BinaryMask,
-        start: Int,
-        endInclusive: Int
-    ) -> (top: Int, bottom: Int)? {
-        var top = mask.height
-        var bottom = -1
-        for y in 0..<mask.height {
-            let rowStart = y * mask.width
-            for x in start...endInclusive where mask.pixels[rowStart + x] == 1 {
-                if y < top { top = y }
-                if y > bottom { bottom = y }
-                break
-            }
-        }
-        return bottom >= top ? (top, bottom) : nil
     }
 
     // MARK: Template-resampled matching
@@ -744,8 +743,6 @@ enum FontTemplateMatcher {
         let precision: Double
     }
 
-    private static let jaccardTieThreshold = 0.035
-
     /// For a single-glyph segment, compute its tight bounding box, then for each
     /// candidate template try a small grid of (width, height, dx, dy) perturbations.
     /// Ranking is primarily Jaccard, with precision used only for near ties. This
@@ -756,21 +753,8 @@ enum FontTemplateMatcher {
         segment: Segment,
         pool: [Character: FontTemplate]
     ) -> Match? {
-        // Compute vertical bbox of the segment.
-        var yTop = mask.height
-        var yBottom = -1
-        for y in 0..<mask.height {
-            let rowStart = y * mask.width
-            var rowHas = false
-            for x in segment.start...segment.endInclusive where mask.pixels[rowStart + x] == 1 {
-                rowHas = true
-                break
-            }
-            if rowHas {
-                if y < yTop { yTop = y }
-                yBottom = y
-            }
-        }
+        let yTop = segment.top
+        let yBottom = segment.bottom
         if yBottom < yTop { return nil }
         let segW = segment.width
         let segH = yBottom - yTop + 1
@@ -840,7 +824,7 @@ enum FontTemplateMatcher {
         }
 
         let confidenceDelta = candidate.confidence - current.confidence
-        if abs(confidenceDelta) <= jaccardTieThreshold {
+        if abs(confidenceDelta) <= FontTemplateMatcherConstants.jaccardTieThreshold {
             return candidate.precision > current.precision
         }
 

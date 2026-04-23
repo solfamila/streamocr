@@ -36,6 +36,7 @@ struct LiveStreamAnalysisResult: Codable, Equatable, Sendable {
     let frameCount: Int
     let frameSize: String
     let recording: LiveRecordingSummary?
+    let buySignalTimings: [BuySignalTiming]
     let recognitionEvents: [OCRPipelineEvent]
     let triggerEvents: [OCRPipelineEvent]
 }
@@ -48,7 +49,6 @@ final class LiveStreamAnalyzer {
         pollFPS: Double = 60,
         loggingEnabled: Bool = false,
         recordVideoURL: URL? = nil,
-        recordAudio: Bool = false,
         metadataURL: URL? = nil,
         resolverTimeoutSeconds: TimeInterval = 10
     ) throws -> LiveStreamAnalysisResult {
@@ -73,31 +73,83 @@ final class LiveStreamAnalyzer {
         var adjustedConfigByFrameSize: [String: CaptureRuntimeConfig] = [:]
         var lastResolved: ResolvedLiveStream?
         var lastPlaybackURL: URL?
-        let directPlaybackCandidates = LiveFFmpegVideoDecoder.preferredDirectSourceURLs(seedURL: seedURL)
+        var lastStartupError: Error?
         let captureCoordinator = recordVideoURL.map {
             LiveMediaCaptureCoordinator(
                 outputURL: $0,
-                includeAudio: recordAudio,
                 loggingEnabled: loggingEnabled,
                 runSeconds: runSeconds
             )
+        }
+
+        while Date() < runDeadline, lastResolved == nil {
+            do {
+                lastResolved = try NanocosmosStreamResolver.resolve(
+                    seedURL: seedURL,
+                    timeoutSeconds: resolverTimeoutSeconds
+                )
+            } catch {
+                lastStartupError = error
+                if loggingEnabled {
+                    print("[live] resolve_failed retrying due_to=\"\(error.localizedDescription)\"")
+                }
+                if Date() < runDeadline {
+                    Thread.sleep(forTimeInterval: 0.5)
+                }
+            }
+        }
+
+        guard let resolved = lastResolved else {
+            throw lastStartupError ?? LiveStreamAnalyzerError.noFramesDecoded(seedURL)
+        }
+
+        if let sourceChunkURL = preferredSourceChunkURL(seedURL: seedURL, resolved: resolved) {
+            do {
+                return try analyzeViaSourceChunks(
+                    seedURL: seedURL,
+                    sourceURL: sourceChunkURL,
+                    resolved: resolved,
+                    runtimeConfigURL: runtimeConfigURL,
+                    runtimeConfig: runtimeConfig,
+                    runSeconds: runSeconds,
+                    runDeadline: runDeadline,
+                    analysisStart: start,
+                    loggingEnabled: loggingEnabled,
+                    eventCollector: eventCollector,
+                    messageSender: messageSender,
+                    pipeline: pipeline,
+                    captureCoordinator: captureCoordinator,
+                    metadataURL: metadataURL
+                )
+            } catch {
+                lastStartupError = error
+                if loggingEnabled {
+                    print("[live] source_chunk_path_failed falling_back_to_avfoundation due_to=\"\(error.localizedDescription)\"")
+                }
+            }
         }
 
         while Date() < runDeadline {
             do {
                 try captureCoordinator?.ensureRecordingStarted(
                     seedURL: seedURL,
-                    remainingSeconds: runDeadline.timeIntervalSinceNow
+                    remainingSeconds: runDeadline.timeIntervalSinceNow,
+                    resolved: resolved
                 )
 
-                let sessionResult = try decodeFFmpegCandidates(
-                    directPlaybackCandidates,
+                let playbackCandidates = frameCount == 0
+                    ? [resolved.playbackURL]
+                    : [resolved.playbackURL] + resolved.alternatePlaybackURLs
+                let sessionResult = try decodePlaybackCandidates(
+                    playbackCandidates,
                     runtimeConfig: runtimeConfig,
                     pipeline: pipeline,
                     captureCoordinator: captureCoordinator,
                     runDeadline: runDeadline,
+                    pollInterval: pollInterval,
                     analysisStart: start,
                     loggingEnabled: loggingEnabled,
+                    startupMode: frameCount == 0,
                     frameCount: &frameCount,
                     frameSize: &frameSize,
                     firstFrameLatencySeconds: &firstFrameLatencySeconds,
@@ -110,47 +162,20 @@ final class LiveStreamAnalyzer {
                     print("[live] reconnecting after decoded_frames=\(sessionResult.decodedFrameCount)")
                 }
             } catch {
-                do {
-                    let resolved = try NanocosmosStreamResolver.resolve(
-                        seedURL: seedURL,
-                        timeoutSeconds: resolverTimeoutSeconds
-                    )
-                    lastResolved = resolved
-                    try captureCoordinator?.ensureRecordingStarted(
-                        seedURL: seedURL,
-                        remainingSeconds: runDeadline.timeIntervalSinceNow,
-                        resolved: resolved
-                    )
-
-                    let sessionResult = try decodeSession(
-                        resolved: resolved,
-                        runtimeConfig: runtimeConfig,
-                        pipeline: pipeline,
-                        captureCoordinator: captureCoordinator,
-                        runDeadline: runDeadline,
-                        pollInterval: pollInterval,
-                        analysisStart: start,
-                        loggingEnabled: loggingEnabled,
-                        frameCount: &frameCount,
-                        frameSize: &frameSize,
-                        firstFrameLatencySeconds: &firstFrameLatencySeconds,
-                        activeDecodeSeconds: &activeDecodeSeconds,
-                        adjustedConfigByFrameSize: &adjustedConfigByFrameSize
-                    )
-                    lastPlaybackURL = sessionResult.playbackURL
-
-                    if loggingEnabled, sessionResult.decodedFrameCount > 0, Date() < runDeadline {
-                        print("[live] reconnecting after decoded_frames=\(sessionResult.decodedFrameCount)")
+                if frameCount > 0 {
+                    if loggingEnabled {
+                        print("[live] stopping after partial decode due_to=\"\(error.localizedDescription)\"")
                     }
-                } catch {
-                    if frameCount > 0 {
-                        if loggingEnabled {
-                            print("[live] stopping after partial decode due_to=\"\(error.localizedDescription)\"")
-                        }
-                        break
-                    }
-                    throw error
+                    break
                 }
+                lastStartupError = error
+                if loggingEnabled {
+                    print("[live] startup_attach_failed retrying due_to=\"\(error.localizedDescription)\"")
+                }
+                if Date() < runDeadline {
+                    Thread.sleep(forTimeInterval: 0.5)
+                }
+                continue
             }
 
             if Date() < runDeadline {
@@ -158,35 +183,194 @@ final class LiveStreamAnalyzer {
             }
         }
 
-        if lastResolved == nil {
-            lastResolved = try? NanocosmosStreamResolver.resolve(
-                seedURL: seedURL,
-                timeoutSeconds: min(resolverTimeoutSeconds, 3)
-            )
-        }
-
-        let resolvedForResult = lastResolved
         guard frameCount > 0 else {
-            throw LiveStreamAnalyzerError.noFramesDecoded(lastPlaybackURL ?? resolvedForResult?.playbackURL ?? seedURL)
+            if let lastStartupError {
+                throw lastStartupError
+            }
+            throw LiveStreamAnalyzerError.noFramesDecoded(lastPlaybackURL ?? resolved.playbackURL)
         }
 
+        return try buildResult(
+            seedURL: seedURL,
+            resolvedForResult: resolved,
+            playbackURL: lastPlaybackURL,
+            runtimeConfigURL: runtimeConfigURL,
+            metadataURL: metadataURL,
+            runSeconds: runSeconds,
+            analysisStart: start,
+            firstFrameLatencySeconds: firstFrameLatencySeconds,
+            activeDecodeSeconds: activeDecodeSeconds,
+            frameCount: frameCount,
+            frameSize: frameSize,
+            eventCollector: eventCollector,
+            messageSender: messageSender,
+            captureCoordinator: captureCoordinator,
+            loggingEnabled: loggingEnabled
+        )
+    }
+
+    private func preferredSourceChunkURL(seedURL: URL, resolved: ResolvedLiveStream) -> URL? {
+        let sourceURL = LiveMediaCaptureCoordinator.preferredRecordingSourceURL(
+            seedURL: seedURL,
+            resolved: resolved
+        )
+        return NanocosmosStreamingChunkPuller.supports(sourceURL: sourceURL) ? sourceURL : nil
+    }
+
+    private func analyzeViaSourceChunks(
+        seedURL: URL,
+        sourceURL: URL,
+        resolved: ResolvedLiveStream,
+        runtimeConfigURL: URL?,
+        runtimeConfig: CaptureRuntimeConfig?,
+        runSeconds: Double,
+        runDeadline: Date,
+        analysisStart: Date,
+        loggingEnabled: Bool,
+        eventCollector: PipelineEventCollector,
+        messageSender: any TradingMessageSending,
+        pipeline: LowLatencyOCRFramePipeline,
+        captureCoordinator: LiveMediaCaptureCoordinator?,
+        metadataURL: URL?
+    ) throws -> LiveStreamAnalysisResult {
+        let decoder = LocalVideoFrameDecoder()
+        let chunkPuller = NanocosmosStreamingChunkPuller()
+        let chunkDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CaptureShellApp-live-chunks-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: chunkDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: chunkDirectory) }
+
+        var frameCount = 0
+        var frameSize = "unknown"
+        var firstFrameLatencySeconds: Double?
+        var activeDecodeSeconds: Double?
+        var adjustedConfigByFrameSize: [String: CaptureRuntimeConfig] = [:]
+        var chunkIndex = 0
+        var presentationTimeOffsetSeconds = 0.0
+        var lastChunkError: Error?
+
+        while Date() < runDeadline {
+            do {
+                try captureCoordinator?.ensureRecordingStarted(
+                    seedURL: seedURL,
+                    remainingSeconds: runDeadline.timeIntervalSinceNow,
+                    resolved: resolved
+                )
+
+                let chunkURL = chunkDirectory.appendingPathComponent(
+                    String(format: "chunk_%06d.mp4", chunkIndex)
+                )
+                let capturedChunk = try chunkPuller.captureChunk(
+                    sourceURL: sourceURL,
+                    destinationURL: chunkURL,
+                    firstByteTimeoutSeconds: min(max(runDeadline.timeIntervalSinceNow, 4), 12),
+                    captureWindowSeconds: 2.0
+                )
+
+                let decodeSummary = try decoder.decode(
+                    videoURL: capturedChunk.fileURL,
+                    presentationTimeOffsetSeconds: presentationTimeOffsetSeconds
+                ) { frame in
+                    try processDecodedFrame(
+                        frame,
+                        runtimeConfig: runtimeConfig,
+                        pipeline: pipeline,
+                        captureCoordinator: captureCoordinator,
+                        analysisStart: analysisStart,
+                        loggingEnabled: loggingEnabled,
+                        frameCount: &frameCount,
+                        frameSize: &frameSize,
+                        firstFrameLatencySeconds: &firstFrameLatencySeconds,
+                        activeDecodeSeconds: &activeDecodeSeconds,
+                        adjustedConfigByFrameSize: &adjustedConfigByFrameSize
+                    )
+                }
+
+                if let lastPresentationTimeSeconds = decodeSummary.lastPresentationTimeSeconds {
+                    presentationTimeOffsetSeconds = max(presentationTimeOffsetSeconds, lastPresentationTimeSeconds)
+                }
+                lastChunkError = nil
+
+                if loggingEnabled {
+                    print(
+                        "[live] source_chunk_captured index=\(chunkIndex) bytes=\(capturedChunk.byteCount) " +
+                        "capture_seconds=\(String(format: "%.3f", capturedChunk.elapsedSeconds)) " +
+                        "frames=\(decodeSummary.frameCount) source_url=\(capturedChunk.sourceURL.absoluteString)"
+                    )
+                }
+
+                try? FileManager.default.removeItem(at: capturedChunk.fileURL)
+                chunkIndex += 1
+            } catch {
+                lastChunkError = error
+                if loggingEnabled {
+                    print("[live] source_chunk_failed index=\(chunkIndex) due_to=\"\(error.localizedDescription)\"")
+                }
+                if Date() < runDeadline {
+                    Thread.sleep(forTimeInterval: frameCount > 0 ? 0.25 : 0.5)
+                }
+            }
+        }
+
+        guard frameCount > 0 else {
+            throw lastChunkError ?? LiveStreamAnalyzerError.noFramesDecoded(sourceURL)
+        }
+
+        return try buildResult(
+            seedURL: seedURL,
+            resolvedForResult: resolved,
+            playbackURL: sourceURL,
+            runtimeConfigURL: runtimeConfigURL,
+            metadataURL: metadataURL,
+            runSeconds: runSeconds,
+            analysisStart: analysisStart,
+            firstFrameLatencySeconds: firstFrameLatencySeconds,
+            activeDecodeSeconds: activeDecodeSeconds,
+            frameCount: frameCount,
+            frameSize: frameSize,
+            eventCollector: eventCollector,
+            messageSender: messageSender,
+            captureCoordinator: captureCoordinator,
+            loggingEnabled: loggingEnabled
+        )
+    }
+
+    private func buildResult(
+        seedURL: URL,
+        resolvedForResult: ResolvedLiveStream?,
+        playbackURL: URL?,
+        runtimeConfigURL: URL?,
+        metadataURL: URL?,
+        runSeconds: Double,
+        analysisStart: Date,
+        firstFrameLatencySeconds: Double?,
+        activeDecodeSeconds: Double?,
+        frameCount: Int,
+        frameSize: String,
+        eventCollector: PipelineEventCollector,
+        messageSender: any TradingMessageSending,
+        captureCoordinator: LiveMediaCaptureCoordinator?,
+        loggingEnabled: Bool
+    ) throws -> LiveStreamAnalysisResult {
         let didFlushPendingMessages = messageSender.waitForPendingMessages(timeout: 2)
         if loggingEnabled, !didFlushPendingMessages {
             print("[live] timed_out_waiting_for_transport_callbacks timeout_seconds=2.00")
         }
 
-        let allEvents = eventCollector.snapshot()
+        let collectedEvents = eventCollector.snapshotWithAnalysisTime()
+        let allEvents = collectedEvents.map(\.event)
         let recognitionEvents = allEvents.filter { $0.kind == .recognition }
         let triggerEvents = allEvents.filter { $0.kind == .trigger }
+        let buySignalTimings = PipelineTimingMetrics.buySignalTimings(from: collectedEvents)
         let recording = try captureCoordinator?.finish()
-        let playbackURL = (lastPlaybackURL ?? resolvedForResult?.playbackURL)?.absoluteString ?? ""
+        let playbackURLString = (playbackURL ?? resolvedForResult?.playbackURL)?.absoluteString ?? ""
         let metadataPath = metadataURL?.path
-        let elapsedSeconds = Date().timeIntervalSince(start)
+        let elapsedSeconds = Date().timeIntervalSince(analysisStart)
         let effectiveFrameRate = Self.effectiveFrameRate(frameCount: frameCount, activeDecodeSeconds: activeDecodeSeconds)
         let metadata = LiveRunMetadata(
             seedURL: (resolvedForResult?.seedURL ?? seedURL).absoluteString,
             playlistURL: resolvedForResult?.playlistURL.absoluteString ?? "",
-            playbackURL: playbackURL,
+            playbackURL: playbackURLString,
             streamURL: resolvedForResult?.streamURL.absoluteString ?? "",
             runtimeConfigPath: runtimeConfigURL?.path,
             requestedRunSeconds: runSeconds,
@@ -207,7 +391,7 @@ final class LiveStreamAnalyzer {
         return LiveStreamAnalysisResult(
             seedURL: (resolvedForResult?.seedURL ?? seedURL).absoluteString,
             playlistURL: resolvedForResult?.playlistURL.absoluteString ?? "",
-            playbackURL: playbackURL,
+            playbackURL: playbackURLString,
             streamURL: resolvedForResult?.streamURL.absoluteString ?? "",
             runtimeConfigPath: runtimeConfigURL?.path,
             metadataPath: metadataPath,
@@ -219,62 +403,14 @@ final class LiveStreamAnalyzer {
             frameCount: frameCount,
             frameSize: frameSize,
             recording: recording,
+            buySignalTimings: buySignalTimings,
             recognitionEvents: recognitionEvents,
             triggerEvents: triggerEvents
         )
     }
 
-    private func decodeFFmpegCandidates(
+    private func decodePlaybackCandidates(
         _ playbackCandidates: [URL],
-        runtimeConfig: CaptureRuntimeConfig?,
-        pipeline: LowLatencyOCRFramePipeline,
-        captureCoordinator: LiveMediaCaptureCoordinator?,
-        runDeadline: Date,
-        analysisStart: Date,
-        loggingEnabled: Bool,
-        frameCount: inout Int,
-        frameSize: inout String,
-        firstFrameLatencySeconds: inout Double?,
-        activeDecodeSeconds: inout Double?,
-        adjustedConfigByFrameSize: inout [String: CaptureRuntimeConfig]
-    ) throws -> DecodeSessionResult {
-        var failures: [String] = []
-
-        for sourceURL in playbackCandidates {
-            do {
-                let decoder = LiveFFmpegVideoDecoder(
-                    sourceURL: sourceURL,
-                    loggingEnabled: loggingEnabled
-                )
-                let stats = try decoder.decode(until: runDeadline) { frame in
-                    try processDecodedFrame(
-                        frame,
-                        runtimeConfig: runtimeConfig,
-                        pipeline: pipeline,
-                        captureCoordinator: captureCoordinator,
-                        analysisStart: analysisStart,
-                        loggingEnabled: loggingEnabled,
-                        frameCount: &frameCount,
-                        frameSize: &frameSize,
-                        firstFrameLatencySeconds: &firstFrameLatencySeconds,
-                        activeDecodeSeconds: &activeDecodeSeconds,
-                        adjustedConfigByFrameSize: &adjustedConfigByFrameSize
-                    )
-                }
-                if stats.frameCount > 0 {
-                    return DecodeSessionResult(decodedFrameCount: stats.frameCount, playbackURL: sourceURL)
-                }
-                failures.append("\(sourceURL.absoluteString): no frames decoded")
-            } catch {
-                failures.append("\(sourceURL.absoluteString): \(error.localizedDescription)")
-            }
-        }
-
-        throw LiveStreamAnalyzerError.playerFailed(failures.joined(separator: " | "))
-    }
-
-    private func decodeSession(
-        resolved: ResolvedLiveStream,
         runtimeConfig: CaptureRuntimeConfig?,
         pipeline: LowLatencyOCRFramePipeline,
         captureCoordinator: LiveMediaCaptureCoordinator?,
@@ -282,6 +418,7 @@ final class LiveStreamAnalyzer {
         pollInterval: TimeInterval,
         analysisStart: Date,
         loggingEnabled: Bool,
+        startupMode: Bool,
         frameCount: inout Int,
         frameSize: inout String,
         firstFrameLatencySeconds: inout Double?,
@@ -289,52 +426,16 @@ final class LiveStreamAnalyzer {
         adjustedConfigByFrameSize: inout [String: CaptureRuntimeConfig]
     ) throws -> DecodeSessionResult {
         var failures: [String] = []
-
-        let ffmpegCandidates = LiveFFmpegVideoDecoder.preferredSourceURLs(
-            seedURL: resolved.seedURL,
-            resolved: resolved
-        )
-        for sourceURL in ffmpegCandidates {
-            do {
-                let decoder = LiveFFmpegVideoDecoder(
-                    sourceURL: sourceURL,
-                    loggingEnabled: loggingEnabled
-                )
-                let stats = try decoder.decode(until: runDeadline) { frame in
-                    try processDecodedFrame(
-                        frame,
-                        runtimeConfig: runtimeConfig,
-                        pipeline: pipeline,
-                        captureCoordinator: captureCoordinator,
-                        analysisStart: analysisStart,
-                        loggingEnabled: loggingEnabled,
-                        frameCount: &frameCount,
-                        frameSize: &frameSize,
-                        firstFrameLatencySeconds: &firstFrameLatencySeconds,
-                        activeDecodeSeconds: &activeDecodeSeconds,
-                        adjustedConfigByFrameSize: &adjustedConfigByFrameSize
-                    )
-                }
-                if stats.frameCount > 0 {
-                    return DecodeSessionResult(decodedFrameCount: stats.frameCount, playbackURL: sourceURL)
-                }
-                failures.append("\(sourceURL.absoluteString): no frames decoded")
-            } catch {
-                failures.append("\(sourceURL.absoluteString): \(error.localizedDescription)")
-            }
-        }
-
-        let playbackCandidates = [resolved.playbackURL] + resolved.alternatePlaybackURLs
         for playbackURL in playbackCandidates {
             do {
                 let decodedFrameCount = try decodeAVPlayerPlaybackSession(
                     playbackURL: playbackURL,
-                    resolved: resolved,
                     runtimeConfig: runtimeConfig,
                     pipeline: pipeline,
                     captureCoordinator: captureCoordinator,
                     runDeadline: runDeadline,
                     pollInterval: pollInterval,
+                    readyTimeoutSeconds: startupMode ? 6 : 12,
                     analysisStart: analysisStart,
                     loggingEnabled: loggingEnabled,
                     frameCount: &frameCount,
@@ -357,12 +458,12 @@ final class LiveStreamAnalyzer {
 
     private func decodeAVPlayerPlaybackSession(
         playbackURL: URL,
-        resolved _: ResolvedLiveStream,
         runtimeConfig: CaptureRuntimeConfig?,
         pipeline: LowLatencyOCRFramePipeline,
         captureCoordinator: LiveMediaCaptureCoordinator?,
         runDeadline: Date,
         pollInterval: TimeInterval,
+        readyTimeoutSeconds: TimeInterval,
         analysisStart: Date,
         loggingEnabled: Bool,
         frameCount: inout Int,
@@ -384,7 +485,7 @@ final class LiveStreamAnalyzer {
         output.requestNotificationOfMediaDataChange(withAdvanceInterval: 0.03)
 
         let sessionStart = Date()
-        let readyDeadline = sessionStart.addingTimeInterval(12)
+        let readyDeadline = sessionStart.addingTimeInterval(readyTimeoutSeconds)
         let staleFrameReconnectSeconds: TimeInterval = 1.25
         var sessionFrameCount = 0
         var lastFrameDate: Date?

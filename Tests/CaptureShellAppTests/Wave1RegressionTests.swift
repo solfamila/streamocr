@@ -47,6 +47,132 @@ struct TradingMessageContractTests {
     }
 }
 
+struct PipelineTimingMetricsTests {
+    @Test
+    func extractsBuySignalTimingsFromCollectedEvents() {
+        let collectedEvents = [
+            CollectedOCRPipelineEvent(
+                event: OCRPipelineEvent(
+                    kind: .trigger,
+                    frameNumber: 1,
+                    region: "manual_cell",
+                    action: "armed",
+                    rawText: "",
+                    normalizedText: "",
+                    confidence: 0,
+                    symbol: nil,
+                    parsedInteger: nil,
+                    isDuplicate: nil,
+                    isZeroOrEmpty: true,
+                    presentationTimeSeconds: 0.1
+                ),
+                analysisTimeSeconds: 0.03
+            ),
+            CollectedOCRPipelineEvent(
+                event: OCRPipelineEvent(
+                    kind: .trigger,
+                    frameNumber: 2,
+                    region: "manual_cell",
+                    action: "buy_triggered",
+                    rawText: "10000",
+                    normalizedText: "10000",
+                    confidence: 0.99,
+                    symbol: nil,
+                    parsedInteger: 10000,
+                    isDuplicate: false,
+                    isZeroOrEmpty: false,
+                    presentationTimeSeconds: 0.133
+                ),
+                analysisTimeSeconds: 0.045
+            ),
+            CollectedOCRPipelineEvent(
+                event: OCRPipelineEvent(
+                    kind: .trigger,
+                    frameNumber: 3,
+                    region: "manual_cell",
+                    action: "buy_transport_succeeded",
+                    rawText: "10000",
+                    normalizedText: "10000",
+                    confidence: 0.99,
+                    symbol: nil,
+                    parsedInteger: 10000,
+                    isDuplicate: false,
+                    isZeroOrEmpty: false,
+                    presentationTimeSeconds: 0.133
+                ),
+                analysisTimeSeconds: 0.049
+            )
+        ]
+
+        #expect(
+            PipelineTimingMetrics.buySignalTimings(from: collectedEvents) == [
+                BuySignalTiming(
+                    frameNumber: 2,
+                    analysisTimeSeconds: 0.045,
+                    presentationTimeSeconds: 0.133,
+                    rawText: "10000",
+                    normalizedText: "10000",
+                    parsedInteger: 10000
+                )
+            ]
+        )
+    }
+
+    @Test
+    func summarizesTriggerPathSamples() {
+        let samples = [
+            TriggerPathTimingSample(
+                frameIngressToRegionMilliseconds: 1,
+                preprocessMilliseconds: 2,
+                cropMilliseconds: 0.5,
+                metalMilliseconds: 0.5,
+                fingerprintMilliseconds: 0.5,
+                gatingMilliseconds: 0.5,
+                ocrMilliseconds: 3,
+                triggerEvaluationMilliseconds: 4,
+                decisionMilliseconds: 5,
+                transportCompletionMilliseconds: 6,
+                ocrToCompletionMilliseconds: 7,
+                totalEndToEndMilliseconds: 6,
+                succeeded: true
+            ),
+            TriggerPathTimingSample(
+                frameIngressToRegionMilliseconds: 3,
+                preprocessMilliseconds: 4,
+                cropMilliseconds: 1,
+                metalMilliseconds: 1,
+                fingerprintMilliseconds: 1,
+                gatingMilliseconds: 1,
+                ocrMilliseconds: 5,
+                triggerEvaluationMilliseconds: 6,
+                decisionMilliseconds: 7,
+                transportCompletionMilliseconds: 8,
+                ocrToCompletionMilliseconds: 9,
+                totalEndToEndMilliseconds: 8,
+                succeeded: false
+            )
+        ]
+
+        #expect(
+            PipelineTimingMetrics.summarizeTriggerPathSamples(samples) ==
+                TriggerPathTimingSummary(
+                    sampleCount: 2,
+                    successCount: 1,
+                    failureCount: 1,
+                    averageFrameIngressToRegionMilliseconds: 2,
+                    averagePreprocessMilliseconds: 3,
+                    averageOCRMilliseconds: 4,
+                    averageTriggerEvaluationMilliseconds: 5,
+                    averageDecisionMilliseconds: 6,
+                    averageTransportCompletionMilliseconds: 7,
+                    averageOCRToCompletionMilliseconds: 8,
+                    averageTotalEndToEndMilliseconds: 7,
+                    maximumTotalEndToEndMilliseconds: 8
+                )
+        )
+    }
+}
+
 struct NanocosmosStreamResolverTests {
     @Test
     func derivesPlayablePlaylistCandidatesFromSeedURL() throws {
@@ -157,90 +283,50 @@ struct NanocosmosStreamResolverTests {
     }
 }
 
-struct LiveFFmpegVideoDecoderTests {
-    @Test
-    func preferredDirectSourceURLsPreferOriginalDirectCandidate() throws {
-        let seedURL = try #require(URL(string: "wss://bintu-h5live.nanocosmos.de/h5live/stream/stream.mp4?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=42674&pid=63178402599"))
-
-        let candidates = LiveFFmpegVideoDecoder.preferredDirectSourceURLs(seedURL: seedURL)
-
-        #expect(candidates.first?.absoluteString == "https://bintu-h5live.nanocosmos.de/h5live/http/stream.mp4?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=42674&pid=63178402599")
-    }
-
-    @Test
-    func preferredSourceURLsPreferOriginalDirectCandidate() throws {
-        let seedURL = try #require(URL(string: "wss://bintu-h5live.nanocosmos.de/h5live/stream/stream.mp4?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=42674&pid=63178402599"))
-        let playlistURL = try #require(URL(string: "https://bintu-h5live.nanocosmos.de/h5live/http/playlist.m3u8?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=42674&pid=63178402599"))
-        let streamURL = try #require(URL(string: "https://bintu-h5live.nanocosmos.de/h5live/http/stream.mp4?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=42674&pid=63178402599&h5pltc=5460542"))
-        let resolved = ResolvedLiveStream(
-            seedURL: seedURL,
-            playlistURL: playlistURL,
-            playbackURL: playlistURL,
-            alternatePlaybackURLs: [],
-            streamURL: streamURL,
-            playlistText: "#EXTM3U"
-        )
-
-        let candidates = LiveFFmpegVideoDecoder.preferredSourceURLs(seedURL: seedURL, resolved: resolved)
-
-        #expect(candidates.first?.absoluteString == "https://bintu-h5live.nanocosmos.de/h5live/http/stream.mp4?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=42674&pid=63178402599")
-    }
-
-    @Test
-    func parsesRationalFrameRates() {
-        #expect(LiveFFmpegVideoDecoder.parseFrameRate("60000/1001").map { abs($0 - 59.94005994) < 0.0001 } == true)
-        #expect(LiveFFmpegVideoDecoder.parseFrameRate("60") == 60)
-        #expect(LiveFFmpegVideoDecoder.parseFrameRate("0/0") == nil)
-    }
-}
-
 struct LiveMediaCaptureCoordinatorTests {
     @Test
-    func recordArgumentsDisableAudioWhenNotRequested() {
-        let arguments = LiveSourceStreamRecorder.recordArguments(
-            sourceURL: URL(string: "https://example.com/stream.mp4")!,
-            outputURL: URL(fileURLWithPath: "/tmp/output.mp4"),
-            includeAudio: false,
-            loggingEnabled: false,
-            runSeconds: 30
-        )
+    func preferredRecordingSourceURLUsesOriginalDirectCandidate() throws {
+        let seedURL = try #require(URL(string: "wss://bintu-h5live.nanocosmos.de/h5live/stream/stream.mp4?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=42674&pid=63178402599"))
 
-        #expect(arguments.contains("-an"))
-        #expect(!arguments.contains("0:a:0?"))
-        #expect(arguments.contains("/tmp/output.mp4"))
+        let recordingURL = LiveMediaCaptureCoordinator.preferredRecordingSourceURL(seedURL: seedURL)
+
+        #expect(recordingURL.absoluteString == "https://bintu-h5live.nanocosmos.de/h5live/http/stream.mp4?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=42674&pid=63178402599")
     }
 
     @Test
-    func recordArgumentsIncludeOptionalAudioMapWhenRequested() {
-        let arguments = LiveSourceStreamRecorder.recordArguments(
-            sourceURL: URL(string: "https://example.com/stream.mp4")!,
-            outputURL: URL(fileURLWithPath: "/tmp/output.mp4"),
-            includeAudio: true,
-            loggingEnabled: false,
-            runSeconds: 30
-        )
+    func preferredRecordingSourceURLKeepsFirstDirectCandidateForBintuPlaySeed() throws {
+        let seedURL = try #require(URL(string: "wss://bintu-play.nanocosmos.de/h5live/stream/stream.mp4?stream=wptPV-dvBBZ&url=rtmp%3A%2F%2Flocalhost%2Fplay&flags=checkandclose"))
 
-        #expect(arguments.contains("0:a:0?"))
-        #expect(arguments.contains("-c:a"))
-        #expect(!arguments.contains("-an"))
+        let recordingURL = LiveMediaCaptureCoordinator.preferredRecordingSourceURL(seedURL: seedURL)
+
+        #expect(recordingURL.absoluteString == "https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?stream=wptPV-dvBBZ&url=rtmp%3A%2F%2Flocalhost%2Fplay&flags=checkandclose")
     }
 
     @Test
-    func estimatedFrameCountUsesNbFramesThenFallsBackToDurationAndFPS() {
+    func estimatedFrameCountUsesDurationAndNominalFrameRate() {
         #expect(
             LiveSourceStreamRecorder.estimatedFrameCount(
-                nbFramesText: "236",
-                avgFrameRateText: "30/1",
+                nominalFrameRate: 30,
                 durationSeconds: 7.8
-            ) == 236
+            ) == 234
         )
         #expect(
             LiveSourceStreamRecorder.estimatedFrameCount(
-                nbFramesText: nil,
-                avgFrameRateText: "30000/1001",
+                nominalFrameRate: 30000 / 1001,
                 durationSeconds: 7.82
             ) == 234
         )
+    }
+}
+
+struct NanocosmosStreamingChunkPullerTests {
+    @Test
+    func supportsStreamingMP4SourceURLs() throws {
+        let streamURL = try #require(URL(string: "https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?stream=wptPV-dvBBZ"))
+        let playlistURL = try #require(URL(string: "https://bintu-play.nanocosmos.de/h5live/http/playlist.m3u8?stream=wptPV-dvBBZ"))
+
+        #expect(NanocosmosStreamingChunkPuller.supports(sourceURL: streamURL))
+        #expect(!NanocosmosStreamingChunkPuller.supports(sourceURL: playlistURL))
     }
 }
 
@@ -940,6 +1026,7 @@ struct TriggerPipelineVerificationHarnessTests {
             manualCellRearmConfirmationFrames: 1,
             manualCellTriggerConfirmationFrames: 2,
             recognizer: recognizer,
+            symbolRecognizer: recognizer,
             messageSender: sender,
             beep: {},
             eventHandler: eventCollector.handle(_:)
@@ -984,6 +1071,7 @@ struct TriggerPipelineVerificationHarnessTests {
             manualSymbolSamplingIntervalFrames: 30,
             manualSymbolTriggerConfirmationFrames: 2,
             recognizer: recognizer,
+            symbolRecognizer: recognizer,
             messageSender: sender,
             beep: {},
             eventHandler: eventCollector.handle(_:)

@@ -257,7 +257,7 @@ private func legacyControllerSafetyText(_ snapshot: TradingDashboardSnapshot) ->
 }
 
 @MainActor
-final class LegacyTradingWindowController: NSWindowController, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
+final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     private let manager: TradingRuntimeManager
     private let onOpenSetup: () -> Void
 

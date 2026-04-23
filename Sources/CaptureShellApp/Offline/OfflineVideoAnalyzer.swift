@@ -65,6 +65,7 @@ struct OfflineAnalysisResult: Codable, Equatable, Sendable {
     let frameCount: Int
     let nominalFrameRate: Double?
     let frameSize: String
+    let buySignalTimings: [BuySignalTiming]
     let recognitionEvents: [OCRPipelineEvent]
     let triggerEvents: [OCRPipelineEvent]
     let verification: OfflineVerificationReport?
@@ -78,34 +79,6 @@ final class OfflineVideoAnalyzer {
         recognizer: any OCRTextRecognizing = FontTemplateTextRecognizer()
     ) throws -> OfflineAnalysisResult {
         let runtimeConfig = try RuntimeConfigFileIO.load(from: runtimeConfigURL)
-        let asset = AVURLAsset(url: videoURL)
-
-        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
-            throw OfflineVideoAnalyzerError.missingVideoTrack(videoURL)
-        }
-
-        guard let reader = try? AVAssetReader(asset: asset) else {
-            throw OfflineVideoAnalyzerError.assetReaderUnavailable(videoURL)
-        }
-
-        let outputSettings: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-            kCVPixelBufferMetalCompatibilityKey as String: true
-        ]
-
-        let output = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: outputSettings)
-        output.alwaysCopiesSampleData = false
-
-        guard reader.canAdd(output) else {
-            throw OfflineVideoAnalyzerError.assetReaderUnavailable(videoURL)
-        }
-
-        reader.add(output)
-        guard reader.startReading() else {
-            let message = reader.error?.localizedDescription ?? "unknown error"
-            throw OfflineVideoAnalyzerError.assetReaderStartFailed(message)
-        }
-
         let eventCollector = PipelineEventCollector()
         let pipeline = LowLatencyOCRFramePipeline(
             loggingEnabled: false,
@@ -115,33 +88,35 @@ final class OfflineVideoAnalyzer {
             eventHandler: eventCollector.handle(_:)
         )
 
-        let nominalFrameRate = videoTrack.nominalFrameRate > 0 ? Double(videoTrack.nominalFrameRate) : nil
-        let adjustedRuntimeConfig = runtimeConfig.adjustedForFrameSize(
-            width: Int(videoTrack.naturalSize.applying(videoTrack.preferredTransform).width.magnitude.rounded()),
-            height: Int(videoTrack.naturalSize.applying(videoTrack.preferredTransform).height.magnitude.rounded())
-        )
-
-        var frameCount = 0
-        var lastFrameSize = "unknown"
-
-        while let sampleBuffer = output.copyNextSampleBuffer() {
-            guard let frame = VideoFrame(sampleBuffer: sampleBuffer, nominalFrameRate: nominalFrameRate) else {
-                continue
+        var adjustedRuntimeConfigCache: [String: CaptureRuntimeConfig] = [:]
+        let decodeSummary: LocalVideoDecodingSummary
+        do {
+            decodeSummary = try LocalVideoFrameDecoder().decode(videoURL: videoURL) { frame in
+                let adjustedRuntimeConfig = adjustedRuntimeConfigCache[frame.sizeSummary] ?? {
+                    let adjusted = runtimeConfig.adjustedForFrameSize(width: frame.width, height: frame.height)
+                    adjustedRuntimeConfigCache[frame.sizeSummary] = adjusted
+                    return adjusted
+                }()
+                pipeline.process(frame, runtimeConfig: adjustedRuntimeConfig)
             }
-
-            frameCount += 1
-            lastFrameSize = frame.sizeSummary
-            pipeline.process(frame, runtimeConfig: adjustedRuntimeConfig)
+        } catch let error as LocalVideoFrameDecoderError {
+            switch error {
+            case .missingVideoTrack:
+                throw OfflineVideoAnalyzerError.missingVideoTrack(videoURL)
+            case .assetReaderUnavailable:
+                throw OfflineVideoAnalyzerError.assetReaderUnavailable(videoURL)
+            case let .assetReaderStartFailed(message):
+                throw OfflineVideoAnalyzerError.assetReaderStartFailed(message)
+            case let .assetReaderFailed(message):
+                throw OfflineVideoAnalyzerError.assetReaderFailed(message)
+            }
         }
 
-        if reader.status == .failed {
-            let message = reader.error?.localizedDescription ?? "unknown decode error"
-            throw OfflineVideoAnalyzerError.assetReaderFailed(message)
-        }
-
-        let allEvents = eventCollector.snapshot()
+        let collectedEvents = eventCollector.snapshotWithAnalysisTime()
+        let allEvents = collectedEvents.map(\.event)
         let recognitionEvents = allEvents.filter { $0.kind == .recognition }
         let triggerEvents = allEvents.filter { $0.kind == .trigger }
+        let buySignalTimings = PipelineTimingMetrics.buySignalTimings(from: collectedEvents)
         let verification = try expectedOutputURL.map {
             let expectedOutput = try OfflineExpectedOutputIO.load(from: $0)
             return OfflineVerificationEngine.verify(
@@ -154,9 +129,10 @@ final class OfflineVideoAnalyzer {
         return OfflineAnalysisResult(
             videoPath: videoURL.path,
             runtimeConfigPath: runtimeConfigURL.path,
-            frameCount: frameCount,
-            nominalFrameRate: nominalFrameRate,
-            frameSize: lastFrameSize,
+            frameCount: decodeSummary.frameCount,
+            nominalFrameRate: decodeSummary.nominalFrameRate,
+            frameSize: decodeSummary.frameSizeSummary,
+            buySignalTimings: buySignalTimings,
             recognitionEvents: recognitionEvents,
             triggerEvents: triggerEvents,
             verification: verification
@@ -166,18 +142,28 @@ final class OfflineVideoAnalyzer {
 
 final class PipelineEventCollector: @unchecked Sendable {
     private let lock = NSLock()
-    private(set) var events: [OCRPipelineEvent] = []
+    private let startTimestamp = CFAbsoluteTimeGetCurrent()
+    private(set) var collectedEvents: [CollectedOCRPipelineEvent] = []
 
     func handle(_ event: OCRPipelineEvent) {
         lock.lock()
-        events.append(event)
+        let analysisTimeSeconds = max(0, CFAbsoluteTimeGetCurrent() - startTimestamp)
+        collectedEvents.append(
+            CollectedOCRPipelineEvent(event: event, analysisTimeSeconds: analysisTimeSeconds)
+        )
         lock.unlock()
     }
 
     func snapshot() -> [OCRPipelineEvent] {
         lock.lock()
         defer { lock.unlock() }
-        return events
+        return collectedEvents.map(\.event)
+    }
+
+    func snapshotWithAnalysisTime() -> [CollectedOCRPipelineEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        return collectedEvents
     }
 }
 

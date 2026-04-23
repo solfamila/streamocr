@@ -7,7 +7,7 @@ font-template matching. There is no Vision OCR, Core ML OCR, or hybrid fallback
 path in the runtime.
 
 Current status:
-- Live stream analysis decodes network video with AVFoundation and can optionally save a decoded MP4 artifact.
+- Live stream analysis prefers a Nanocosmos source-chunk decode path for `stream.mp4` feeds and can optionally save a source-level MP4 artifact.
 - Offline MP4 analysis uses the same ROI/OCR/trigger pipeline as live capture.
 - Numeric position cells are read with Apple SD Gothic Neo digit templates.
 - Optional symbol cells are read with Microsoft Sans Serif uppercase-letter templates.
@@ -56,25 +56,29 @@ swift run CaptureShellApp \
   --runtime-config /absolute/path/runtime-config.json \
   --run-seconds 5 \
   --record-video /tmp/live-source.mp4 \
-  --record-audio \
   --live-metadata-json /tmp/live-metadata.json \
   --result-json /tmp/live-result.json
 ```
 
 The live command derives the nanocosmos HTTP `stream.mp4` URL from the `wss://`
-seed, prefers a direct `ffmpeg` decode path for live frames, and falls back to
-AVFoundation only if the direct decoder cannot produce video. Those decoded
-frames feed the same OCR pipeline as offline analysis. The CLI live analyzer is
-dry-run only: it records and analyzes, but does not place trades.
-If `--record-video` is set, the app starts a parallel ffmpeg recorder against
-the Nanocosmos source URL while OCR keeps decoding frames independently. That
-recorder is source-level, much closer to the Python forensics recorder than the
-older decoded-frame MP4 writer. If `--record-audio` is also supplied, the same
-source recording keeps the audio track instead of capturing and muxing audio
-separately. If `--live-metadata-json` is omitted but `--record-video` is set, a
-sibling `*.metadata.json` file is written automatically.
+seed and uses a native source-chunk decode path for Nanocosmos streaming MP4
+feeds. If that source-chunk path is unavailable, the analyzer falls back to
+AVFoundation playback. Those decoded frames feed the same OCR pipeline as
+offline analysis. The CLI live analyzer is dry-run only: it records and analyzes,
+but does not place trades.
+If `--record-video` is set, the app starts a parallel native source recorder
+against the Nanocosmos source URL while OCR keeps decoding frames independently.
+That recorder is source-level, much closer to the Python forensics recorder than
+the older decoded-frame MP4 writer. Streaming MP4 source recording preserves the
+source tracks, so audio remains present whenever the source provides it. The old
+`--record-audio` flag is gone because source recording already keeps the source
+audio track automatically. If `--live-metadata-json` is omitted but
+`--record-video` is set, a sibling `*.metadata.json` file is written automatically.
 The AppKit capture window is the path that routes OCR `BUY` / `SUBSCRIBE`
 signals directly into the in-process trading runtime.
+Both live and offline result JSON now include `buySignalTimings`, which lists
+each `buy_triggered` event with the media `presentationTimeSeconds` and the
+wall-clock `analysisTimeSeconds` from the start of that run.
 
 ### Benchmark the PLRZ Fixture
 

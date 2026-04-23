@@ -2,14 +2,12 @@ import Foundation
 
 final class LiveMediaCaptureCoordinator {
     private let outputURL: URL
-    private let includeAudio: Bool
     private let loggingEnabled: Bool
     private var recorder: LiveSourceStreamRecorder?
     private var hasStartedRecording = false
 
-    init(outputURL: URL, includeAudio: Bool, loggingEnabled: Bool, runSeconds _: Double) {
+    init(outputURL: URL, loggingEnabled: Bool, runSeconds _: Double) {
         self.outputURL = outputURL
-        self.includeAudio = includeAudio
         self.loggingEnabled = loggingEnabled
     }
 
@@ -28,12 +26,11 @@ final class LiveMediaCaptureCoordinator {
         } ?? Self.preferredRecordingSourceURL(seedURL: seedURL)
 
         if loggingEnabled {
-            print("[live] starting_source_recording url=\(sourceURL.absoluteString) include_audio=\(includeAudio)")
+            print("[live] starting_source_recording url=\(sourceURL.absoluteString)")
         }
 
         let recorder = LiveSourceStreamRecorder(
             outputURL: outputURL,
-            includeAudio: includeAudio,
             loggingEnabled: loggingEnabled
         )
         try recorder.start(sourceURL: sourceURL, runSeconds: remainingSeconds)
@@ -50,15 +47,18 @@ final class LiveMediaCaptureCoordinator {
     }
 
     static func preferredRecordingSourceURL(seedURL: URL, resolved: ResolvedLiveStream) -> URL {
-        let preferredCandidates = LiveFFmpegVideoDecoder.preferredSourceURLs(
-            seedURL: seedURL,
-            resolved: resolved
-        )
-        return preferredCandidates.first ?? resolved.playbackURL
+        preferredDirectSourceURL(seedURL: seedURL) ?? resolved.streamURL
     }
 
     static func preferredRecordingSourceURL(seedURL: URL) -> URL {
-        let preferredCandidates = LiveFFmpegVideoDecoder.preferredDirectSourceURLs(seedURL: seedURL)
-        return preferredCandidates.first ?? seedURL
+        preferredDirectSourceURL(seedURL: seedURL) ?? seedURL
+    }
+
+    private static func preferredDirectSourceURL(seedURL: URL) -> URL? {
+        let directCandidates = (try? NanocosmosStreamResolver.deriveDirectPlaybackCandidates(seedURL: seedURL)) ?? []
+        if let originalStyleCandidate = directCandidates.first(where: { $0.absoluteString.contains("url=") }) {
+            return originalStyleCandidate
+        }
+        return directCandidates.first
     }
 }
