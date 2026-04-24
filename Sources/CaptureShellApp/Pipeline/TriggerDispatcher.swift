@@ -43,8 +43,18 @@ private struct PendingSubscribeTransport {
     }
 }
 
+private struct RecentRetryableBuyRejection {
+    let integerValue: Int?
+    let timestamp: CFAbsoluteTime
+
+    func matches(integerValue: Int?) -> Bool {
+        self.integerValue == integerValue
+    }
+}
+
 final class TriggerDispatcher: @unchecked Sendable {
     private static let latencySummarySampleCount = 10
+    private static let retryableBuyCooldownSeconds: CFAbsoluteTime = 1.0
 
     private let withPipelineState: (@escaping () -> Void) -> Void
     private let assertPipelineStateHeld: () -> Void
@@ -55,6 +65,7 @@ final class TriggerDispatcher: @unchecked Sendable {
 
     private var pendingBuyTransport: PendingBuyTransport?
     private var pendingSubscribeTransport: PendingSubscribeTransport?
+    private var recentRetryableBuyRejection: RecentRetryableBuyRejection?
     private var timingSamplesByEvent: [String: [TriggerPathTimingSample]] = [:]
 
     init(
@@ -78,6 +89,7 @@ final class TriggerDispatcher: @unchecked Sendable {
         assertPipelineStateHeld()
         pendingBuyTransport = nil
         pendingSubscribeTransport = nil
+        recentRetryableBuyRejection = nil
         timingSamplesByEvent.removeAll(keepingCapacity: true)
     }
 
@@ -93,6 +105,13 @@ final class TriggerDispatcher: @unchecked Sendable {
                 }
                 return TriggerDispatchDecision(
                     action: "transport_pending_suppressed",
+                    shouldDispatchTrigger: false
+                )
+            }
+
+            if shouldSuppressRetryableBuyRejection(for: evaluation.integerValue) {
+                return TriggerDispatchDecision(
+                    action: "retryable_rejection_cooldown_suppressed",
                     shouldDispatchTrigger: false
                 )
             }
@@ -213,6 +232,7 @@ final class TriggerDispatcher: @unchecked Sendable {
             return
         }
 
+        recentRetryableBuyRejection = nil
         pendingBuyTransport.isStale = true
         self.pendingBuyTransport = pendingBuyTransport
     }
@@ -248,7 +268,7 @@ final class TriggerDispatcher: @unchecked Sendable {
         self.pendingSubscribeTransport = pendingSubscribeTransport
     }
 
-    private func handleBuyTransportResult(_ result: Result<Void, any Error>) {
+    private func handleBuyTransportResult(_ result: Result<TradingMessageSendOutcome, any Error>) {
         assertPipelineStateHeld()
         guard let pendingBuyTransport else {
             return
@@ -281,12 +301,23 @@ final class TriggerDispatcher: @unchecked Sendable {
             )
         }
 
-        if case .success = result, !pendingBuyTransport.isStale {
-            triggerStateMachine.commitManualCellTriggerSuccess()
+        switch result {
+        case let .success(outcome):
+            recentRetryableBuyRejection = nil
+            if outcome.commitsTriggerState, !pendingBuyTransport.isStale {
+                triggerStateMachine.commitManualCellTriggerSuccess()
+            }
+        case let .failure(error):
+            if isRetryableBuyRejection(error) {
+                recentRetryableBuyRejection = RecentRetryableBuyRejection(
+                    integerValue: pendingBuyTransport.integerValue,
+                    timestamp: CFAbsoluteTimeGetCurrent()
+                )
+            }
         }
     }
 
-    private func handleSubscribeTransportResult(_ result: Result<Void, any Error>) {
+    private func handleSubscribeTransportResult(_ result: Result<TradingMessageSendOutcome, any Error>) {
         assertPipelineStateHeld()
         guard let pendingSubscribeTransport else {
             return
@@ -319,9 +350,32 @@ final class TriggerDispatcher: @unchecked Sendable {
             )
         }
 
-        if case .success = result, !pendingSubscribeTransport.isStale {
+        if case let .success(outcome) = result,
+           outcome.commitsTriggerState,
+           !pendingSubscribeTransport.isStale
+        {
             triggerStateMachine.commitManualSymbolTriggerSuccess(symbol: pendingSubscribeTransport.symbol)
         }
+    }
+
+    private func shouldSuppressRetryableBuyRejection(for integerValue: Int?) -> Bool {
+        guard let recentRetryableBuyRejection else {
+            return false
+        }
+
+        guard recentRetryableBuyRejection.matches(integerValue: integerValue) else {
+            return false
+        }
+
+        return (CFAbsoluteTimeGetCurrent() - recentRetryableBuyRejection.timestamp) < Self.retryableBuyCooldownSeconds
+    }
+
+    private func isRetryableBuyRejection(_ error: any Error) -> Bool {
+        if case .retryableRejection = error as? TradingMessageSendError {
+            return true
+        }
+
+        return false
     }
 
     private func transportOutcomeEvent(from triggerEvent: OCRPipelineEvent, action: String) -> OCRPipelineEvent {
@@ -342,7 +396,7 @@ final class TriggerDispatcher: @unchecked Sendable {
     }
 
     private func transportAction(
-        for result: Result<Void, any Error>,
+        for result: Result<TradingMessageSendOutcome, any Error>,
         success: String,
         failure: String
     ) -> String {
@@ -354,16 +408,16 @@ final class TriggerDispatcher: @unchecked Sendable {
         }
     }
 
-    private func transportResultLabel(for result: Result<Void, any Error>) -> String {
+    private func transportResultLabel(for result: Result<TradingMessageSendOutcome, any Error>) -> String {
         switch result {
-        case .success:
-            "success"
+        case let .success(outcome):
+            outcome.resultLabel
         case .failure:
             "failure"
         }
     }
 
-    private func transportErrorSuffix(for result: Result<Void, any Error>) -> String {
+    private func transportErrorSuffix(for result: Result<TradingMessageSendOutcome, any Error>) -> String {
         switch result {
         case .success:
             ""
@@ -377,7 +431,7 @@ final class TriggerDispatcher: @unchecked Sendable {
         triggerEvaluationMilliseconds: Double,
         decisionMilliseconds: Double,
         sendCompletionTimestamp: CFAbsoluteTime,
-        result: Result<Void, any Error>
+        result: Result<TradingMessageSendOutcome, any Error>
     ) -> TriggerPathTimingSample {
         let frameIngressToRegionMilliseconds = max(
             0,
@@ -399,8 +453,8 @@ final class TriggerDispatcher: @unchecked Sendable {
 
         let succeeded: Bool
         switch result {
-        case .success:
-            succeeded = true
+        case let .success(outcome):
+            succeeded = outcome.commitsTriggerState
         case .failure:
             succeeded = false
         }
@@ -427,7 +481,7 @@ final class TriggerDispatcher: @unchecked Sendable {
         eventName: String,
         decisionLabel: String,
         sample: TriggerPathTimingSample,
-        result: Result<Void, any Error>
+        result: Result<TradingMessageSendOutcome, any Error>
     ) {
         guard loggingEnabled else {
             return

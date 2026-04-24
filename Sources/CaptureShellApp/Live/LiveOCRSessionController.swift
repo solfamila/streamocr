@@ -63,6 +63,7 @@ final class LiveOCRSessionController: @unchecked Sendable {
     private var activeSessionID: UUID?
     private var activeRuntimeConfig: CaptureRuntimeConfig?
     private var buyQuantityRatio = 0.5
+    private var activeMessageSender: OCRAutomationTradingMessageSender?
 
     init(manager: TradingRuntimeManager) {
         self.manager = manager
@@ -129,8 +130,10 @@ final class LiveOCRSessionController: @unchecked Sendable {
 
     func stop() {
         stateLock.lock()
+        let messageSender = activeMessageSender
         activeSessionID = nil
         stateLock.unlock()
+        messageSender?.cancelPendingMessages(reason: "Live OCR stopped before pending trading actions completed.")
         publishStatus(.off)
     }
 
@@ -175,6 +178,25 @@ final class LiveOCRSessionController: @unchecked Sendable {
                 )
             }
         )
+        stateLock.lock()
+        if activeSessionID == sessionID {
+            activeMessageSender = messageSender
+        }
+        stateLock.unlock()
+
+        defer {
+            let flushed = messageSender.waitForPendingMessages(timeout: 2)
+            if loggingEnabled, !flushed {
+                print("[live-session] pending_trading_actions_did_not_flush_before_exit")
+            }
+
+            stateLock.lock()
+            if activeSessionID == sessionID || activeSessionID == nil {
+                activeMessageSender = nil
+            }
+            stateLock.unlock()
+        }
+
         let pipeline = LowLatencyOCRFramePipeline(
             loggingEnabled: loggingEnabled,
             recognizer: FontTemplateTextRecognizer(),

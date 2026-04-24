@@ -74,8 +74,19 @@ source tracks, so audio remains present whenever the source provides it. The old
 `--record-audio` flag is gone because source recording already keeps the source
 audio track automatically. If `--live-metadata-json` is omitted but
 `--record-video` is set, a sibling `*.metadata.json` file is written automatically.
-The AppKit capture window is the path that routes OCR `BUY` / `SUBSCRIBE`
-signals directly into the in-process trading runtime.
+There are three live OCR paths in the app:
+- CLI `--live-analyze`: dry-run analysis / JSON / optional recording only
+- Trading GUI live stream: routes OCR `BUY` / `SUBSCRIBE` directly into the
+  in-process `TradingRuntimeManager`
+- Display capture window: routes ScreenCaptureKit OCR directly into the same
+  in-process runtime
+
+In the trading GUI live-stream path, OCR `SUBSCRIBE` updates the active symbol
+in the runtime, and OCR `BUY` uses the configured OCR buy ratio to size the
+order (`ocr shares * ratio`, rounded down, minimum 1 share). A live OCR `BUY`
+is only actually submitted when controller trading is armed. When disarmed, the
+signal is intentionally ignored instead of placing a delayed order later.
+
 Both live and offline result JSON now include `buySignalTimings`, which lists
 each `buy_triggered` event with the media `presentationTimeSeconds` and the
 wall-clock `analysisTimeSeconds` from the start of that run.

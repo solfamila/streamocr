@@ -6,11 +6,21 @@ struct OCRAutomationTradingConfiguration: Sendable {
     let controllerArmed: Bool
 }
 
+private enum BuyRejectionDisposition {
+    case intentionallyIgnored(String)
+    case retryable(String)
+}
+
 final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked Sendable {
     private let manager: TradingRuntimeManager
     private let configurationProvider: @MainActor () -> OCRAutomationTradingConfiguration
     private let lock = NSLock()
     private var pendingOperations = 0
+    private var isCancelled = false
+    private var cancellationReason: String?
+
+    private let buyAvailabilityPollIntervalNanoseconds: UInt64 = 100_000_000
+    private let buyAvailabilityTimeoutSeconds: TimeInterval = 2.0
 
     init(
         manager: TradingRuntimeManager,
@@ -25,23 +35,28 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
     func send(
         _ payload: String,
         event: String,
-        completion: @escaping @Sendable (Result<Void, any Error>) -> Void
+        completion: @escaping @Sendable (Result<TradingMessageSendOutcome, any Error>) -> Void
     ) {
         beginPendingOperation()
 
         Task { @MainActor [self] in
-            let result: Result<Void, any Error>
+            let result: Result<TradingMessageSendOutcome, any Error>
 
             do {
-                switch event {
-                case "BUY":
-                    try handleBuy(payload: payload)
-                case "SUBSCRIBE":
-                    try handleSubscribe(payload: payload)
-                default:
-                    throw TradingRuntimeManagerError.actionFailed("Unsupported OCR automation event: \(event)")
+                if let cancellationReason = cancellationReasonSnapshot() {
+                    result = .failure(TradingMessageSendError.cancelled(reason: cancellationReason))
+                } else {
+                    switch event {
+                    case "BUY":
+                        result = .success(try await handleBuy(payload: payload))
+                    case "SUBSCRIBE":
+                        try throwIfCancelled()
+                        try handleSubscribe(payload: payload)
+                        result = .success(.submitted)
+                    default:
+                        throw TradingRuntimeManagerError.actionFailed("Unsupported OCR automation event: \(event)")
+                    }
                 }
-                result = .success(())
             } catch {
                 result = .failure(error)
             }
@@ -64,6 +79,13 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         return pendingOperationCount == 0
     }
 
+    func cancelPendingMessages(reason: String) {
+        lock.lock()
+        isCancelled = true
+        cancellationReason = reason
+        lock.unlock()
+    }
+
     @MainActor
     private func handleSubscribe(payload: String) throws {
         guard
@@ -84,7 +106,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
     }
 
     @MainActor
-    private func handleBuy(payload: String) throws {
+    private func handleBuy(payload: String) async throws -> TradingMessageSendOutcome {
         let configuration = configurationProvider()
         let buyMessage = try TradingMessageContract.parseBuyMessage(payload)
         let quantityInput = resolvedBuyQuantity(
@@ -95,8 +117,10 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
 
         guard configuration.controllerArmed else {
             print(disarmedBuyLogLine(ocrQuantity: buyMessage.ocrQuantity, ratio: configuration.buyQuantityRatio, quantityInput: quantityInput))
-            return
+            return .intentionallyIgnored(reason: "Controller trading is not armed.")
         }
+
+        try throwIfCancelled()
 
         let dashboard = manager.dashboard
 
@@ -110,13 +134,34 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
             selectedTraceId: dashboard.inputs.selectedTraceId
         )
 
-        let preSubmitDashboard = manager.dashboard
+        let preSubmitDashboard = try await awaitBuyAvailability(quantityInput: quantityInput)
         print(armedBuyAttemptLogLine(
             snapshot: preSubmitDashboard,
             ocrQuantity: buyMessage.ocrQuantity,
             ratio: configuration.buyQuantityRatio,
             quantityInput: quantityInput
         ))
+
+        if let disposition = buyRejectionDisposition(snapshot: preSubmitDashboard) {
+            let reason = rejectionReason(for: disposition)
+            let rejectionLine = rejectedBuyLogLine(
+                reason: reason,
+                snapshot: preSubmitDashboard,
+                ocrQuantity: buyMessage.ocrQuantity,
+                ratio: configuration.buyQuantityRatio,
+                quantityInput: quantityInput
+            )
+            print(rejectionLine)
+            manager.appendMessage("OCR buy rejected: \(reason)")
+            switch disposition {
+            case .intentionallyIgnored:
+                return .intentionallyIgnored(reason: reason)
+            case .retryable:
+                throw TradingMessageSendError.retryableRejection(reason: reason)
+            }
+        }
+
+        try throwIfCancelled()
 
         do {
             _ = try manager.submitBuy(
@@ -125,7 +170,8 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
             )
         } catch {
             let postFailureDashboard = manager.dashboard
-            if let consumedReason = consumedBuyRejectionReason(error: error, snapshot: postFailureDashboard) {
+            if let disposition = classifiedBuyRejection(error: error, snapshot: postFailureDashboard) {
+                let consumedReason = rejectionReason(for: disposition)
                 let rejectionLine = rejectedBuyLogLine(
                     reason: consumedReason,
                     snapshot: postFailureDashboard,
@@ -135,7 +181,12 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
                 )
                 print(rejectionLine)
                 manager.appendMessage("OCR buy rejected: \(consumedReason)")
-                return
+                switch disposition {
+                case .intentionallyIgnored:
+                    return .intentionallyIgnored(reason: consumedReason)
+                case .retryable:
+                    throw TradingMessageSendError.retryableRejection(reason: consumedReason)
+                }
             }
             let failureLine = failedBuyLogLine(
                 error: error,
@@ -160,6 +211,8 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
                 )
             )
         }
+
+        return .submitted
     }
 
     private func resolvedBuyQuantity(ocrQuantity: Int?, ratio: Double, fallbackQuantity: Int) -> Int {
@@ -288,25 +341,66 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         )
     }
 
-    private func consumedBuyRejectionReason(
+    private func classifiedBuyRejection(
         error: any Error,
         snapshot: TradingDashboardSnapshot
-    ) -> String? {
+    ) -> BuyRejectionDisposition? {
+        if let sendError = error as? TradingMessageSendError {
+            switch sendError {
+            case let .retryableRejection(reason):
+                return .retryable(reason)
+            case let .cancelled(reason):
+                return .intentionallyIgnored(reason)
+            }
+        }
+
         if case let TradingRuntimeManagerError.actionFailed(message) = error {
             if message == "Buy action is not currently available" {
-                return specificBuyUnavailableReason(snapshot)
+                return buyRejectionDisposition(snapshot: snapshot)
             }
 
             if isRuntimeBuyGateError(message) {
-                return message
+                return classifyKnownRuntimeBuyGateMessage(message)
             }
         }
 
         if !snapshot.panel.canBuy {
-            return specificBuyUnavailableReason(snapshot)
+            return buyRejectionDisposition(snapshot: snapshot)
         }
 
         return nil
+    }
+
+    private func buyRejectionDisposition(snapshot: TradingDashboardSnapshot) -> BuyRejectionDisposition? {
+        let reason = specificBuyUnavailableReason(snapshot)
+        switch reason {
+        case "Kill switch is enabled.",
+            "Order exceeds the max order notional limit.",
+            "Projected exposure exceeds the max open notional limit.":
+            return .intentionallyIgnored(reason)
+        case "Buy action is not currently available.":
+            return .retryable(reason)
+        default:
+            return .retryable(reason)
+        }
+    }
+
+    private func classifyKnownRuntimeBuyGateMessage(_ message: String) -> BuyRejectionDisposition {
+        if message == "Trading is halted by the kill switch" ||
+            message.hasPrefix("Order notional $") ||
+            message.hasPrefix("Projected open notional $")
+        {
+            return .intentionallyIgnored(message)
+        }
+
+        return .retryable(message)
+    }
+
+    private func rejectionReason(for disposition: BuyRejectionDisposition) -> String {
+        switch disposition {
+        case let .intentionallyIgnored(reason), let .retryable(reason):
+            return reason
+        }
     }
 
     private func specificBuyUnavailableReason(_ snapshot: TradingDashboardSnapshot) -> String {
@@ -341,6 +435,36 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         return knownPrefixes.contains { message.hasPrefix($0) }
     }
 
+    @MainActor
+    private func awaitBuyAvailability(quantityInput: Int) async throws -> TradingDashboardSnapshot {
+        manager.refreshDashboard()
+        var snapshot = manager.dashboard
+        if snapshot.panel.canBuy {
+            return snapshot
+        }
+
+        let deadline = Date().addingTimeInterval(buyAvailabilityTimeoutSeconds)
+        while Date() < deadline {
+            try throwIfCancelled()
+            try await Task.sleep(nanoseconds: buyAvailabilityPollIntervalNanoseconds)
+            manager.refreshDashboard()
+            snapshot = manager.dashboard
+            if snapshot.panel.canBuy {
+                return snapshot
+            }
+
+            if snapshot.panel.status.tradingKillSwitch {
+                return snapshot
+            }
+
+            if quantityInput <= 0 {
+                return snapshot
+            }
+        }
+
+        return snapshot
+    }
+
     private func buyNote(ocrQuantity: Int?, ratio: Double, quantityInput: Int) -> String {
         if let ocrQuantity {
             return String(
@@ -358,6 +482,19 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         lock.lock()
         defer { lock.unlock() }
         return pendingOperations
+    }
+
+    private func cancellationReasonSnapshot() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return isCancelled ? (cancellationReason ?? "OCR automation session stopped.") : nil
+    }
+
+    @MainActor
+    private func throwIfCancelled() throws {
+        if let cancellationReason = cancellationReasonSnapshot() {
+            throw TradingMessageSendError.cancelled(reason: cancellationReason)
+        }
     }
 
     private func beginPendingOperation() {

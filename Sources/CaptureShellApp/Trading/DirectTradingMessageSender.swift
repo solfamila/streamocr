@@ -14,12 +14,12 @@ final class DirectTradingMessageSender: TradingMessageSending, @unchecked Sendab
     func send(
         _ payload: String,
         event: String,
-        completion: @escaping @Sendable (Result<Void, any Error>) -> Void
+        completion: @escaping @Sendable (Result<TradingMessageSendOutcome, any Error>) -> Void
     ) {
         beginPendingOperation()
 
         Task { @MainActor [self] in
-            let result: Result<Void, any Error>
+            let result: Result<TradingMessageSendOutcome, any Error>
 
             do {
                 switch event {
@@ -31,7 +31,7 @@ final class DirectTradingMessageSender: TradingMessageSending, @unchecked Sendab
                 default:
                     throw TradingRuntimeManagerError.actionFailed("Unsupported direct trading event: \(event)")
                 }
-                result = .success(())
+                result = .success(.submitted)
             } catch {
                 result = .failure(error)
             }

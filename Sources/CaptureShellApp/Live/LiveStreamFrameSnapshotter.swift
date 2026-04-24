@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreGraphics
+import CoreImage
 import Foundation
 
 struct LiveStreamFrameSnapshot {
@@ -23,8 +24,14 @@ enum LiveStreamFrameSnapshotterError: Error, LocalizedError {
     }
 }
 
+private enum LiveStreamFrameSnapshotterDecodeStop: Error {
+    case firstFrameCaptured
+}
+
 final class LiveStreamFrameSnapshotter {
     private let chunkPuller = NanocosmosStreamingChunkPuller()
+    private let decoder = LocalVideoFrameDecoder()
+    private let ciContext = CIContext(options: [.cacheIntermediates: false])
 
     func captureSnapshot(seedURL: URL) throws -> LiveStreamFrameSnapshot {
         let resolved = try NanocosmosStreamResolver.resolve(seedURL: seedURL)
@@ -50,14 +57,21 @@ final class LiveStreamFrameSnapshotter {
             captureWindowSeconds: 1.2
         )
 
-        let asset = AVURLAsset(url: capturedChunk.fileURL)
-        let generator = AVAssetImageGenerator(asset: asset)
-        generator.appliesPreferredTrackTransform = true
-        generator.requestedTimeToleranceAfter = .zero
-        generator.requestedTimeToleranceBefore = .zero
+        var firstFrameImage: CGImage?
+        do {
+            _ = try decoder.decode(videoURL: capturedChunk.fileURL) { [ciContext] frame in
+                let image = CIImage(cvPixelBuffer: frame.pixelBuffer)
+                guard let cgImage = ciContext.createCGImage(image, from: image.extent) else {
+                    return
+                }
+                firstFrameImage = cgImage
+                throw LiveStreamFrameSnapshotterDecodeStop.firstFrameCaptured
+            }
+        } catch LiveStreamFrameSnapshotterDecodeStop.firstFrameCaptured {
+            // Expected early exit once we have the first decoded frame.
+        }
 
-        let frameTime = CMTime(seconds: 0.0, preferredTimescale: 600)
-        guard let cgImage = try? generator.copyCGImage(at: frameTime, actualTime: nil) else {
+        guard let cgImage = firstFrameImage else {
             throw LiveStreamFrameSnapshotterError.unableToRenderFrame(sourceURL)
         }
 

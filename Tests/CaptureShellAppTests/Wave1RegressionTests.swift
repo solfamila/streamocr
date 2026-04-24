@@ -1114,12 +1114,12 @@ struct TriggerPipelineVerificationHarnessTests {
         func send(
             _ payload: String,
             event _: String,
-            completion: @escaping @Sendable (Result<Void, any Error>) -> Void
+            completion: @escaping @Sendable (Result<TradingMessageSendOutcome, any Error>) -> Void
         ) {
             lock.lock()
             messages.append(payload)
             lock.unlock()
-            completion(.success(()))
+            completion(.success(.submitted))
         }
     }
 
@@ -1132,13 +1132,13 @@ struct TriggerPipelineVerificationHarnessTests {
 
         private struct PendingMessage {
             let payload: String
-            let completion: @Sendable (Result<Void, any Error>) -> Void
+            let completion: @Sendable (Result<TradingMessageSendOutcome, any Error>) -> Void
         }
 
         func send(
             _ payload: String,
             event _: String,
-            completion: @escaping @Sendable (Result<Void, any Error>) -> Void
+            completion: @escaping @Sendable (Result<TradingMessageSendOutcome, any Error>) -> Void
         ) {
             lock.lock()
             messages.append(payload)
@@ -1147,27 +1147,27 @@ struct TriggerPipelineVerificationHarnessTests {
         }
 
         func succeedNext() {
-            resolveNext(with: .success(()))
+            resolveNext(with: .success(.submitted))
         }
 
         func succeedNext(matchingPayload payload: String) {
-            resolveNext(matchingPayload: payload, with: .success(()))
+            resolveNext(matchingPayload: payload, with: .success(.submitted))
         }
 
         func failNext() {
             resolveNext(with: .failure(TestTransportError.sendFailed))
         }
 
-        private func resolveNext(with result: Result<Void, any Error>) {
-            let completion: (@Sendable (Result<Void, any Error>) -> Void)?
+        private func resolveNext(with result: Result<TradingMessageSendOutcome, any Error>) {
+            let completion: (@Sendable (Result<TradingMessageSendOutcome, any Error>) -> Void)?
             lock.lock()
             completion = pendingMessages.isEmpty ? nil : pendingMessages.removeFirst().completion
             lock.unlock()
             completion?(result)
         }
 
-        private func resolveNext(matchingPayload payload: String, with result: Result<Void, any Error>) {
-            let completion: (@Sendable (Result<Void, any Error>) -> Void)?
+        private func resolveNext(matchingPayload payload: String, with result: Result<TradingMessageSendOutcome, any Error>) {
+            let completion: (@Sendable (Result<TradingMessageSendOutcome, any Error>) -> Void)?
             lock.lock()
             if let index = pendingMessages.firstIndex(where: { $0.payload == payload }) {
                 completion = pendingMessages.remove(at: index).completion
