@@ -8,7 +8,11 @@ import Testing
 struct TradingMessageContractTests {
     @Test
     func buyMessageMatchesContract() {
-        #expect(TradingMessageContract.buyMessage == #"{"action":"BUY"}"#)
+        #expect(TradingMessageContract.buyMessage(ocrQuantity: nil) == #"{"action":"BUY"}"#)
+        #expect(TradingMessageContract.buyMessage(ocrQuantity: 10000) == #"{"action":"BUY","ocrQuantity":10000}"#)
+
+        let parsed = try? TradingMessageContract.parseBuyMessage(#"{"action":"BUY","ocrQuantity":10000}"#)
+        #expect(parsed == OCRBuyMessage(ocrQuantity: 10000))
     }
 
     @Test
@@ -589,8 +593,8 @@ struct TriggerPipelineVerificationHarnessTests {
 
         #expect(
             sender.messages == [
-                TradingMessageContract.buyMessage,
-                TradingMessageContract.buyMessage
+                TradingMessageContract.buyMessage(ocrQuantity: 15),
+                TradingMessageContract.buyMessage(ocrQuantity: 9)
             ]
         )
     }
@@ -636,7 +640,7 @@ struct TriggerPipelineVerificationHarnessTests {
         #expect(
             sender.messages == [
                 #"{"subscribe":"MSFT"}"#,
-                TradingMessageContract.buyMessage,
+                TradingMessageContract.buyMessage(ocrQuantity: 15),
                 #"{"subscribe":"AAPL"}"#
             ]
         )
@@ -738,14 +742,14 @@ struct TriggerPipelineVerificationHarnessTests {
         pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
         pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
 
-        #expect(sender.messages == [TradingMessageContract.buyMessage])
+        #expect(sender.messages == [TradingMessageContract.buyMessage(ocrQuantity: 15)])
         #expect(eventCollector.events.map(\.action) == ["buy_triggered"])
 
         sender.succeedNext()
         #expect(eventCollector.events.map(\.action) == ["buy_triggered", "buy_transport_succeeded"])
 
         pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
-        #expect(sender.messages == [TradingMessageContract.buyMessage])
+        #expect(sender.messages == [TradingMessageContract.buyMessage(ocrQuantity: 15)])
     }
 
     @Test
@@ -766,7 +770,12 @@ struct TriggerPipelineVerificationHarnessTests {
         #expect(eventCollector.events.map(\.action) == ["buy_triggered", "buy_transport_failed"])
 
         pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
-        #expect(sender.messages == [TradingMessageContract.buyMessage, TradingMessageContract.buyMessage])
+        #expect(
+            sender.messages == [
+                TradingMessageContract.buyMessage(ocrQuantity: 15),
+                TradingMessageContract.buyMessage(ocrQuantity: 15)
+            ]
+        )
         #expect(eventCollector.events.map(\.action) == ["buy_triggered", "buy_transport_failed", "buy_triggered"])
 
         sender.succeedNext()
@@ -774,7 +783,7 @@ struct TriggerPipelineVerificationHarnessTests {
     }
 
     @Test
-    func staleBuyTransportSuccessDoesNotDisarmAfterConfirmedDifferentCandidate() {
+    func firstPendingBuyWinsUntilRearmEvenIfLaterNonzeroReadsDiffer() {
         let sender = ControlledTransportMessageSender()
         let eventCollector = CapturingPipelineEventHandler()
         let pipeline = LowLatencyOCRFramePipeline(
@@ -790,8 +799,8 @@ struct TriggerPipelineVerificationHarnessTests {
         sender.succeedNext()
         pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "20", normalizedText: "20", confidence: 0.9)
 
-        #expect(sender.messages == [TradingMessageContract.buyMessage, TradingMessageContract.buyMessage])
-        #expect(eventCollector.events.map(\.action) == ["buy_triggered", "buy_transport_succeeded", "buy_triggered"])
+        #expect(sender.messages == [TradingMessageContract.buyMessage(ocrQuantity: 15)])
+        #expect(eventCollector.events.map(\.action) == ["buy_triggered", "buy_transport_succeeded"])
     }
 
     @Test
@@ -811,7 +820,7 @@ struct TriggerPipelineVerificationHarnessTests {
         sender.succeedNext()
         pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
 
-        #expect(sender.messages == [TradingMessageContract.buyMessage])
+        #expect(sender.messages == [TradingMessageContract.buyMessage(ocrQuantity: 15)])
         #expect(eventCollector.events.map(\.action) == ["buy_triggered", "buy_transport_succeeded"])
     }
 
@@ -881,7 +890,7 @@ struct TriggerPipelineVerificationHarnessTests {
             normalizedText: "15",
             confidence: 0.9
         )
-        sender.succeedNext(matchingPayload: TradingMessageContract.buyMessage)
+        sender.succeedNext(matchingPayload: TradingMessageContract.buyMessage(ocrQuantity: 15))
         pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "", normalizedText: "", confidence: 0.9)
         sender.succeedNext(matchingPayload: #"{"subscribe":"PLRZ"}"#)
         pipeline.processTriggerEventForTesting(
@@ -894,7 +903,7 @@ struct TriggerPipelineVerificationHarnessTests {
         #expect(
             sender.messages == [
                 #"{"subscribe":"PLRZ"}"#,
-                TradingMessageContract.buyMessage,
+                TradingMessageContract.buyMessage(ocrQuantity: 15),
                 #"{"subscribe":"AAPL"}"#
             ]
         )
@@ -1011,7 +1020,7 @@ struct TriggerPipelineVerificationHarnessTests {
             confidence: 1.0
         )
 
-        #expect(sender.messages == [TradingMessageContract.buyMessage])
+        #expect(sender.messages == [TradingMessageContract.buyMessage(ocrQuantity: 10000)])
     }
 
     @Test
@@ -1046,7 +1055,7 @@ struct TriggerPipelineVerificationHarnessTests {
         pipeline.process(VideoFrame(pixelBuffer: pixelBuffer), runtimeConfig: runtimeConfig)
 
         #expect(recognizer.callCount == 1)
-        #expect(sender.messages == [TradingMessageContract.buyMessage])
+        #expect(sender.messages == [TradingMessageContract.buyMessage(ocrQuantity: 10000)])
         #expect(eventCollector.events.count == 2)
         #expect(eventCollector.events[0].kind == .recognition)
         #expect(eventCollector.events[1].kind == .trigger)

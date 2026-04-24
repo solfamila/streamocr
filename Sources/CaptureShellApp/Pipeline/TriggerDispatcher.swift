@@ -168,7 +168,7 @@ final class TriggerDispatcher: @unchecked Sendable {
             buyDecisionMilliseconds: buyDecisionMilliseconds
         )
 
-        messageSender.send(TradingMessageContract.buyMessage, event: "BUY") { [weak self] result in
+        messageSender.send(TradingMessageContract.buyMessage(ocrQuantity: integerValue), event: "BUY") { [weak self] result in
             self?.withPipelineState { [weak self] in
                 self?.handleBuyTransportResult(result)
             }
@@ -208,12 +208,8 @@ final class TriggerDispatcher: @unchecked Sendable {
         }
 
         let didGenuinelyRearm = !evaluation.wasArmed && evaluation.isArmedAfter
-        let didConfirmDifferentCandidate =
-            evaluation.shouldTriggerBuy &&
-            evaluation.integerValue != nil &&
-            !pendingBuyTransport.matches(integerValue: evaluation.integerValue)
 
-        guard didGenuinelyRearm || didConfirmDifferentCandidate else {
+        guard didGenuinelyRearm else {
             return
         }
 

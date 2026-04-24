@@ -260,17 +260,24 @@ private func legacyControllerSafetyText(_ snapshot: TradingDashboardSnapshot) ->
 final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     private let manager: TradingRuntimeManager
     private let onOpenSetup: () -> Void
+    private let onStartLiveStream: (String) -> Void
+    private let onStopLiveStream: () -> Void
+    private let onLiveStreamURLChanged: (String) -> Void
+    private let onOCRBuyRatioChanged: (Double) -> Void
 
     private var dashboard: TradingDashboardSnapshot
+    private var liveStatus = LiveOCRSessionStatusSnapshot.off
     private var refreshTimer: Timer?
     private var recoveryMaintenanceInFlight = false
 
     private let twsStatusLabel = makeLegacyLabel("TWS: Disconnected", font: .systemFont(ofSize: 13, weight: .semibold), color: .systemRed)
     private let accountStatusLabel = makeLegacyLabel("Account: --", font: .systemFont(ofSize: 13, weight: .medium))
     private let directLinkStatusLabel = makeLegacyLabel("Link: Direct OCR", font: .systemFont(ofSize: 13, weight: .medium), color: .systemGreen)
+    private let liveStatusLabel = makeLegacyLabel("Live: Off", font: .systemFont(ofSize: 13, weight: .medium), color: .secondaryLabelColor)
     private let buildModeBannerLabel = makeLegacyLabel("", font: .systemFont(ofSize: 12, weight: .semibold), color: .systemOrange)
     private let recoveryBannerLabel = makeLegacyLabel("", font: .systemFont(ofSize: 12, weight: .semibold), color: .systemRed)
 
+    private lazy var liveURLField = makeLegacyInputField("", width: 360, target: self, action: #selector(liveStreamFieldAction), delegate: self)
     private lazy var symbolField = makeLegacyInputField("", width: 120, target: self, action: #selector(subscribeAction), delegate: self)
     private let marketHeaderLabel = makeLegacyLabel("Market Data: waiting for a subscription", font: .systemFont(ofSize: 15, weight: .semibold))
     private let bidLabel = makeLegacyValueLabel()
@@ -279,6 +286,7 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     private let positionLabel = makeLegacyValueLabel()
     private let pnlLabel = makeLegacyValueLabel()
     private let bookDepthLabel = makeLegacyValueLabel()
+    private let liveMetricsLabel = makeLegacyLabel("Live OCR is off.", font: .systemFont(ofSize: 12, weight: .medium), color: .secondaryLabelColor)
     private let pricePreviewLabel = makeLegacyLabel("Prices: buy --  |  sell --", font: .monospacedSystemFont(ofSize: 13, weight: .medium))
     private let safetyStatusLabel = makeLegacyLabel("Safety: quote waiting  |  controller disarmed  |  kill switch off", font: .systemFont(ofSize: 12, weight: .medium), color: .secondaryLabelColor)
     private let controllerHintLabel = makeLegacyLabel("Controller: Square buy  |  Circle close  |  Triangle cancel all  |  Cross toggle qty", font: .systemFont(ofSize: 12, weight: .medium), color: .secondaryLabelColor)
@@ -286,7 +294,9 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     private lazy var quantityField = makeLegacyInputField("1", width: 72, target: self, action: #selector(inputFieldAction), delegate: self)
     private lazy var bufferField = makeLegacyInputField("0.01", width: 80, target: self, action: #selector(inputFieldAction), delegate: self)
     private lazy var maxPositionField = makeLegacyInputField("40000", width: 110, target: self, action: #selector(inputFieldAction), delegate: self)
+    private lazy var ocrRatioField = makeLegacyInputField("0.50", width: 80, target: self, action: #selector(ocrRatioFieldAction), delegate: self)
 
+    private lazy var liveStartStopButton = makeLegacyButton("Start Live OCR", target: self, action: #selector(toggleLiveStream))
     private lazy var subscribeButton = makeLegacyButton("Subscribe", target: self, action: #selector(subscribeAction))
     private lazy var buyButton = makeLegacyButton("Buy Limit", target: self, action: #selector(buyAction))
     private lazy var closeButton = makeLegacyButton("Close Long", target: self, action: #selector(closeAction))
@@ -307,9 +317,20 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     private let traceTextView = makeLegacyReadOnlyTextView()
     private let messagesTextView = makeLegacyReadOnlyTextView()
 
-    init(manager: TradingRuntimeManager, onOpenSetup: @escaping () -> Void) {
+    init(
+        manager: TradingRuntimeManager,
+        onOpenSetup: @escaping () -> Void,
+        onStartLiveStream: @escaping (String) -> Void,
+        onStopLiveStream: @escaping () -> Void,
+        onLiveStreamURLChanged: @escaping (String) -> Void,
+        onOCRBuyRatioChanged: @escaping (Double) -> Void
+    ) {
         self.manager = manager
         self.onOpenSetup = onOpenSetup
+        self.onStartLiveStream = onStartLiveStream
+        self.onStopLiveStream = onStopLiveStream
+        self.onLiveStreamURLChanged = onLiveStreamURLChanged
+        self.onOCRBuyRatioChanged = onOCRBuyRatioChanged
         self.dashboard = manager.dashboard
 
         let window = NSWindow(
@@ -343,7 +364,13 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
         NSApp.activate(ignoringOtherApps: true)
         startRefreshTimer()
         if !manager.isStarted {
-            _ = manager.start()
+            let startResult = manager.startWithAutoConnectFallback()
+            if let autoDetectedConfig = startResult.autoDetectedConfig {
+                appendMessage("Auto-detected IB connection at \(autoDetectedConfig.host):\(autoDetectedConfig.port)")
+            } else if !startResult.connected, !startResult.attemptedFallbackPorts.isEmpty {
+                let ports = startResult.attemptedFallbackPorts.map(String.init).joined(separator: ", ")
+                appendMessage("Tried common IB ports (\(ports)) after the default connection failed")
+            }
         } else {
             manager.refreshDashboard()
         }
@@ -354,6 +381,29 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
         refreshInterface()
     }
 
+    func updateLiveStatus(_ liveStatus: LiveOCRSessionStatusSnapshot) {
+        self.liveStatus = liveStatus
+        refreshLiveSection()
+    }
+
+    func updateOCRBuyRatio(_ ratio: Double) {
+        guard !isEditingField(ocrRatioField) else {
+            return
+        }
+        ocrRatioField.stringValue = String(format: "%.2f", ratio)
+    }
+
+    func setLiveURLText(_ urlText: String, force: Bool = false) {
+        guard force || !isEditingField(liveURLField) else {
+            return
+        }
+        liveURLField.stringValue = urlText
+    }
+
+    var currentLiveStreamURLText: String {
+        liveURLField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     func windowWillClose(_ notification: Notification) {
         _ = notification
         refreshTimer?.invalidate()
@@ -361,13 +411,23 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     }
 
     func controlTextDidChange(_ notification: Notification) {
-        if let field = notification.object as? NSTextField, field === symbolField {
+        guard let field = notification.object as? NSTextField else {
+            return
+        }
+
+        if field === symbolField {
             syncInputsToRuntime()
+        } else if field === liveURLField {
+            onLiveStreamURLChanged(currentLiveStreamURLText)
         }
     }
 
     func controlTextDidEndEditing(_ notification: Notification) {
-        _ = notification
+        if let field = notification.object as? NSTextField, field === liveURLField {
+            onLiveStreamURLChanged(currentLiveStreamURLText)
+        } else if let field = notification.object as? NSTextField, field === ocrRatioField {
+            onOCRBuyRatioChanged(sanitizedOCRBuyRatio())
+        }
         syncInputsToRuntime()
     }
 
@@ -442,6 +502,7 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
         contentView.layer?.backgroundColor = legacyAppBackgroundColor().cgColor
 
         styleLegacyTintedButton(subscribeButton, bezelColor: NSColor(calibratedRed: 0.15, green: 0.45, blue: 0.95, alpha: 1))
+        styleLegacyTintedButton(liveStartStopButton, bezelColor: NSColor(calibratedRed: 0.13, green: 0.48, blue: 0.82, alpha: 1))
         styleLegacyTintedButton(buyButton, bezelColor: NSColor(calibratedRed: 0.13, green: 0.64, blue: 0.32, alpha: 1))
         styleLegacyTintedButton(closeButton, bezelColor: NSColor(calibratedRed: 0.96, green: 0.60, blue: 0.18, alpha: 1))
         styleLegacyTintedButton(cancelAllButton, bezelColor: NSColor(calibratedRed: 0.90, green: 0.27, blue: 0.22, alpha: 1))
@@ -465,16 +526,17 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
             rootStack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor)
         ])
 
-        let statusLabels = makeLegacyRowStack([twsStatusLabel, accountStatusLabel, directLinkStatusLabel])
+        let statusLabels = makeLegacyRowStack([twsStatusLabel, accountStatusLabel, directLinkStatusLabel, liveStatusLabel])
         statusLabels.spacing = 18
 
         armControllerButton.widthAnchor.constraint(equalToConstant: 150).isActive = true
         killSwitchButton.widthAnchor.constraint(equalToConstant: 180).isActive = true
         loadRecoveryButton.widthAnchor.constraint(equalToConstant: 122).isActive = true
         deleteLogsButton.widthAnchor.constraint(equalToConstant: 122).isActive = true
+        settingsButton.title = "OCR Setup"
         settingsButton.widthAnchor.constraint(equalToConstant: 118).isActive = true
 
-        let statusControls = makeLegacyRowStack([armControllerButton, killSwitchButton, loadRecoveryButton, deleteLogsButton, settingsButton])
+        let statusControls = makeLegacyRowStack([armControllerButton, killSwitchButton, loadRecoveryButton, deleteLogsButton])
         statusControls.spacing = 12
 
         let statusRow = makeLegacyRowStack([statusLabels, makeLegacyFlexibleSpacer(), statusControls])
@@ -524,7 +586,21 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
             rightStack.bottomAnchor.constraint(equalTo: rightPanel.bottomAnchor, constant: -18)
         ])
 
+        liveStartStopButton.widthAnchor.constraint(equalToConstant: 150).isActive = true
         subscribeButton.widthAnchor.constraint(equalToConstant: 116).isActive = true
+
+        let liveRow = makeLegacyRowStack([
+            makeLegacyLabel("Live URL", font: .systemFont(ofSize: 13, weight: .semibold), color: .secondaryLabelColor),
+            liveURLField,
+            liveStartStopButton,
+            settingsButton
+        ])
+        leftStack.addArrangedSubview(liveRow)
+        liveRow.widthAnchor.constraint(equalTo: leftStack.widthAnchor).isActive = true
+
+        leftStack.addArrangedSubview(liveMetricsLabel)
+        liveMetricsLabel.widthAnchor.constraint(equalTo: leftStack.widthAnchor).isActive = true
+
         let symbolRow = makeLegacyRowStack([
             makeLegacyLabel("Symbol", font: .systemFont(ofSize: 13, weight: .semibold), color: .secondaryLabelColor),
             symbolField,
@@ -551,6 +627,8 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
         let inputRow = makeLegacyRowStack([
             makeLegacyLabel("Qty", font: .systemFont(ofSize: 12, weight: .medium), color: .secondaryLabelColor),
             quantityField,
+            makeLegacyLabel("OCR Ratio", font: .systemFont(ofSize: 12, weight: .medium), color: .secondaryLabelColor),
+            ocrRatioField,
             makeLegacyLabel("Buffer", font: .systemFont(ofSize: 12, weight: .medium), color: .secondaryLabelColor),
             bufferField,
             makeLegacyLabel("Max Position $", font: .systemFont(ofSize: 12, weight: .medium), color: .secondaryLabelColor),
@@ -654,6 +732,7 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     private func refreshInterface() {
         updateInputFieldsFromState()
         refreshStatusLabels()
+        refreshLiveSection()
         refreshMarketSection()
         refreshOrders()
         refreshTracePopup()
@@ -725,6 +804,40 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
             recoveryBannerLabel.stringValue = status.startupRecoveryBanner
         }
         buildModeBannerLabel.isHidden = true
+    }
+
+    private func refreshLiveSection() {
+        liveStatusLabel.stringValue = liveStatus.headline.replacingOccurrences(of: "stream: ", with: ": ")
+        switch liveStatus.state {
+        case .off:
+            liveStatusLabel.textColor = .secondaryLabelColor
+        case .connecting:
+            liveStatusLabel.textColor = .systemOrange
+        case .live:
+            liveStatusLabel.textColor = .systemGreen
+        case .error:
+            liveStatusLabel.textColor = .systemRed
+        }
+
+        liveMetricsLabel.stringValue = liveStatus.detail
+        liveMetricsLabel.textColor = liveStatus.state == .error ? .systemRed : .secondaryLabelColor
+        liveStartStopButton.title = liveStatus.isRunning ? "Stop Live OCR" : "Start Live OCR"
+        liveStartStopButton.bezelColor = liveStatus.isRunning
+            ? NSColor(calibratedRed: 0.70, green: 0.20, blue: 0.18, alpha: 1)
+            : NSColor(calibratedRed: 0.13, green: 0.48, blue: 0.82, alpha: 1)
+
+        if !isEditingField(liveURLField) {
+            liveURLField.stringValue = liveStatus.seedURLText
+        }
+
+        if !isEditingField(ocrRatioField) {
+            ocrRatioField.stringValue = sanitizedOCRBuyRatioString()
+        }
+
+        settingsButton.isEnabled = !dashboard.panel.status.controllerArmed
+        settingsButton.toolTip = dashboard.panel.status.controllerArmed
+            ? "Disarm the controller before editing OCR ROIs."
+            : nil
     }
 
     private func refreshMarketSection() {
@@ -849,6 +962,9 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
         if !isEditingField(quantityField) {
             quantityField.stringValue = String(dashboard.inputs.quantityInput)
         }
+        if !isEditingField(ocrRatioField) {
+            ocrRatioField.stringValue = sanitizedOCRBuyRatioString()
+        }
         if !isEditingField(bufferField) {
             bufferField.stringValue = String(format: "%.2f", dashboard.inputs.priceBuffer)
         }
@@ -858,6 +974,9 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
         if !isEditingField(symbolField) {
             symbolField.stringValue = dashboard.inputs.symbolInput
         }
+        if !isEditingField(liveURLField), !liveStatus.seedURLText.isEmpty {
+            liveURLField.stringValue = liveStatus.seedURLText
+        }
     }
 
     private func isEditingField(_ field: NSTextField) -> Bool {
@@ -865,6 +984,15 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
             return false
         }
         return window.firstResponder == editor
+    }
+
+    private func sanitizedOCRBuyRatio() -> Double {
+        let ratio = ocrRatioField.doubleValue
+        return ratio.isFinite && ratio > 0 ? ratio : 0.5
+    }
+
+    private func sanitizedOCRBuyRatioString() -> String {
+        String(format: "%.2f", sanitizedOCRBuyRatio())
     }
 
     private func localStateColor(_ order: TradingDashboardSnapshot.Order) -> NSColor {
@@ -914,6 +1042,37 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     private func inputFieldAction() {
         syncInputsToRuntime()
         manager.refreshDashboard()
+    }
+
+    @objc
+    private func liveStreamFieldAction() {
+        onLiveStreamURLChanged(currentLiveStreamURLText)
+    }
+
+    @objc
+    private func ocrRatioFieldAction() {
+        let ratio = sanitizedOCRBuyRatio()
+        ocrRatioField.stringValue = String(format: "%.2f", ratio)
+        onOCRBuyRatioChanged(ratio)
+    }
+
+    @objc
+    private func toggleLiveStream() {
+        if liveStatus.isRunning {
+            onStopLiveStream()
+            appendMessage("Stopped live OCR stream")
+            return
+        }
+
+        let urlText = currentLiveStreamURLText
+        guard !urlText.isEmpty else {
+            appendMessage("Enter a live stream URL before starting OCR")
+            return
+        }
+
+        onLiveStreamURLChanged(urlText)
+        onStartLiveStream(urlText)
+        appendMessage("Starting live OCR stream")
     }
 
     @objc
@@ -1045,7 +1204,7 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     @objc
     private func openSettings() {
         onOpenSetup()
-        appendMessage("Opened setup window for ROI and trading settings")
+        appendMessage("Opened OCR ROI setup")
     }
 
     @objc

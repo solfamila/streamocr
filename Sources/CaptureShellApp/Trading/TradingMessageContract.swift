@@ -2,11 +2,14 @@ import Foundation
 
 enum TradingMessageContractError: Error, LocalizedError {
     case invalidSymbol(String)
+    case invalidBuyPayload
 
     var errorDescription: String? {
         switch self {
         case let .invalidSymbol(symbol):
             "Refusing to build subscribe payload from invalid symbol input: \(symbol)"
+        case .invalidBuyPayload:
+            "Refusing to use an invalid OCR buy payload."
         }
     }
 }
@@ -21,8 +24,17 @@ struct SymbolNormalizationAnalysis: Equatable, Sendable {
     }
 }
 
+struct OCRBuyMessage: Equatable, Sendable {
+    let ocrQuantity: Int?
+}
+
 enum TradingMessageContract {
-    static let buyMessage = #"{"action":"BUY"}"#
+    static func buyMessage(ocrQuantity: Int?) -> String {
+        guard let ocrQuantity else {
+            return #"{"action":"BUY"}"#
+        }
+        return #"{"action":"BUY","ocrQuantity":\#(ocrQuantity)}"#
+    }
 
     static func normalizeSymbol(_ symbol: String) -> String {
         normalizedOCRSymbol(symbol) ?? ""
@@ -75,6 +87,37 @@ enum TradingMessageContract {
             return nil
         }
         return #"{"subscribe":"\#(normalized)"}"#
+    }
+
+    static func parseBuyMessage(_ payload: String) throws -> OCRBuyMessage {
+        guard let data = payload.data(using: .utf8) else {
+            throw TradingMessageContractError.invalidBuyPayload
+        }
+
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw TradingMessageContractError.invalidBuyPayload
+        }
+
+        guard object["action"] as? String == "BUY" else {
+            throw TradingMessageContractError.invalidBuyPayload
+        }
+
+        let ocrQuantity: Int?
+        if let rawQuantity = object["ocrQuantity"] {
+            if let integerQuantity = rawQuantity as? Int {
+                ocrQuantity = integerQuantity
+            } else if let integer64Quantity = rawQuantity as? Int64 {
+                ocrQuantity = Int(integer64Quantity)
+            } else if let numberQuantity = rawQuantity as? NSNumber {
+                ocrQuantity = numberQuantity.intValue
+            } else {
+                throw TradingMessageContractError.invalidBuyPayload
+            }
+        } else {
+            ocrQuantity = nil
+        }
+
+        return OCRBuyMessage(ocrQuantity: ocrQuantity)
     }
 
     private static func asciiUppercaseLetter(_ character: Character) -> Character? {

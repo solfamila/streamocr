@@ -4,10 +4,23 @@ import Foundation
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let tradingRuntimeManager = TradingRuntimeManager()
+    private let liveSessionController: LiveOCRSessionController
     private lazy var tradingWindowController = TradingWindowController(
         manager: tradingRuntimeManager,
         onOpenSetup: { [weak self] in
             self?.showSetupWindow()
+        },
+        onStartLiveStream: { [weak self] urlText in
+            self?.startLiveStream(urlText: urlText)
+        },
+        onStopLiveStream: { [weak self] in
+            self?.stopLiveStream()
+        },
+        onLiveStreamURLChanged: { [weak self] urlText in
+            self?.liveStreamURLChanged(urlText)
+        },
+        onOCRBuyRatioChanged: { [weak self] ratio in
+            self?.ocrBuyRatioChanged(ratio)
         }
     )
     private lazy var captureController = DisplayCaptureController(
@@ -41,6 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let activeRegionsLabel = NSTextField(labelWithString: "")
     private let configPathLabel = NSTextField(labelWithString: "")
+    private let liveSourceLabel = NSTextField(labelWithString: "Live source: not set")
 
     private let tradingRuntimeButton = NSButton(title: "Start Trading Runtime", target: nil, action: nil)
     private let applyTradingConnectionButton = NSButton(title: "Apply Trading Connection", target: nil, action: nil)
@@ -73,28 +87,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var displays: [DisplayTarget] = []
     private var isCapturing = false
     private var regionState = RuntimeRegionSelectionState()
+    private var currentLiveStreamURLText = ""
+    private var ocrBuyRatio = 0.5
+    private let startupEnvironment = ProcessInfo.processInfo.environment
+
+    override init() {
+        liveSessionController = LiveOCRSessionController(manager: tradingRuntimeManager)
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installAppMenu()
-        configureUI()
-        bindCaptureCallbacks()
         bindTradingCallbacks()
+        bindLiveSessionCallbacks()
 
         configPathLabel.stringValue = "Config file: \(runtimeConfigStore.configURL.path)"
-        updateRegionSummaryUI()
+        loadPersistedRuntimeConfigIfAvailable()
         loadTradingConfiguration()
         syncTradingInputsToRuntime()
         tradingRuntimeManager.refreshDashboard()
-
-        Task {
-            await refreshDisplays()
-        }
+        tradingWindowController.updateOCRBuyRatio(ocrBuyRatio)
+        tradingWindowController.updateLiveStatus(liveSessionController.currentStatusSnapshot())
+        tradingWindowController.showWindowAndStart()
+        applyStartupOverridesIfNeeded()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         Task {
             await captureController.stopCapture()
         }
+        liveSessionController.stop()
         tradingRuntimeManager.shutdown()
     }
 
@@ -187,20 +209,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc
     private func saveRuntimeConfigTapped() {
-        guard let selected = selectedDisplay else {
-            statusLabel.stringValue = "Select a display target before saving runtime config."
-            return
-        }
-
-        if let regionDisplayID = regionState.displayID,
-            regionDisplayID != selected.id,
-            regionState.hasAnySelection {
-            statusLabel.stringValue = "Cannot save: active regions target display \(regionDisplayID), but selected display is \(selected.id)."
-            return
-        }
-
         guard let config = regionState.toPersistedConfig() else {
-            statusLabel.stringValue = "Base ROI and trigger cell are required before saving runtime config."
+            statusLabel.stringValue = "Position base ROI and position cell ROI are required before saving runtime config."
             return
         }
 
@@ -208,7 +218,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try runtimeConfigStore.save(config)
             regionState.sourceDescription = "Saved to \(runtimeConfigStore.configURL.lastPathComponent)"
             syncRuntimeRegionState()
-            statusLabel.stringValue = "Saved runtime config for display \(selected.id)."
+            statusLabel.stringValue = "Saved runtime config for live OCR."
         } catch {
             statusLabel.stringValue = "Failed to save runtime config: \(error.localizedDescription)"
         }
@@ -218,29 +228,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func loadRuntimeConfigTapped() {
         do {
             let storedConfig = try runtimeConfigStore.load()
-
-            if let matchingIndex = displays.firstIndex(where: { UInt32($0.id) == storedConfig.displayID }) {
-                let matchingDisplay = displays[matchingIndex]
-                displayPopUp.selectItem(at: matchingIndex)
-
-                let adjustedConfig = storedConfig.adjustedForDisplay(matchingDisplay)
-                regionState.applyPersistedConfig(
-                    adjustedConfig,
-                    sourceDescription: "Loaded from \(runtimeConfigStore.configURL.lastPathComponent)"
-                )
-
-                syncRuntimeRegionState()
-                statusLabel.stringValue = "Loaded runtime config for display \(matchingDisplay.id). Active regions are now in use."
-                return
-            }
-
             regionState.applyPersistedConfig(
                 storedConfig,
-                sourceDescription: "Loaded (display unavailable)"
+                sourceDescription: "Loaded from \(runtimeConfigStore.configURL.lastPathComponent)"
             )
-
             syncRuntimeRegionState()
-            statusLabel.stringValue = "Loaded runtime config for display \(storedConfig.displayID), but that display is not currently available."
+            statusLabel.stringValue = "Loaded runtime config for live OCR."
         } catch {
             statusLabel.stringValue = "Failed to load runtime config: \(error.localizedDescription)"
         }
@@ -256,31 +249,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func configureUI() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1100, height: 640),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            contentRect: NSRect(x: 0, y: 0, width: 860, height: 520),
+            styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
 
-        window.title = "CaptureShell Wave 1"
+        window.title = "OCR ROI Setup"
         window.center()
-        window.makeKeyAndOrderFront(nil)
+        window.isReleasedWhenClosed = false
 
         let contentView = NSView()
         contentView.translatesAutoresizingMaskIntoConstraints = false
         window.contentView = contentView
 
-        let titleLabel = NSTextField(labelWithString: "ScreenCaptureKit Display Capture")
+        let titleLabel = NSTextField(labelWithString: "Live OCR ROI Setup")
         titleLabel.font = NSFont.boldSystemFont(ofSize: 16)
 
         let scopeLabel = NSTextField(
-            labelWithString: "Display capture with nested ROI selection (base/symbol first, then cell) and persisted runtime config."
+            labelWithString: "Capture a fresh live-stream frame, then define the symbol and position OCR regions. ROI edits are blocked while the controller is armed."
         )
         scopeLabel.textColor = .secondaryLabelColor
+        scopeLabel.lineBreakMode = .byWordWrapping
+        scopeLabel.maximumNumberOfLines = 3
 
         statusLabel.textColor = .labelColor
         statusLabel.lineBreakMode = .byWordWrapping
         statusLabel.maximumNumberOfLines = 4
+
+        liveSourceLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        liveSourceLabel.textColor = .secondaryLabelColor
+        liveSourceLabel.lineBreakMode = .byTruncatingMiddle
 
         activeRegionsLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         activeRegionsLabel.lineBreakMode = .byWordWrapping
@@ -291,57 +290,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         configPathLabel.textColor = .secondaryLabelColor
         configPathLabel.lineBreakMode = .byTruncatingMiddle
 
-        configureTradingField(hostField, placeholder: "127.0.0.1", width: 140)
-        configureTradingField(portField, placeholder: "7496", width: 80)
-        configureTradingField(clientIDField, placeholder: "101", width: 80)
-        configureTradingField(symbolField, placeholder: "PLRZ", width: 120)
-        configureTradingField(quantityField, placeholder: "1", width: 80)
-        configureTradingField(bufferField, placeholder: "0.01", width: 80)
-        configureTradingField(maxPositionField, placeholder: "40000", width: 110)
-        configureTradingField(staleQuoteField, placeholder: "1500", width: 90)
-        configureTradingField(maxOrderField, placeholder: "15000", width: 110)
-        configureTradingField(maxOpenField, placeholder: "50000", width: 110)
-
-        tradingStatusLabel.lineBreakMode = .byWordWrapping
-        tradingStatusLabel.maximumNumberOfLines = 3
-        accountStatusLabel.textColor = .secondaryLabelColor
-        controllerStatusLabel.textColor = .secondaryLabelColor
-        marketStatusLabel.textColor = .secondaryLabelColor
-
-        tradingMessagesTextView.isEditable = false
-        tradingMessagesTextView.isSelectable = true
-        tradingMessagesTextView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        tradingMessagesTextView.backgroundColor = .textBackgroundColor
-        let tradingMessagesScrollView = NSScrollView()
-        tradingMessagesScrollView.translatesAutoresizingMaskIntoConstraints = false
-        tradingMessagesScrollView.documentView = tradingMessagesTextView
-        tradingMessagesScrollView.hasVerticalScroller = true
-        tradingMessagesScrollView.borderType = .bezelBorder
-        tradingMessagesScrollView.heightAnchor.constraint(equalToConstant: 180).isActive = true
-
-        requestPermissionButton.target = self
-        requestPermissionButton.action = #selector(requestPermissionTapped)
-
-        refreshDisplaysButton.target = self
-        refreshDisplaysButton.action = #selector(refreshDisplaysTapped)
-
-        startStopButton.target = self
-        startStopButton.action = #selector(startStopTapped)
-
-        displayPopUp.target = self
-        displayPopUp.action = #selector(displaySelectionChanged)
-
         selectBaseROIButton.target = self
         selectBaseROIButton.action = #selector(selectBaseROITapped)
+        selectBaseROIButton.title = "Select Position Base ROI"
 
         selectManualCellButton.target = self
         selectManualCellButton.action = #selector(selectManualCellTapped)
+        selectManualCellButton.title = "Select Position Cell ROI"
 
         selectSymbolROIButton.target = self
         selectSymbolROIButton.action = #selector(selectSymbolROITapped)
+        selectSymbolROIButton.title = "Select Symbol Base ROI"
 
         selectSymbolCellButton.target = self
         selectSymbolCellButton.action = #selector(selectSymbolCellTapped)
+        selectSymbolCellButton.title = "Select Symbol Cell ROI"
 
         clearSymbolSelectionsButton.target = self
         clearSymbolSelectionsButton.action = #selector(clearSymbolSelectionsTapped)
@@ -351,42 +314,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         loadConfigButton.target = self
         loadConfigButton.action = #selector(loadRuntimeConfigTapped)
-        openTradingGUIButton.target = self
-        openTradingGUIButton.action = #selector(openTradingGUITapped)
 
-        tradingRuntimeButton.target = self
-        tradingRuntimeButton.action = #selector(tradingRuntimeTapped)
-        applyTradingConnectionButton.target = self
-        applyTradingConnectionButton.action = #selector(applyTradingConnectionTapped)
-        applyTradingRiskButton.target = self
-        applyTradingRiskButton.action = #selector(applyTradingRiskTapped)
-        subscribeButton.target = self
-        subscribeButton.action = #selector(subscribeTapped)
-        buyButton.target = self
-        buyButton.action = #selector(buyTapped)
-        closeButton.target = self
-        closeButton.action = #selector(closeTapped)
-        cancelAllButton.target = self
-        cancelAllButton.action = #selector(cancelAllTapped)
-        armControllerButton.target = self
-        armControllerButton.action = #selector(armControllerTapped)
-        killSwitchButton.target = self
-        killSwitchButton.action = #selector(killSwitchTapped)
+        let symbolRow = NSStackView(views: [selectSymbolROIButton, selectSymbolCellButton])
+        symbolRow.orientation = .horizontal
+        symbolRow.spacing = 10
 
-        [hostField, portField, clientIDField, symbolField, quantityField, bufferField, maxPositionField, staleQuoteField, maxOrderField, maxOpenField].forEach {
-            $0.target = self
-            $0.action = #selector(tradingInputChanged)
-        }
+        let positionRow = NSStackView(views: [selectBaseROIButton, selectManualCellButton])
+        positionRow.orientation = .horizontal
+        positionRow.spacing = 10
 
-        let captureButtonsRow = NSStackView(views: [requestPermissionButton, refreshDisplaysButton, startStopButton])
-        captureButtonsRow.orientation = .horizontal
-        captureButtonsRow.spacing = 10
-
-        let roiButtonsRow = NSStackView(views: [selectBaseROIButton, selectManualCellButton, selectSymbolROIButton, selectSymbolCellButton])
-        roiButtonsRow.orientation = .horizontal
-        roiButtonsRow.spacing = 10
-
-        let configButtonsRow = NSStackView(views: [clearSymbolSelectionsButton, saveConfigButton, loadConfigButton, openTradingGUIButton])
+        let configButtonsRow = NSStackView(views: [clearSymbolSelectionsButton, saveConfigButton, loadConfigButton])
         configButtonsRow.orientation = .horizontal
         configButtonsRow.spacing = 10
 
@@ -394,55 +331,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         regionsHeader.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
 
         let nextStepLabel = NSTextField(
-            labelWithString: "After ROI selection, open the old trading GUI. OCR BUY/SUBSCRIBE now route directly into that in-process trading runtime."
+            labelWithString: "Use the main trading GUI to enter the live stream URL, preview FPS, and arm OCR-driven buys."
         )
         nextStepLabel.textColor = .secondaryLabelColor
         nextStepLabel.lineBreakMode = .byWordWrapping
         nextStepLabel.maximumNumberOfLines = 3
 
-        let connectionRow = NSStackView(views: [
-            makeTradingLabeledField(title: "Host", field: hostField),
-            makeTradingLabeledField(title: "Port", field: portField),
-            makeTradingLabeledField(title: "Client ID", field: clientIDField),
-            applyTradingConnectionButton,
-            tradingRuntimeButton
-        ])
-        connectionRow.orientation = .horizontal
-        connectionRow.spacing = 10
-
-        let inputRow = NSStackView(views: [
-            makeTradingLabeledField(title: "Symbol", field: symbolField),
-            makeTradingLabeledField(title: "Qty", field: quantityField),
-            makeTradingLabeledField(title: "Buffer", field: bufferField),
-            makeTradingLabeledField(title: "Max Position $", field: maxPositionField),
-            subscribeButton
-        ])
-        inputRow.orientation = .horizontal
-        inputRow.spacing = 10
-
-        let riskRow = NSStackView(views: [
-            makeTradingLabeledField(title: "Stale Quote ms", field: staleQuoteField),
-            makeTradingLabeledField(title: "Max Order $", field: maxOrderField),
-            makeTradingLabeledField(title: "Max Open $", field: maxOpenField),
-            applyTradingRiskButton
-        ])
-        riskRow.orientation = .horizontal
-        riskRow.spacing = 10
-
-        let actionRow = NSStackView(views: [buyButton, closeButton, cancelAllButton, armControllerButton, killSwitchButton])
-        actionRow.orientation = .horizontal
-        actionRow.spacing = 10
-
-        let tradingMessagesHeader = NSTextField(labelWithString: "Trading Messages")
-        tradingMessagesHeader.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
-
         let stack = NSStackView(
             views: [
                 titleLabel,
                 scopeLabel,
-                displayPopUp,
-                captureButtonsRow,
-                roiButtonsRow,
+                liveSourceLabel,
+                symbolRow,
+                positionRow,
                 configButtonsRow,
                 configPathLabel,
                 regionsHeader,
@@ -534,6 +435,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func bindLiveSessionCallbacks() {
+        liveSessionController.onStatusChanged = { [weak self] status in
+            guard let self else {
+                return
+            }
+            tradingWindowController.updateLiveStatus(status)
+            if window != nil {
+                updateSetupWindowSourceLabel()
+            }
+        }
+        liveSessionController.setRuntimeConfig(regionState.toPersistedConfig())
+        liveSessionController.setBuyQuantityRatio(ocrBuyRatio)
+    }
+
     @objc
     private func openTradingGUITapped() {
         syncTradingInputsToRuntime()
@@ -541,8 +456,112 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showSetupWindow() {
+        if window == nil {
+            configureUI()
+        }
+        currentLiveStreamURLText = tradingWindowController.currentLiveStreamURLText
+        updateSetupWindowSourceLabel()
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func startLiveStream(urlText: String) {
+        currentLiveStreamURLText = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            try liveSessionController.start(seedURLText: currentLiveStreamURLText)
+        } catch {
+            let errorStatus = LiveOCRSessionStatusSnapshot(
+                state: .error,
+                isRunning: false,
+                seedURLText: currentLiveStreamURLText,
+                headline: "Live stream: Error",
+                detail: error.localizedDescription,
+                fps: nil,
+                frameSize: nil,
+                lastSubscribedSymbol: nil,
+                hasPositionROI: regionState.baseROI != nil && regionState.manualCellROI != nil,
+                hasSymbolROI: regionState.symbolROI != nil && regionState.manualSymbolCellROI != nil
+            )
+            tradingWindowController.updateLiveStatus(errorStatus)
+        }
+    }
+
+    private func stopLiveStream() {
+        liveSessionController.stop()
+    }
+
+    private func applyStartupOverridesIfNeeded() {
+        if let startupURL = startupEnvironment["CAPTURESHELLAPP_LIVE_URL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !startupURL.isEmpty
+        {
+            currentLiveStreamURLText = startupURL
+            tradingWindowController.setLiveURLText(startupURL, force: true)
+        }
+
+        if let startupRatioText = startupEnvironment["CAPTURESHELLAPP_OCR_RATIO"],
+            let startupRatio = Double(startupRatioText),
+            startupRatio.isFinite,
+            startupRatio > 0
+        {
+            ocrBuyRatio = startupRatio
+            liveSessionController.setBuyQuantityRatio(startupRatio)
+            tradingWindowController.updateOCRBuyRatio(startupRatio)
+        }
+
+        let autoStartValue = startupEnvironment["CAPTURESHELLAPP_AUTOSTART_LIVE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        guard let autoStartValue, ["1", "true", "yes", "on"].contains(autoStartValue) else {
+            return
+        }
+
+        guard !currentLiveStreamURLText.isEmpty else {
+            tradingWindowController.updateLiveStatus(
+                LiveOCRSessionStatusSnapshot(
+                    state: .error,
+                    isRunning: false,
+                    seedURLText: "",
+                    headline: "Live stream: Error",
+                    detail: "CAPTURESHELLAPP_AUTOSTART_LIVE is set, but no CAPTURESHELLAPP_LIVE_URL was provided.",
+                    fps: nil,
+                    frameSize: nil,
+                    lastSubscribedSymbol: nil,
+                    hasPositionROI: regionState.baseROI != nil && regionState.manualCellROI != nil,
+                    hasSymbolROI: regionState.symbolROI != nil && regionState.manualSymbolCellROI != nil
+                )
+            )
+            return
+        }
+
+        let startupURL = currentLiveStreamURLText
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.startLiveStream(urlText: startupURL)
+        }
+    }
+
+    private func liveStreamURLChanged(_ urlText: String) {
+        currentLiveStreamURLText = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
+        updateSetupWindowSourceLabel()
+    }
+
+    private func ocrBuyRatioChanged(_ ratio: Double) {
+        ocrBuyRatio = ratio.isFinite && ratio > 0 ? ratio : 0.5
+        liveSessionController.setBuyQuantityRatio(ocrBuyRatio)
+    }
+
+    private func loadPersistedRuntimeConfigIfAvailable() {
+        guard let storedConfig = try? runtimeConfigStore.load() else {
+            updateRegionSummaryUI()
+            return
+        }
+
+        regionState.applyPersistedConfig(
+            storedConfig,
+            sourceDescription: "Loaded from \(runtimeConfigStore.configURL.lastPathComponent)"
+        )
+        syncRuntimeRegionState()
     }
 
     private func refreshDisplays() async {
@@ -579,10 +598,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         syncTradingInputsToRuntime()
-        let connected = tradingRuntimeManager.start()
-        tradingStatusLabel.stringValue = connected
+        let startResult = tradingRuntimeManager.startWithAutoConnectFallback()
+        tradingStatusLabel.stringValue = startResult.connected
             ? "Trading runtime started and connected to TWS."
             : "Trading runtime started, but TWS is not connected yet."
+        if let autoDetectedConfig = startResult.autoDetectedConfig {
+            tradingStatusLabel.stringValue += " Auto-detected \(autoDetectedConfig.host):\(autoDetectedConfig.port)."
+        }
     }
 
     @objc
@@ -764,47 +786,108 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func syncRuntimeRegionState() {
         captureController.setActiveRuntimeConfig(regionState.toPersistedConfig())
+        liveSessionController.setRuntimeConfig(regionState.toPersistedConfig())
         updateRegionSummaryUI()
+        updateSetupWindowSourceLabel()
     }
 
-    private func selectRegion(for type: RegionType) {
-        guard let selectedDisplay else {
-            statusLabel.stringValue = "Select a display target before selecting regions."
+    private func updateSetupWindowSourceLabel() {
+        let trimmedURL = currentLiveStreamURLText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedURL.isEmpty {
+            liveSourceLabel.stringValue = "Live source: not set"
+        } else {
+            liveSourceLabel.stringValue = "Live source: \(trimmedURL)"
+        }
+    }
+
+    private func prepareRegionStateForFrameSize(width: Int, height: Int) {
+        guard width > 0, height > 0 else {
             return
         }
 
-        if let existingDisplayID = regionState.displayID,
-            existingDisplayID != selectedDisplay.id,
-            regionState.hasAnySelection {
-            regionState.resetForDisplay(selectedDisplay)
-            statusLabel.stringValue = "Display changed. Cleared previous selections from display \(existingDisplayID)."
-        } else {
-            regionState.displayID = selectedDisplay.id
-            regionState.displayWidth = selectedDisplay.width
-            regionState.displayHeight = selectedDisplay.height
+        if
+            regionState.displayWidth > 0,
+            regionState.displayHeight > 0,
+            regionState.displayWidth != width || regionState.displayHeight != height,
+            let persistedConfig = regionState.toPersistedConfig()
+        {
+            regionState.applyPersistedConfig(
+                persistedConfig.adjustedForFrameSize(width: width, height: height, displayID: 0),
+                sourceDescription: "Scaled for live frame \(width)x\(height)"
+            )
+            return
         }
+
+        if
+            regionState.hasAnySelection,
+            regionState.displayWidth > 0,
+            regionState.displayHeight > 0,
+            (regionState.displayWidth != width || regionState.displayHeight != height)
+        {
+            regionState = RuntimeRegionSelectionState(
+                displayID: 0,
+                displayWidth: width,
+                displayHeight: height,
+                sourceDescription: "Reset for live frame \(width)x\(height)"
+            )
+            return
+        }
+
+        if regionState.displayWidth == 0 || regionState.displayHeight == 0 {
+            regionState.displayID = 0
+            regionState.displayWidth = width
+            regionState.displayHeight = height
+            if regionState.sourceDescription.isEmpty {
+                regionState.sourceDescription = "Manual (unsaved)"
+            }
+        }
+    }
+
+    private func selectRegion(for type: RegionType) {
+        guard !tradingRuntimeManager.dashboard.panel.status.controllerArmed else {
+            statusLabel.stringValue = "Disarm the controller before editing OCR ROIs."
+            return
+        }
+
+        currentLiveStreamURLText = tradingWindowController.currentLiveStreamURLText
+        let trimmedURL = currentLiveStreamURLText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let seedURL = URL(string: trimmedURL), !trimmedURL.isEmpty else {
+            statusLabel.stringValue = "Enter a live stream URL in the trading GUI before selecting OCR ROIs."
+            return
+        }
+
+        let snapshot: LiveStreamFrameSnapshot
+        do {
+            snapshot = try LiveStreamFrameSnapshotter().captureSnapshot(seedURL: seedURL)
+        } catch {
+            statusLabel.stringValue = "Failed to capture a live ROI snapshot: \(error.localizedDescription)"
+            return
+        }
+
+        prepareRegionStateForFrameSize(width: snapshot.width, height: snapshot.height)
 
         let selectionContext: ROISelectionContext?
         switch type {
         case .manualCellROI:
             guard let baseROI = regionState.baseROI else {
-                statusLabel.stringValue = "Select Base ROI first. Trigger cell selection is nested inside Base ROI."
+                statusLabel.stringValue = "Select the position base ROI first."
                 return
             }
-            selectionContext = ROISelectionContext(parentRect: baseROI, label: "Base ROI")
+            selectionContext = ROISelectionContext(parentRect: baseROI, label: "Position base ROI")
         case .manualSymbolCellROI:
             guard let symbolROI = regionState.symbolROI else {
-                statusLabel.stringValue = "Select Symbol ROI first. Symbol cell selection is nested inside Symbol ROI."
+                statusLabel.stringValue = "Select the symbol base ROI first."
                 return
             }
-            selectionContext = ROISelectionContext(parentRect: symbolROI, label: "Symbol ROI")
+            selectionContext = ROISelectionContext(parentRect: symbolROI, label: "Symbol base ROI")
         case .baseROI, .symbolROI:
             selectionContext = nil
         }
 
         do {
             let selectedRect = try roiSelector.selectRect(
-                for: selectedDisplay,
+                on: snapshot.cgImage,
+                frameTitle: "Live stream \(snapshot.width)x\(snapshot.height)",
                 prompt: type.prompt,
                 initialRect: currentRect(for: type),
                 context: selectionContext
@@ -814,15 +897,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             regionState.sourceDescription = "Manual (unsaved)"
             syncRuntimeRegionState()
 
-            var statusMessage = "\(type.statusTitle) updated for display \(selectedDisplay.id): \(selectedRect.summary)."
+            var statusMessage = "\(type.statusTitle) updated from live stream snapshot: \(selectedRect.summary)."
             switch type {
             case .baseROI:
-                statusMessage += " Next: select Trigger cell from the nested Base ROI view."
+                statusMessage += " Next: select Position cell from the nested Position base ROI view."
                 if clearedDependentSelection {
-                    statusMessage += " Cleared previous Trigger cell selection."
+                    statusMessage += " Cleared previous Position cell selection."
                 }
             case .symbolROI:
-                statusMessage += " Next: select Symbol cell from the nested Symbol ROI view."
+                statusMessage += " Next: select Symbol cell from the nested Symbol base ROI view."
                 if clearedDependentSelection {
                     statusMessage += " Cleared previous Symbol cell selection."
                 }
@@ -903,24 +986,24 @@ private enum RegionType {
     var prompt: String {
         switch self {
         case .baseROI:
-            return "Select the main OCR base ROI"
+            return "Select the position base ROI"
         case .manualCellROI:
-            return "Select the numeric trigger cell ROI from the zoomed Base ROI view"
+            return "Select the numeric position cell ROI from the zoomed Position base ROI view"
         case .symbolROI:
-            return "Select the optional symbol ROI"
+            return "Select the symbol base ROI"
         case .manualSymbolCellROI:
-            return "Select the optional symbol cell ROI from the zoomed Symbol ROI view"
+            return "Select the symbol cell ROI from the zoomed Symbol base ROI view"
         }
     }
 
     var statusTitle: String {
         switch self {
         case .baseROI:
-            return "Base ROI"
+            return "Position base ROI"
         case .manualCellROI:
-            return "Trigger cell"
+            return "Position cell"
         case .symbolROI:
-            return "Symbol ROI"
+            return "Symbol base ROI"
         case .manualSymbolCellROI:
             return "Symbol cell"
         }

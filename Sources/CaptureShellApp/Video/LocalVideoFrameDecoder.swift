@@ -41,86 +41,91 @@ final class LocalVideoFrameDecoder {
         presentationTimeOffsetSeconds: Double = 0,
         onFrame: (VideoFrame) throws -> Void
     ) throws -> LocalVideoDecodingSummary {
-        let asset = AVURLAsset(url: videoURL)
+        try autoreleasepool {
+            let asset = AVURLAsset(url: videoURL)
 
-        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
-            throw LocalVideoFrameDecoderError.missingVideoTrack(videoURL)
-        }
-
-        guard let reader = try? AVAssetReader(asset: asset) else {
-            throw LocalVideoFrameDecoderError.assetReaderUnavailable(videoURL)
-        }
-
-        let outputSettings: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-            kCVPixelBufferMetalCompatibilityKey as String: true
-        ]
-
-        let output = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: outputSettings)
-        output.alwaysCopiesSampleData = false
-
-        guard reader.canAdd(output) else {
-            throw LocalVideoFrameDecoderError.assetReaderUnavailable(videoURL)
-        }
-
-        reader.add(output)
-        guard reader.startReading() else {
-            let message = reader.error?.localizedDescription ?? "unknown error"
-            throw LocalVideoFrameDecoderError.assetReaderStartFailed(message)
-        }
-
-        let nominalFrameRate = videoTrack.nominalFrameRate > 0 ? Double(videoTrack.nominalFrameRate) : nil
-        let naturalSize = videoTrack.naturalSize.applying(videoTrack.preferredTransform)
-        let width = Int(naturalSize.width.magnitude.rounded())
-        let height = Int(naturalSize.height.magnitude.rounded())
-
-        var frameCount = 0
-        var firstPresentationTimeSeconds: Double?
-        var lastPresentationTimeSeconds: Double?
-
-        while let sampleBuffer = output.copyNextSampleBuffer() {
-            guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
-                continue
+            guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+                throw LocalVideoFrameDecoderError.missingVideoTrack(videoURL)
             }
 
-            let samplePresentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            let samplePresentationSeconds = CMTimeGetSeconds(samplePresentationTime)
-            let adjustedPresentationTimeStamp: CMTime? = if samplePresentationSeconds.isFinite {
-                CMTime(
-                    seconds: max(0, samplePresentationSeconds) + presentationTimeOffsetSeconds,
-                    preferredTimescale: 60_000
-                )
-            } else {
-                nil
+            guard let reader = try? AVAssetReader(asset: asset) else {
+                throw LocalVideoFrameDecoderError.assetReaderUnavailable(videoURL)
+            }
+            defer { reader.cancelReading() }
+
+            let outputSettings: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+                kCVPixelBufferMetalCompatibilityKey as String: true
+            ]
+
+            let output = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: outputSettings)
+            output.alwaysCopiesSampleData = false
+
+            guard reader.canAdd(output) else {
+                throw LocalVideoFrameDecoderError.assetReaderUnavailable(videoURL)
             }
 
-            let frame = VideoFrame(
-                pixelBuffer: pixelBuffer,
-                presentationTimeStamp: adjustedPresentationTimeStamp,
-                nominalFrameRate: nominalFrameRate
+            reader.add(output)
+            guard reader.startReading() else {
+                let message = reader.error?.localizedDescription ?? "unknown error"
+                throw LocalVideoFrameDecoderError.assetReaderStartFailed(message)
+            }
+
+            let nominalFrameRate = videoTrack.nominalFrameRate > 0 ? Double(videoTrack.nominalFrameRate) : nil
+            let naturalSize = videoTrack.naturalSize.applying(videoTrack.preferredTransform)
+            let width = Int(naturalSize.width.magnitude.rounded())
+            let height = Int(naturalSize.height.magnitude.rounded())
+
+            var frameCount = 0
+            var firstPresentationTimeSeconds: Double?
+            var lastPresentationTimeSeconds: Double?
+
+            while let sampleBuffer = autoreleasepool(invoking: { output.copyNextSampleBuffer() }) {
+                try autoreleasepool {
+                    guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+                        return
+                    }
+
+                    let samplePresentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+                    let samplePresentationSeconds = CMTimeGetSeconds(samplePresentationTime)
+                    let adjustedPresentationTimeStamp: CMTime? = if samplePresentationSeconds.isFinite {
+                        CMTime(
+                            seconds: max(0, samplePresentationSeconds) + presentationTimeOffsetSeconds,
+                            preferredTimescale: 60_000
+                        )
+                    } else {
+                        nil
+                    }
+
+                    let frame = VideoFrame(
+                        pixelBuffer: pixelBuffer,
+                        presentationTimeStamp: adjustedPresentationTimeStamp,
+                        nominalFrameRate: nominalFrameRate
+                    )
+
+                    try onFrame(frame)
+                    frameCount += 1
+
+                    if let presentationTimeSeconds = frame.presentationTimeSeconds {
+                        firstPresentationTimeSeconds = firstPresentationTimeSeconds ?? presentationTimeSeconds
+                        lastPresentationTimeSeconds = presentationTimeSeconds
+                    }
+                }
+            }
+
+            if reader.status == .failed {
+                let message = reader.error?.localizedDescription ?? "unknown decode error"
+                throw LocalVideoFrameDecoderError.assetReaderFailed(message)
+            }
+
+            return LocalVideoDecodingSummary(
+                frameCount: frameCount,
+                nominalFrameRate: nominalFrameRate,
+                width: width,
+                height: height,
+                firstPresentationTimeSeconds: firstPresentationTimeSeconds,
+                lastPresentationTimeSeconds: lastPresentationTimeSeconds
             )
-
-            try onFrame(frame)
-            frameCount += 1
-
-            if let presentationTimeSeconds = frame.presentationTimeSeconds {
-                firstPresentationTimeSeconds = firstPresentationTimeSeconds ?? presentationTimeSeconds
-                lastPresentationTimeSeconds = presentationTimeSeconds
-            }
         }
-
-        if reader.status == .failed {
-            let message = reader.error?.localizedDescription ?? "unknown decode error"
-            throw LocalVideoFrameDecoderError.assetReaderFailed(message)
-        }
-
-        return LocalVideoDecodingSummary(
-            frameCount: frameCount,
-            nominalFrameRate: nominalFrameRate,
-            width: width,
-            height: height,
-            firstPresentationTimeSeconds: firstPresentationTimeSeconds,
-            lastPresentationTimeSeconds: lastPresentationTimeSeconds
-        )
     }
 }

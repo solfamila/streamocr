@@ -159,6 +159,13 @@ struct TradingActionResponse: Decodable, Equatable {
     var timelineCsv: String?
 }
 
+struct TradingRuntimeStartResult: Equatable {
+    let connected: Bool
+    let activeConfig: TradingConnectionConfigSnapshot
+    let autoDetectedConfig: TradingConnectionConfigSnapshot?
+    let attemptedFallbackPorts: [Int]
+}
+
 struct TradingTraceExportBundle: Equatable {
     var baseName: String
     var reportText: String
@@ -191,6 +198,7 @@ final class TradingRuntimeManager: @unchecked Sendable {
     var onDashboardChanged: ((TradingDashboardSnapshot) -> Void)?
     private(set) var isStarted = false
 
+    private static let autoDetectFallbackPorts = [4001, 4002, 7497]
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
     private var handle: OpaquePointer?
@@ -289,6 +297,68 @@ final class TradingRuntimeManager: @unchecked Sendable {
         isStarted = true
         refreshDashboard()
         return started
+    }
+
+    func startWithAutoConnectFallback() -> TradingRuntimeStartResult {
+        let originalConfig = (try? currentConnectionConfig()) ?? TradingConnectionConfigSnapshot(
+            host: "127.0.0.1",
+            port: 7496,
+            clientId: 1,
+            controllerEnabled: true,
+            orderRoutingMode: "smart",
+            pegBestOffset: 0,
+            pegBestOffsetUpToMid: false,
+            pegBestMinCompeteSize: 0,
+            pegBestMidOffsetAtWhole: 0,
+            pegBestMidOffsetAtHalf: 0,
+            pegBestRerouteToSmartMinutes: 0
+        )
+
+        let initialConnected = start()
+        guard !initialConnected, Self.shouldAutoDetectLocalIBConnection(for: originalConfig) else {
+            return TradingRuntimeStartResult(
+                connected: initialConnected,
+                activeConfig: (try? currentConnectionConfig()) ?? originalConfig,
+                autoDetectedConfig: nil,
+                attemptedFallbackPorts: []
+            )
+        }
+
+        shutdown()
+
+        var attemptedFallbackPorts: [Int] = []
+        for port in Self.autoDetectFallbackPorts where port != originalConfig.port {
+            attemptedFallbackPorts.append(port)
+            var fallbackConfig = originalConfig
+            fallbackConfig.port = port
+
+            do {
+                try updateConnectionConfig(fallbackConfig)
+            } catch {
+                continue
+            }
+
+            if start() {
+                let activeConfig = (try? currentConnectionConfig()) ?? fallbackConfig
+                return TradingRuntimeStartResult(
+                    connected: true,
+                    activeConfig: activeConfig,
+                    autoDetectedConfig: activeConfig,
+                    attemptedFallbackPorts: attemptedFallbackPorts
+                )
+            }
+
+            shutdown()
+        }
+
+        try? updateConnectionConfig(originalConfig)
+        let restoredConnected = start()
+        return TradingRuntimeStartResult(
+            connected: restoredConnected,
+            activeConfig: (try? currentConnectionConfig()) ?? originalConfig,
+            autoDetectedConfig: nil,
+            attemptedFallbackPorts: attemptedFallbackPorts
+        )
     }
 
     func shutdown() {
@@ -435,6 +505,12 @@ final class TradingRuntimeManager: @unchecked Sendable {
         guard let handle else { return }
         TradingRuntimeBridgeSetTradingKillSwitch(handle, enabled)
         refreshDashboard()
+    }
+
+    private static func shouldAutoDetectLocalIBConnection(for config: TradingConnectionConfigSnapshot) -> Bool {
+        let normalizedHost = config.host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let isLocalHost = normalizedHost.isEmpty || normalizedHost == "127.0.0.1" || normalizedHost == "localhost"
+        return isLocalHost && config.port == 7496
     }
 
     func appendMessage(_ message: String) {
