@@ -7,7 +7,7 @@ import ImageIO
 import UniformTypeIdentifiers
 #endif
 
-private enum FontTemplateMatcherConstants {
+enum FontTemplateMatcherConstants {
     static let maskBinarizationThreshold: UInt8 = 128
     static let diagnosticForegroundPixelThreshold = 20
     static let templateTargetGlyphHeightRatio: CGFloat = 0.72
@@ -101,6 +101,7 @@ final class FontTemplateTextRecognizer: OCRTextRecognizing, @unchecked Sendable 
     private var templateCache: [TemplateCacheKey: FontTemplateSet] = [:]
     private let diagnosticLock = NSLock()
     private var diagnosticDumpDone = false
+    private let symbolMetalMatcher: SymbolTemplateMetalMatcher?
 
     init(
         numericOptions: Options = .numericCell,
@@ -108,6 +109,7 @@ final class FontTemplateTextRecognizer: OCRTextRecognizing, @unchecked Sendable 
     ) {
         self.numericOptions = numericOptions
         self.symbolOptions = symbolOptions
+        self.symbolMetalMatcher = SymbolTemplateMetalMatcher.make()
     }
 
     func recognizeText(in pixelBuffer: CVPixelBuffer, region: OCRRegionKind) -> OCRTextRecognition {
@@ -123,7 +125,19 @@ final class FontTemplateTextRecognizer: OCRTextRecognizing, @unchecked Sendable 
 
         maybeDumpDiagnostics(mask: mask, templates: templates)
 
-        let decoded = FontTemplateMatcher.decode(mask: mask, templates: templates, options: options)
+        let decoded: FontTemplateMatcher.Decoded
+        if region == .manualSymbolCell,
+           let symbolMetalMatcher,
+           let metalDecoded = FontTemplateMatcher.decodeSymbolWithMetal(
+            mask: mask,
+            templates: templates,
+            options: options,
+            matcher: symbolMetalMatcher
+           ) {
+            decoded = metalDecoded
+        } else {
+            decoded = FontTemplateMatcher.decode(mask: mask, templates: templates, options: options)
+        }
         guard !decoded.characters.isEmpty else {
             return OCRTextRecognition(rawText: "", confidence: 0)
         }
@@ -275,11 +289,50 @@ struct BinaryMask: Sendable {
     let width: Int
     let height: Int
     var pixels: [UInt8]
+    private let foregroundIntegral: [Int]
+
+    init(width: Int, height: Int, pixels: [UInt8]) {
+        self.width = width
+        self.height = height
+        self.pixels = pixels
+        self.foregroundIntegral = Self.makeForegroundIntegral(width: width, height: height, pixels: pixels)
+    }
 
     func foregroundCount() -> Int {
-        var total = 0
-        for value in pixels where value == 1 { total += 1 }
-        return total
+        foregroundIntegral.last ?? 0
+    }
+
+    func foregroundCount(x: Int, y: Int, width rectWidth: Int, height rectHeight: Int) -> Int {
+        guard rectWidth > 0, rectHeight > 0 else {
+            return 0
+        }
+        let stride = width + 1
+        let x0 = x
+        let y0 = y
+        let x1 = x + rectWidth
+        let y1 = y + rectHeight
+        return foregroundIntegral[y1 * stride + x1]
+            - foregroundIntegral[y0 * stride + x1]
+            - foregroundIntegral[y1 * stride + x0]
+            + foregroundIntegral[y0 * stride + x0]
+    }
+
+    private static func makeForegroundIntegral(width: Int, height: Int, pixels: [UInt8]) -> [Int] {
+        guard width > 0, height > 0 else {
+            return [0]
+        }
+        let stride = width + 1
+        var integral = [Int](repeating: 0, count: stride * (height + 1))
+        for y in 0..<height {
+            var rowTotal = 0
+            for x in 0..<width {
+                if pixels[y * width + x] == 1 {
+                    rowTotal += 1
+                }
+                integral[(y + 1) * stride + (x + 1)] = integral[y * stride + (x + 1)] + rowTotal
+            }
+        }
+        return integral
     }
 }
 
@@ -623,6 +676,53 @@ enum FontTemplateMatcher {
         return Decoded(characters: characters, perGlyphConfidences: confidences)
     }
 
+    static func decodeSymbolWithMetal(
+        mask: BinaryMask,
+        templates: FontTemplateSet,
+        options: FontTemplateTextRecognizer.Options,
+        matcher: SymbolTemplateMetalMatcher
+    ) -> Decoded? {
+        guard !options.splitWideSegments, templates.separatorTemplates.isEmpty else {
+            return nil
+        }
+
+        let rawSegments = foregroundSegments(in: mask, mergeGap: options.mergeGap)
+        guard !rawSegments.isEmpty else {
+            return Decoded(characters: [], perGlyphConfidences: [])
+        }
+
+        let filteredSegments = rawSegments.filter { segment in
+            let segmentArea = Double(segment.area) / Double(max(1, mask.width * mask.height))
+            return segmentArea >= options.minimumSegmentAreaRatio
+        }
+        guard !filteredSegments.isEmpty else {
+            return Decoded(characters: [], perGlyphConfidences: [])
+        }
+
+        guard let matches = matcher.bestMatches(
+            mask: mask,
+            segments: filteredSegments,
+            templates: templates.glyphTemplates
+        ) else {
+            return nil
+        }
+
+        var characters: [Character] = []
+        var confidences: [Double] = []
+        characters.reserveCapacity(matches.count)
+        confidences.reserveCapacity(matches.count)
+
+        for match in matches {
+            guard let match else {
+                continue
+            }
+            characters.append(match.character)
+            confidences.append(match.confidence)
+        }
+
+        return Decoded(characters: characters, perGlyphConfidences: confidences)
+    }
+
     // MARK: Segmentation
 
     struct Segment {
@@ -743,6 +843,19 @@ enum FontTemplateMatcher {
         let precision: Double
     }
 
+    private struct TemplatePoint {
+        let x: Int
+        let y: Int
+    }
+
+    private struct ResizedTemplateMask {
+        let width: Int
+        let height: Int
+        let foregroundPoints: [TemplatePoint]
+
+        var foregroundCount: Int { foregroundPoints.count }
+    }
+
     /// For a single-glyph segment, compute its tight bounding box, then for each
     /// candidate template try a small grid of (width, height, dx, dy) perturbations.
     /// Ranking is primarily Jaccard, with precision used only for near ties. This
@@ -777,7 +890,7 @@ enum FontTemplateMatcher {
                     if h > mask.height { continue }
 
                     // Resample template to (w, h) once; reuse across (dx, dy) loop.
-                    let resized = resizeMaskNearestBilinear(
+                    let resized = resizeTemplateForeground(
                         source: template.mask,
                         srcW: template.width,
                         srcH: template.height,
@@ -832,18 +945,32 @@ enum FontTemplateMatcher {
     }
 
     /// Bilinear-interpolated resize of a 0/1 mask, re-binarized at 0.5.
-    private static func resizeMaskNearestBilinear(
+    /// Return foreground coordinates directly so each candidate window scores only
+    /// template ink pixels instead of rescanning the full rectangle.
+    private static func resizeTemplateForeground(
         source: [UInt8],
         srcW: Int,
         srcH: Int,
         dstW: Int,
         dstH: Int
-    ) -> [UInt8] {
-        if srcW == dstW && srcH == dstH {
-            return source
+    ) -> ResizedTemplateMask {
+        guard srcW > 0, srcH > 0, dstW > 0, dstH > 0 else {
+            return ResizedTemplateMask(width: dstW, height: dstH, foregroundPoints: [])
         }
-        var result = [UInt8](repeating: 0, count: dstW * dstH)
-        guard srcW > 0, srcH > 0, dstW > 0, dstH > 0 else { return result }
+
+        if srcW == dstW && srcH == dstH {
+            var points: [TemplatePoint] = []
+            points.reserveCapacity(source.count)
+            for y in 0..<srcH {
+                for x in 0..<srcW where source[y * srcW + x] == 1 {
+                    points.append(TemplatePoint(x: x, y: y))
+                }
+            }
+            return ResizedTemplateMask(width: dstW, height: dstH, foregroundPoints: points)
+        }
+
+        var points: [TemplatePoint] = []
+        points.reserveCapacity(dstW * dstH / 2)
 
         let xRatio = Double(srcW) / Double(dstW)
         let yRatio = Double(srcH) / Double(dstH)
@@ -866,10 +993,12 @@ enum FontTemplateMatcher {
                 let top = p00 * (1 - xFrac) + p01 * xFrac
                 let bot = p10 * (1 - xFrac) + p11 * xFrac
                 let value = top * (1 - yFrac) + bot * yFrac
-                result[dy * dstW + dx] = value >= 0.5 ? 1 : 0
+                if value >= 0.5 {
+                    points.append(TemplatePoint(x: dx, y: dy))
+                }
             }
         }
-        return result
+        return ResizedTemplateMask(width: dstW, height: dstH, foregroundPoints: points)
     }
 
     /// Overlap quality between mask[x0..<x0+w, y0..<y0+h] and a flat template
@@ -879,24 +1008,19 @@ enum FontTemplateMatcher {
         mask: BinaryMask,
         x0: Int,
         y0: Int,
-        template: [UInt8],
+        template: ResizedTemplateMask,
         width: Int,
         height: Int
     ) -> MatchQuality {
         var intersection = 0
-        var union = 0
-        var templateForeground = 0
-        for ty in 0..<height {
-            let maskRowStart = (y0 + ty) * mask.width + x0
-            let templateRowStart = ty * width
-            for tx in 0..<width {
-                let maskValue = mask.pixels[maskRowStart + tx]
-                let templateValue = template[templateRowStart + tx]
-                if templateValue == 1 { templateForeground += 1 }
-                if maskValue == 1 || templateValue == 1 { union += 1 }
-                if maskValue == 1 && templateValue == 1 { intersection += 1 }
+        for point in template.foregroundPoints {
+            if mask.pixels[(y0 + point.y) * mask.width + x0 + point.x] == 1 {
+                intersection += 1
             }
         }
+        let templateForeground = template.foregroundCount
+        let maskForeground = mask.foregroundCount(x: x0, y: y0, width: width, height: height)
+        let union = maskForeground + templateForeground - intersection
         guard union > 0, templateForeground > 0 else {
             return MatchQuality(jaccard: 0, precision: 0)
         }
