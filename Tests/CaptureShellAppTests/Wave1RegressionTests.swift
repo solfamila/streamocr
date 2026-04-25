@@ -1745,3 +1745,175 @@ struct OCRFingerprintPolicyTests {
         return pixelBuffer
     }
 }
+
+struct SymbolTemplateMetalMatcherTests {
+    @Test
+    func metalSymbolDecoderMatchesCPUDecoderForSyntheticSymbols() throws {
+        guard let matcher = SymbolTemplateMetalMatcher.make() else {
+            return
+        }
+        let templates = try #require(FontTemplateSet.make(targetHeight: 88, options: .symbolCell))
+
+        for symbol in ["PLRZ", "PLPZ"] {
+            let mask = try makeSymbolMask(symbol, templates: templates)
+            let cpu = FontTemplateMatcher.decode(mask: mask, templates: templates, options: .symbolCell)
+            let metal = try #require(
+                FontTemplateMatcher.decodeSymbolWithMetal(
+                    mask: mask,
+                    templates: templates,
+                    options: .symbolCell,
+                    matcher: matcher
+                )
+            )
+
+            #expect(String(cpu.characters) == symbol)
+            #expect(String(metal.characters) == String(cpu.characters))
+            #expect(metal.perGlyphConfidences.count == cpu.perGlyphConfidences.count)
+            for index in cpu.perGlyphConfidences.indices {
+                #expect(abs(cpu.perGlyphConfidences[index] - metal.perGlyphConfidences[index]) < 0.0001)
+            }
+        }
+
+        let blank = BinaryMask(
+            width: 64,
+            height: templates.bitmapHeight,
+            pixels: Array(repeating: 0, count: 64 * templates.bitmapHeight)
+        )
+        let cpuBlank = FontTemplateMatcher.decode(mask: blank, templates: templates, options: .symbolCell)
+        let metalBlank = try #require(
+            FontTemplateMatcher.decodeSymbolWithMetal(
+                mask: blank,
+                templates: templates,
+                options: .symbolCell,
+                matcher: matcher
+            )
+        )
+        #expect(cpuBlank.characters.isEmpty)
+        #expect(metalBlank.characters.isEmpty)
+    }
+
+    @Test
+    func symbolRecognizerFallsBackToCPUWhenMetalMatcherIsUnavailable() throws {
+        let templates = try #require(FontTemplateSet.make(targetHeight: 88, options: .symbolCell))
+        let mask = try makeSymbolMask("PLRZ", templates: templates)
+        let pixelBuffer = try makePixelBuffer(from: mask)
+
+        let recognizer = FontTemplateTextRecognizer(symbolMetalMatcher: nil)
+        let recognition = recognizer.recognizeText(in: pixelBuffer, region: .manualSymbolCell)
+
+        #expect(recognition.rawText == "PLRZ")
+        #expect(recognition.confidence > 0.75)
+    }
+
+    @Test
+    func benchmarkSymbolRecognitionCPUVersusMetalWhenRequested() throws {
+        guard ProcessInfo.processInfo.environment["OCR_SYMBOL_BENCHMARK"] == "1" else {
+            return
+        }
+        guard let matcher = SymbolTemplateMetalMatcher.make() else {
+            print("[benchmark] Symbol Metal matcher unavailable; skipping CPU-vs-Metal comparison.")
+            return
+        }
+
+        let templates = try #require(FontTemplateSet.make(targetHeight: 88, options: .symbolCell))
+        let mask = try makeSymbolMask("PLRZ", templates: templates)
+        let pixelBuffer = try makePixelBuffer(from: mask)
+        let iterations = max(
+            1,
+            Int(ProcessInfo.processInfo.environment["OCR_SYMBOL_BENCHMARK_ITERATIONS"] ?? "") ?? 500
+        )
+        let cpuRecognizer = FontTemplateTextRecognizer(symbolMetalMatcher: nil)
+        let metalRecognizer = FontTemplateTextRecognizer(symbolMetalMatcher: matcher)
+
+        _ = cpuRecognizer.recognizeText(in: pixelBuffer, region: .manualSymbolCell)
+        _ = metalRecognizer.recognizeText(in: pixelBuffer, region: .manualSymbolCell)
+
+        var cpuLast = ""
+        let cpuStart = DispatchTime.now().uptimeNanoseconds
+        for _ in 0..<iterations {
+            cpuLast = cpuRecognizer.recognizeText(in: pixelBuffer, region: .manualSymbolCell).rawText
+        }
+        let cpuElapsedSeconds = Double(DispatchTime.now().uptimeNanoseconds - cpuStart) / 1_000_000_000
+
+        var metalLast = ""
+        let metalStart = DispatchTime.now().uptimeNanoseconds
+        for _ in 0..<iterations {
+            metalLast = metalRecognizer.recognizeText(in: pixelBuffer, region: .manualSymbolCell).rawText
+        }
+        let metalElapsedSeconds = Double(DispatchTime.now().uptimeNanoseconds - metalStart) / 1_000_000_000
+
+        #expect(cpuLast == "PLRZ")
+        #expect(metalLast == cpuLast)
+        print(
+            String(
+                format: "[benchmark] manualSymbolCell iterations=%d cpu=%.1f recognitions/sec metal=%.1f recognitions/sec",
+                iterations,
+                Double(iterations) / max(cpuElapsedSeconds, .leastNonzeroMagnitude),
+                Double(iterations) / max(metalElapsedSeconds, .leastNonzeroMagnitude)
+            )
+        )
+    }
+
+    private func makeSymbolMask(_ symbol: String, templates: FontTemplateSet) throws -> BinaryMask {
+        let glyphs = try symbol.map { character in
+            try #require(templates.glyphTemplates[character])
+        }
+        let gap = 2
+        let width = glyphs.reduce(0) { $0 + $1.width } + max(0, glyphs.count - 1) * gap
+        let height = templates.bitmapHeight
+        var pixels = Array(repeating: UInt8(0), count: width * height)
+        var xOffset = 0
+
+        for glyph in glyphs {
+            for y in 0..<glyph.height {
+                let targetY = glyph.yOffset + y
+                guard targetY >= 0, targetY < height else {
+                    continue
+                }
+                for x in 0..<glyph.width where glyph.mask[y * glyph.width + x] == 1 {
+                    pixels[targetY * width + xOffset + x] = 1
+                }
+            }
+            xOffset += glyph.width + gap
+        }
+
+        return BinaryMask(width: width, height: height, pixels: pixels)
+    }
+
+    private func makePixelBuffer(from mask: BinaryMask) throws -> CVPixelBuffer {
+        var pixelBuffer: CVPixelBuffer?
+        let attributes: [CFString: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:]
+        ]
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            mask.width,
+            mask.height,
+            kCVPixelFormatType_32BGRA,
+            attributes as CFDictionary,
+            &pixelBuffer
+        )
+        #expect(status == kCVReturnSuccess)
+        let unwrapped = try #require(pixelBuffer)
+
+        CVPixelBufferLockBaseAddress(unwrapped, [])
+        defer { CVPixelBufferUnlockBaseAddress(unwrapped, []) }
+
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(unwrapped)
+        let pointer = try #require(CVPixelBufferGetBaseAddress(unwrapped)?.assumingMemoryBound(to: UInt8.self))
+        for y in 0..<mask.height {
+            let row = pointer.advanced(by: y * bytesPerRow)
+            for x in 0..<mask.width {
+                let value: UInt8 = mask.pixels[y * mask.width + x] == 1 ? 255 : 0
+                row[x * 4] = value
+                row[x * 4 + 1] = value
+                row[x * 4 + 2] = value
+                row[x * 4 + 3] = 255
+            }
+        }
+
+        return unwrapped
+    }
+}

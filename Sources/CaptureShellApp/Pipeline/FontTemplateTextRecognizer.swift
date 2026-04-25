@@ -105,11 +105,12 @@ final class FontTemplateTextRecognizer: OCRTextRecognizing, @unchecked Sendable 
 
     init(
         numericOptions: Options = .numericCell,
-        symbolOptions: Options = .symbolCell
+        symbolOptions: Options = .symbolCell,
+        symbolMetalMatcher: SymbolTemplateMetalMatcher? = SymbolTemplateMetalMatcher.make()
     ) {
         self.numericOptions = numericOptions
         self.symbolOptions = symbolOptions
-        self.symbolMetalMatcher = SymbolTemplateMetalMatcher.make()
+        self.symbolMetalMatcher = symbolMetalMatcher
     }
 
     func recognizeText(in pixelBuffer: CVPixelBuffer, region: OCRRegionKind) -> OCRTextRecognition {

@@ -23,11 +23,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.ocrBuyRatioChanged(ratio)
         }
     )
+    private lazy var displayCaptureMessageSender = OCRAutomationTradingMessageSender(
+        manager: tradingRuntimeManager,
+        configurationProvider: { [weak self] in
+            guard let self else {
+                return OCRAutomationTradingConfiguration(buyQuantityRatio: 0.5, controllerArmed: false)
+            }
+            return self.currentOCRAutomationTradingConfiguration()
+        }
+    )
     private lazy var captureController = DisplayCaptureController(
         permissionManager: ScreenRecordingPermissionManager(),
         timingLogger: FrameTimingLogger(),
         pipeline: LowLatencyOCRFramePipeline(
-            messageSender: DirectTradingMessageSender(manager: tradingRuntimeManager)
+            messageSender: displayCaptureMessageSender
         )
     )
 
@@ -567,6 +576,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func ocrBuyRatioChanged(_ ratio: Double) {
         ocrBuyRatio = ratio.isFinite && ratio > 0 ? ratio : 0.5
         liveSessionController.setBuyQuantityRatio(ocrBuyRatio)
+    }
+
+    private func currentOCRAutomationTradingConfiguration() -> OCRAutomationTradingConfiguration {
+        OCRAutomationTradingConfiguration(
+            buyQuantityRatio: ocrBuyRatio,
+            controllerArmed: tradingRuntimeManager.dashboard.panel.status.controllerArmed
+        )
     }
 
     private func loadPersistedRuntimeConfigIfAvailable() {
