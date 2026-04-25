@@ -17,6 +17,10 @@ if let exitCode = LiveAnalysisCommand.runIfRequested(arguments: CommandLine.argu
     exit(Int32(exitCode))
 }
 
+if let exitCode = LiveWebSocketDecodeProbeCommand.runIfRequested(arguments: CommandLine.arguments) {
+    exit(Int32(exitCode))
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 

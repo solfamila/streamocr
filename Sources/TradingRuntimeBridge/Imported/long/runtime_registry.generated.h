@@ -76,10 +76,6 @@ constexpr std::string_view logCategoryName(LogCategory category) {
 }
 
 enum class QueueId {
-    BridgeCapture,
-    BridgeSender,
-    OutboxJournal,
-    OutboxDrain,
     EngineAcceptLoop,
     EngineSequencer,
     EngineSegmentWriter,
@@ -103,11 +99,7 @@ struct QueueSpec {
     std::string_view qosName;
 };
 
-inline constexpr std::array<QueueSpec, 17> kQueueSpecs = {{
-    {QueueId::BridgeCapture, SubsystemId::LongBridge, LogCategory::Bridge, "com.foxy.long.bridge.capture", "inherited"},
-    {QueueId::BridgeSender, SubsystemId::LongBridge, LogCategory::Bridge, "com.foxy.long.bridge.sender", "userInitiated"},
-    {QueueId::OutboxJournal, SubsystemId::LongBridge, LogCategory::Bridge, "com.foxy.long.bridge.outbox-journal", "utility"},
-    {QueueId::OutboxDrain, SubsystemId::LongBridge, LogCategory::Bridge, "com.foxy.long.bridge.outbox-drain", "utility"},
+inline constexpr std::array<QueueSpec, 13> kQueueSpecs = {{
     {QueueId::EngineAcceptLoop, SubsystemId::TapeEngine, LogCategory::Rpc, "com.foxy.tape-engine.accept-loop", "utility"},
     {QueueId::EngineSequencer, SubsystemId::TapeEngine, LogCategory::Sequencer, "com.foxy.tape-engine.sequencer", "userInitiated"},
     {QueueId::EngineSegmentWriter, SubsystemId::TapeEngine, LogCategory::Recorder, "com.foxy.tape-engine.segment-writer", "utility"},
@@ -125,40 +117,32 @@ inline constexpr std::array<QueueSpec, 17> kQueueSpecs = {{
 
 constexpr QueueSpec queueSpec(QueueId id) {
     switch (id) {
-        case QueueId::BridgeCapture:
-            return kQueueSpecs[0];
-        case QueueId::BridgeSender:
-            return kQueueSpecs[1];
-        case QueueId::OutboxJournal:
-            return kQueueSpecs[2];
-        case QueueId::OutboxDrain:
-            return kQueueSpecs[3];
         case QueueId::EngineAcceptLoop:
-            return kQueueSpecs[4];
+            return kQueueSpecs[0];
         case QueueId::EngineSequencer:
-            return kQueueSpecs[5];
+            return kQueueSpecs[1];
         case QueueId::EngineSegmentWriter:
-            return kQueueSpecs[6];
+            return kQueueSpecs[2];
         case QueueId::EngineReplay:
-            return kQueueSpecs[7];
+            return kQueueSpecs[3];
         case QueueId::EngineAnalyzerDeferred:
-            return kQueueSpecs[8];
+            return kQueueSpecs[4];
         case QueueId::TapescopeMainUi:
-            return kQueueSpecs[9];
+            return kQueueSpecs[5];
         case QueueId::TapescopeSnapshotDecode:
-            return kQueueSpecs[10];
+            return kQueueSpecs[6];
         case QueueId::TapescopeReplayScrub:
-            return kQueueSpecs[11];
+            return kQueueSpecs[7];
         case QueueId::TapescopeMetalPrep:
-            return kQueueSpecs[12];
+            return kQueueSpecs[8];
         case QueueId::TapescopeReportRender:
-            return kQueueSpecs[13];
+            return kQueueSpecs[9];
         case QueueId::TapeMcpRequestLoop:
-            return kQueueSpecs[14];
+            return kQueueSpecs[10];
         case QueueId::TapeMcpReads:
-            return kQueueSpecs[15];
+            return kQueueSpecs[11];
         case QueueId::TapeMcpExports:
-            return kQueueSpecs[16];
+            return kQueueSpecs[12];
         default:
             return kQueueSpecs[0];
     }

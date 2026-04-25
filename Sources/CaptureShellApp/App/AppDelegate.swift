@@ -33,6 +33,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let runtimeConfigStore = RuntimeConfigStore()
     private let roiSelector = ROISelector()
+    private var liveROISelectionTask: Task<Void, Never>?
+    private var appliedRuntimeConfig: CaptureRuntimeConfig?
 
     private var window: NSWindow?
     private var statusLabel = NSTextField(labelWithString: "Starting...")
@@ -117,7 +119,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await captureController.stopCapture()
         }
         liveSessionController.stop()
-        tradingRuntimeManager.shutdown()
+        Task {
+            await tradingRuntimeManager.shutdownAsync()
+        }
     }
 
     @objc
@@ -445,7 +449,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 updateSetupWindowSourceLabel()
             }
         }
-        liveSessionController.setRuntimeConfig(regionState.toPersistedConfig())
+        appliedRuntimeConfig = regionState.toPersistedConfig()
+        liveSessionController.setRuntimeConfig(appliedRuntimeConfig)
         liveSessionController.setBuyQuantityRatio(ocrBuyRatio)
     }
 
@@ -468,7 +473,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startLiveStream(urlText: String) {
         currentLiveStreamURLText = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
-            try liveSessionController.start(seedURLText: currentLiveStreamURLText)
+            try liveSessionController.start(
+                seedURLText: currentLiveStreamURLText,
+                loggingEnabled: isEnvironmentFlagEnabled("CAPTURESHELLAPP_LIVE_VERBOSE")
+            )
         } catch {
             let errorStatus = LiveOCRSessionStatusSnapshot(
                 state: .error,
@@ -484,6 +492,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             tradingWindowController.updateLiveStatus(errorStatus)
         }
+    }
+
+    private func isEnvironmentFlagEnabled(_ name: String) -> Bool {
+        guard let rawValue = startupEnvironment[name]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        else {
+            return false
+        }
+        return ["1", "true", "yes", "on"].contains(rawValue)
     }
 
     private func stopLiveStream() {
@@ -570,40 +588,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func loadTradingConfiguration() {
-        do {
-            let connection = try tradingRuntimeManager.currentConnectionConfig()
-            hostField.stringValue = connection.host
-            portField.stringValue = String(connection.port)
-            clientIDField.stringValue = String(connection.clientId)
-        } catch {
-            tradingStatusLabel.stringValue = "Failed to load trading connection config: \(error.localizedDescription)"
-        }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let connection = try await tradingRuntimeManager.currentConnectionConfigAsync()
+                hostField.stringValue = connection.host
+                portField.stringValue = String(connection.port)
+                clientIDField.stringValue = String(connection.clientId)
+            } catch {
+                tradingStatusLabel.stringValue = "Failed to load trading connection config: \(error.localizedDescription)"
+            }
 
-        do {
-            let risk = try tradingRuntimeManager.currentRiskControls()
-            staleQuoteField.stringValue = String(risk.staleQuoteThresholdMs)
-            maxOrderField.stringValue = String(format: "%.0f", risk.maxOrderNotional)
-            maxOpenField.stringValue = String(format: "%.0f", risk.maxOpenNotional)
-        } catch {
-            tradingStatusLabel.stringValue = "Failed to load trading risk controls: \(error.localizedDescription)"
+            do {
+                let risk = try await tradingRuntimeManager.currentRiskControlsAsync()
+                staleQuoteField.stringValue = String(risk.staleQuoteThresholdMs)
+                maxOrderField.stringValue = String(format: "%.0f", risk.maxOrderNotional)
+                maxOpenField.stringValue = String(format: "%.0f", risk.maxOpenNotional)
+            } catch {
+                tradingStatusLabel.stringValue = "Failed to load trading risk controls: \(error.localizedDescription)"
+            }
         }
     }
 
     @objc
     private func tradingRuntimeTapped() {
         if tradingRuntimeManager.isStarted {
-            tradingRuntimeManager.shutdown()
-            tradingStatusLabel.stringValue = "Trading runtime stopped."
+            tradingStatusLabel.stringValue = "Stopping trading runtime..."
+            Task { [weak self] in
+                guard let self else { return }
+                await tradingRuntimeManager.shutdownAsync()
+                tradingStatusLabel.stringValue = "Trading runtime stopped."
+            }
             return
         }
 
         syncTradingInputsToRuntime()
-        let startResult = tradingRuntimeManager.startWithAutoConnectFallback()
-        tradingStatusLabel.stringValue = startResult.connected
-            ? "Trading runtime started and connected to TWS."
-            : "Trading runtime started, but TWS is not connected yet."
-        if let autoDetectedConfig = startResult.autoDetectedConfig {
-            tradingStatusLabel.stringValue += " Auto-detected \(autoDetectedConfig.host):\(autoDetectedConfig.port)."
+        tradingStatusLabel.stringValue = "Starting trading runtime..."
+        Task { [weak self] in
+            guard let self else { return }
+            let startResult = await tradingRuntimeManager.startWithAutoConnectFallbackAsync()
+            tradingStatusLabel.stringValue = startResult.connected
+                ? "Trading runtime started and connected to TWS."
+                : "Trading runtime started, but TWS is not connected yet."
+            if let autoDetectedConfig = startResult.autoDetectedConfig {
+                tradingStatusLabel.stringValue += " Auto-detected \(autoDetectedConfig.host):\(autoDetectedConfig.port)."
+            }
         }
     }
 
@@ -614,93 +643,119 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc
     private func applyTradingConnectionTapped() {
-        do {
-            var config = try tradingRuntimeManager.currentConnectionConfig()
-            config.host = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            config.port = max(1, Int(portField.intValue))
-            config.clientId = max(1, Int(clientIDField.intValue))
-            try tradingRuntimeManager.updateConnectionConfig(config)
-            tradingStatusLabel.stringValue = "Trading connection settings applied."
-        } catch {
-            tradingStatusLabel.stringValue = "Failed to apply connection settings: \(error.localizedDescription)"
+        tradingStatusLabel.stringValue = "Applying trading connection settings..."
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                var config = try await tradingRuntimeManager.currentConnectionConfigAsync()
+                config.host = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                config.port = max(1, Int(portField.intValue))
+                config.clientId = max(1, Int(clientIDField.intValue))
+                try await tradingRuntimeManager.updateConnectionConfigAsync(config)
+                tradingStatusLabel.stringValue = "Trading connection settings applied."
+            } catch {
+                tradingStatusLabel.stringValue = "Failed to apply connection settings: \(error.localizedDescription)"
+            }
         }
     }
 
     @objc
     private func applyTradingRiskTapped() {
-        do {
-            var risk = try tradingRuntimeManager.currentRiskControls()
-            risk.staleQuoteThresholdMs = max(250, Int(staleQuoteField.intValue))
-            risk.maxOrderNotional = max(100, maxOrderField.doubleValue)
-            risk.maxOpenNotional = max(risk.maxOrderNotional, maxOpenField.doubleValue)
-            try tradingRuntimeManager.updateRiskControls(risk)
-            tradingStatusLabel.stringValue = "Trading risk controls applied."
-        } catch {
-            tradingStatusLabel.stringValue = "Failed to apply risk controls: \(error.localizedDescription)"
+        tradingStatusLabel.stringValue = "Applying trading risk controls..."
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                var risk = try await tradingRuntimeManager.currentRiskControlsAsync()
+                risk.staleQuoteThresholdMs = max(250, Int(staleQuoteField.intValue))
+                risk.maxOrderNotional = max(100, maxOrderField.doubleValue)
+                risk.maxOpenNotional = max(risk.maxOrderNotional, maxOpenField.doubleValue)
+                try await tradingRuntimeManager.updateRiskControlsAsync(risk)
+                tradingStatusLabel.stringValue = "Trading risk controls applied."
+            } catch {
+                tradingStatusLabel.stringValue = "Failed to apply risk controls: \(error.localizedDescription)"
+            }
         }
     }
 
     @objc
     private func subscribeTapped() {
         syncTradingInputsToRuntime()
-        do {
-            let response = try tradingRuntimeManager.requestSubscription(
-                symbol: symbolField.stringValue,
-                recalcQtyFromFirstAsk: false
-            )
-            tradingStatusLabel.stringValue = "Subscribed to \(response.normalizedSymbol ?? symbolField.stringValue)."
-        } catch {
-            tradingStatusLabel.stringValue = "Subscribe failed: \(error.localizedDescription)"
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let response = try await tradingRuntimeManager.requestSubscriptionAsync(
+                    symbol: symbolField.stringValue,
+                    recalcQtyFromFirstAsk: false
+                )
+                tradingStatusLabel.stringValue = "Subscribed to \(response.normalizedSymbol ?? symbolField.stringValue)."
+            } catch {
+                tradingStatusLabel.stringValue = "Subscribe failed: \(error.localizedDescription)"
+            }
         }
     }
 
     @objc
     private func buyTapped() {
         syncTradingInputsToRuntime()
-        do {
-            _ = try tradingRuntimeManager.submitBuy(source: "GUI Button", note: "Buy Limit button pressed")
-            tradingStatusLabel.stringValue = "BUY submitted."
-        } catch {
-            tradingStatusLabel.stringValue = "Buy failed: \(error.localizedDescription)"
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await tradingRuntimeManager.submitBuyAsync(source: "GUI Button", note: "Buy Limit button pressed")
+                tradingStatusLabel.stringValue = "BUY submitted."
+            } catch {
+                tradingStatusLabel.stringValue = "Buy failed: \(error.localizedDescription)"
+            }
         }
     }
 
     @objc
     private func closeTapped() {
         syncTradingInputsToRuntime()
-        do {
-            _ = try tradingRuntimeManager.submitClose(source: "GUI Button", note: "Close Long button pressed")
-            tradingStatusLabel.stringValue = "Close submitted."
-        } catch {
-            tradingStatusLabel.stringValue = "Close failed: \(error.localizedDescription)"
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await tradingRuntimeManager.submitCloseAsync(source: "GUI Button", note: "Close Long button pressed")
+                tradingStatusLabel.stringValue = "Close submitted."
+            } catch {
+                tradingStatusLabel.stringValue = "Close failed: \(error.localizedDescription)"
+            }
         }
     }
 
     @objc
     private func cancelAllTapped() {
-        do {
-            let response = try tradingRuntimeManager.cancelAll()
-            let count = response.orderIds?.count ?? 0
-            tradingStatusLabel.stringValue = count > 0
-                ? "Cancel requested for \(count) order(s)."
-                : "No pending orders to cancel."
-        } catch {
-            tradingStatusLabel.stringValue = "Cancel all failed: \(error.localizedDescription)"
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let response = try await tradingRuntimeManager.cancelAllAsync()
+                let count = response.orderIds?.count ?? 0
+                tradingStatusLabel.stringValue = count > 0
+                    ? "Cancel requested for \(count) order(s)."
+                    : "No pending orders to cancel."
+            } catch {
+                tradingStatusLabel.stringValue = "Cancel all failed: \(error.localizedDescription)"
+            }
         }
     }
 
     @objc
     private func armControllerTapped() {
         let nextArmed = !tradingRuntimeManager.dashboard.panel.status.controllerArmed
-        tradingRuntimeManager.setControllerArmed(nextArmed)
-        tradingStatusLabel.stringValue = nextArmed ? "Controller armed." : "Controller disarmed."
+        Task { [weak self] in
+            guard let self else { return }
+            await tradingRuntimeManager.setControllerArmedAsync(nextArmed)
+            tradingStatusLabel.stringValue = nextArmed ? "Controller armed." : "Controller disarmed."
+        }
     }
 
     @objc
     private func killSwitchTapped() {
         let nextEnabled = !tradingRuntimeManager.dashboard.panel.status.tradingKillSwitch
-        tradingRuntimeManager.setTradingKillSwitch(nextEnabled)
-        tradingStatusLabel.stringValue = nextEnabled ? "Kill switch enabled." : "Kill switch disabled."
+        Task { [weak self] in
+            guard let self else { return }
+            await tradingRuntimeManager.setTradingKillSwitchAsync(nextEnabled)
+            tradingStatusLabel.stringValue = nextEnabled ? "Kill switch enabled." : "Kill switch disabled."
+        }
     }
 
     private func syncTradingInputsToRuntime() {
@@ -785,8 +840,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func syncRuntimeRegionState() {
-        captureController.setActiveRuntimeConfig(regionState.toPersistedConfig())
-        liveSessionController.setRuntimeConfig(regionState.toPersistedConfig())
+        let nextConfig = regionState.toPersistedConfig()
+        if let nextConfig {
+            appliedRuntimeConfig = nextConfig
+        }
+        captureController.setActiveRuntimeConfig(appliedRuntimeConfig)
+        liveSessionController.setRuntimeConfig(appliedRuntimeConfig)
+        updateRegionSummaryUI()
+        updateSetupWindowSourceLabel()
+    }
+
+    private func refreshRegionDraftUI() {
         updateRegionSummaryUI()
         updateSetupWindowSourceLabel()
     }
@@ -849,6 +913,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        guard liveROISelectionTask == nil else {
+            statusLabel.stringValue = "Already capturing a live ROI snapshot. Please wait..."
+            return
+        }
+
         currentLiveStreamURLText = tradingWindowController.currentLiveStreamURLText
         let trimmedURL = currentLiveStreamURLText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let seedURL = URL(string: trimmedURL), !trimmedURL.isEmpty else {
@@ -856,11 +925,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let snapshot: LiveStreamFrameSnapshot
-        do {
-            snapshot = try LiveStreamFrameSnapshotter().captureSnapshot(seedURL: seedURL)
-        } catch {
-            statusLabel.stringValue = "Failed to capture a live ROI snapshot: \(error.localizedDescription)"
+        statusLabel.stringValue = "Capturing live ROI snapshot for \(type.statusTitle.lowercased())..."
+
+        liveROISelectionTask = Task { [weak self] in
+            defer {
+                Task { @MainActor [weak self] in
+                    self?.liveROISelectionTask = nil
+                }
+            }
+
+            do {
+                let snapshot = try await Task.detached(priority: .userInitiated) { [weak self] in
+                    guard let self else {
+                        throw LiveOCRSessionControllerError.noActiveLiveFrame
+                    }
+
+                    let liveStatus = self.liveSessionController.currentStatusSnapshot()
+                    if liveStatus.isRunning {
+                        return try self.liveSessionController.captureCurrentFrameSnapshot()
+                    }
+
+                    return try LiveStreamFrameSnapshotter().captureSnapshot(seedURL: seedURL)
+                }.value
+
+                await MainActor.run { [weak self] in
+                    self?.statusLabel.stringValue = "Preparing \(type.statusTitle.lowercased()) ROI selector..."
+                }
+
+                await self?.presentRegionSelection(type: type, snapshot: snapshot)
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.statusLabel.stringValue = "Failed to capture a live ROI snapshot: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func presentRegionSelection(type: RegionType, snapshot: LiveStreamFrameSnapshot) async {
+        guard !tradingRuntimeManager.dashboard.panel.status.controllerArmed else {
+            statusLabel.stringValue = "Disarm the controller before editing OCR ROIs."
             return
         }
 
@@ -884,25 +988,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             selectionContext = nil
         }
 
+        let initialRect = currentRect(for: type)
+        let frameTitle = "Live stream \(snapshot.width)x\(snapshot.height)"
+
         do {
-            let selectedRect = try roiSelector.selectRect(
-                on: snapshot.cgImage,
-                frameTitle: "Live stream \(snapshot.width)x\(snapshot.height)",
-                prompt: type.prompt,
-                initialRect: currentRect(for: type),
+            let preparedInput = try await prepareLiveSelectionInput(
+                snapshot: snapshot,
+                initialRect: initialRect,
                 context: selectionContext
+            )
+
+            let selectedRect = try roiSelector.selectPreparedRect(
+                preparedInput,
+                prompt: type.prompt,
+                displayTitle: frameTitle,
+                maxWidth: snapshot.width,
+                maxHeight: snapshot.height
             )
 
             let clearedDependentSelection = setRect(selectedRect, for: type)
             regionState.sourceDescription = "Manual (unsaved)"
-            syncRuntimeRegionState()
+            let shouldApplyRuntimeConfig = !(type == .baseROI && clearedDependentSelection)
+            if shouldApplyRuntimeConfig {
+                syncRuntimeRegionState()
+            } else {
+                refreshRegionDraftUI()
+            }
 
             var statusMessage = "\(type.statusTitle) updated from live stream snapshot: \(selectedRect.summary)."
             switch type {
             case .baseROI:
                 statusMessage += " Next: select Position cell from the nested Position base ROI view."
                 if clearedDependentSelection {
-                    statusMessage += " Cleared previous Position cell selection."
+                    statusMessage += " Cleared previous Position cell selection. Live OCR keeps using the previous applied position config until you select the new Position cell ROI."
                 }
             case .symbolROI:
                 statusMessage += " Next: select Symbol cell from the nested Symbol base ROI view."
@@ -919,6 +1037,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusLabel.stringValue = "Failed to select \(type.statusTitle.lowercased()): \(error.message)"
         } catch {
             statusLabel.stringValue = "Failed to select \(type.statusTitle.lowercased()): \(error.localizedDescription)"
+        }
+    }
+
+    private func prepareLiveSelectionInput(
+        snapshot: LiveStreamFrameSnapshot,
+        initialRect: PixelRect?,
+        context: ROISelectionContext?
+    ) async throws -> PreparedROISelectionInput {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let preparedInput = try ROISelector.prepareSelectionInput(
+                        cgImage: snapshot.cgImage,
+                        coordinateWidth: snapshot.width,
+                        coordinateHeight: snapshot.height,
+                        initialRect: initialRect,
+                        context: context
+                    )
+                    continuation.resume(returning: preparedInput)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
         }
     }
 

@@ -188,6 +188,19 @@ struct NanocosmosStreamResolverTests {
     }
 
     @Test
+    func derivesPlayablePlaylistCandidatesFromNanoplayerEmbedURL() throws {
+        let seed = try #require(URL(string: "https://demo.nanocosmos.de/nanoplayer/release/nanoplayer.html?entry.rtmp.streamname=wptPV-dvBBZ&security.jwtoken=test-jwt"))
+
+        let candidates = try NanocosmosStreamResolver.derivePlaylistCandidates(seedURL: seed)
+
+        #expect(
+            candidates.map(\.absoluteString).contains(
+                "https://bintu-play.nanocosmos.de/h5live/http/playlist.m3u8?stream=wptPV-dvBBZ&url=rtmp%3A%2F%2Fbintu-play.nanocosmos.de%2Fplay&jwtoken=test-jwt"
+            )
+        )
+    }
+
+    @Test
     func derivesDirectPlaybackCandidatesFromSeedURL() throws {
         let seed = try #require(URL(string: "wss://bintu-h5live.nanocosmos.de/h5live/stream/stream.mp4?url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&stream=COeCf-9jp1Q&cid=433201&pid=72860723635"))
 
@@ -196,6 +209,24 @@ struct NanocosmosStreamResolverTests {
         #expect(
             candidates.map(\.absoluteString).contains(
                 "https://bintu-h5live.nanocosmos.de/h5live/http/stream.mp4?stream=COeCf-9jp1Q&cid=433201&pid=72860723635"
+            )
+        )
+    }
+
+    @Test
+    func derivesDirectPlaybackCandidatesFromNanoplayerEmbedURL() throws {
+        let seed = try #require(URL(string: "https://demo.nanocosmos.de/nanoplayer/release/nanoplayer.html?entry.rtmp.streamname=wptPV-dvBBZ&security.jwtoken=test-jwt"))
+
+        let candidates = try NanocosmosStreamResolver.deriveDirectPlaybackCandidates(seedURL: seed)
+
+        #expect(
+            candidates.map(\.absoluteString).contains(
+                "https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?stream=wptPV-dvBBZ&jwtoken=test-jwt"
+            )
+        )
+        #expect(
+            candidates.map(\.absoluteString).contains(
+                "https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?stream=wptPV-dvBBZ&url=rtmp%3A%2F%2Fbintu-play.nanocosmos.de%2Fplay&jwtoken=test-jwt"
             )
         )
     }
@@ -287,6 +318,33 @@ struct NanocosmosStreamResolverTests {
     }
 }
 
+struct NanocosmosWebSocketFrameSourceTests {
+    @Test
+    func normalizedWebSocketURLRemovesCheckAndCloseFlag() throws {
+        let seedURL = try #require(URL(string: "wss://bintu-h5live.nanocosmos.de:443/h5live/stream/stream.mp4?stream=wptPV-dvBBZ&url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay&flags=checkandclose"))
+
+        let webSocketURL = try #require(NanocosmosWebSocketFrameSource.normalizedWebSocketURL(from: seedURL))
+
+        #expect(webSocketURL.scheme == "wss")
+        #expect(webSocketURL.path == "/h5live/stream/stream.mp4")
+        #expect(webSocketURL.absoluteString.contains("stream=wptPV-dvBBZ"))
+        #expect(webSocketURL.absoluteString.contains("url=rtmp://localhost:1935/play"))
+        #expect(!webSocketURL.absoluteString.contains("checkandclose"))
+    }
+
+    @Test
+    func normalizedWebSocketURLConvertsHTTPPlaybackPath() throws {
+        let seedURL = try #require(URL(string: "https://bintu-h5live.nanocosmos.de/h5live/http/stream.mp4?stream=wptPV-dvBBZ&url=rtmp%3A%2F%2Flocalhost%3A1935%2Fplay"))
+
+        let webSocketURL = try #require(NanocosmosWebSocketFrameSource.normalizedWebSocketURL(from: seedURL))
+
+        #expect(webSocketURL.scheme == "wss")
+        #expect(webSocketURL.host == "bintu-h5live.nanocosmos.de")
+        #expect(webSocketURL.path == "/h5live/stream/stream.mp4")
+        #expect(webSocketURL.absoluteString.contains("stream=wptPV-dvBBZ"))
+    }
+}
+
 struct LiveMediaCaptureCoordinatorTests {
     @Test
     func preferredRecordingSourceURLUsesOriginalDirectCandidate() throws {
@@ -304,6 +362,15 @@ struct LiveMediaCaptureCoordinatorTests {
         let recordingURL = LiveMediaCaptureCoordinator.preferredRecordingSourceURL(seedURL: seedURL)
 
         #expect(recordingURL.absoluteString == "https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?stream=wptPV-dvBBZ&url=rtmp%3A%2F%2Flocalhost%2Fplay&flags=checkandclose")
+    }
+
+    @Test
+    func preferredRecordingSourceURLUsesOriginalStyleCandidateForNanoplayerEmbedSeed() throws {
+        let seedURL = try #require(URL(string: "https://demo.nanocosmos.de/nanoplayer/release/nanoplayer.html?entry.rtmp.streamname=wptPV-dvBBZ&security.jwtoken=test-jwt"))
+
+        let recordingURL = LiveMediaCaptureCoordinator.preferredRecordingSourceURL(seedURL: seedURL)
+
+        #expect(recordingURL.absoluteString == "https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?stream=wptPV-dvBBZ&url=rtmp%3A%2F%2Fbintu-play.nanocosmos.de%2Fplay&jwtoken=test-jwt")
     }
 
     @Test

@@ -51,8 +51,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
                         result = .success(try await handleBuy(payload: payload))
                     case "SUBSCRIBE":
                         try throwIfCancelled()
-                        try handleSubscribe(payload: payload)
-                        result = .success(.submitted)
+                        result = .success(try await handleSubscribe(payload: payload))
                     default:
                         throw TradingRuntimeManagerError.actionFailed("Unsupported OCR automation event: \(event)")
                     }
@@ -87,7 +86,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
     }
 
     @MainActor
-    private func handleSubscribe(payload: String) throws {
+    private func handleSubscribe(payload: String) async throws -> TradingMessageSendOutcome {
         guard
             let data = payload.data(using: .utf8),
             let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -101,8 +100,9 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
             throw TradingRuntimeManagerError.actionFailed("Invalid subscribe symbol in OCR payload.")
         }
 
-        _ = try manager.requestSubscription(symbol: normalized, recalcQtyFromFirstAsk: false)
-        manager.appendMessage("OCR subscribed to \(normalized)")
+        _ = try await manager.requestSubscriptionAsync(symbol: normalized, recalcQtyFromFirstAsk: false)
+        await manager.appendMessageAsync("OCR subscribed to \(normalized)")
+        return .submitted
     }
 
     @MainActor
@@ -152,7 +152,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
                 quantityInput: quantityInput
             )
             print(rejectionLine)
-            manager.appendMessage("OCR buy rejected: \(reason)")
+            await manager.appendMessageAsync("OCR buy rejected: \(reason)")
             switch disposition {
             case .intentionallyIgnored:
                 return .intentionallyIgnored(reason: reason)
@@ -164,7 +164,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         try throwIfCancelled()
 
         do {
-            _ = try manager.submitBuy(
+            _ = try await manager.submitBuyAsync(
                 source: "OCR",
                 note: buyNote(ocrQuantity: buyMessage.ocrQuantity, ratio: configuration.buyQuantityRatio, quantityInput: quantityInput)
             )
@@ -180,7 +180,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
                     quantityInput: quantityInput
                 )
                 print(rejectionLine)
-                manager.appendMessage("OCR buy rejected: \(consumedReason)")
+                await manager.appendMessageAsync("OCR buy rejected: \(consumedReason)")
                 switch disposition {
                 case .intentionallyIgnored:
                     return .intentionallyIgnored(reason: consumedReason)
@@ -196,13 +196,13 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
                 quantityInput: quantityInput
             )
             print(failureLine)
-            manager.appendMessage("OCR buy rejected: \(error.localizedDescription)")
+            await manager.appendMessageAsync("OCR buy rejected: \(error.localizedDescription)")
             throw error
         }
 
         print(submittedBuyLogLine(ocrQuantity: buyMessage.ocrQuantity, ratio: configuration.buyQuantityRatio, quantityInput: quantityInput))
         if let ocrQuantity = buyMessage.ocrQuantity {
-            manager.appendMessage(
+            await manager.appendMessageAsync(
                 String(
                     format: "OCR buy submitted: detected %.0f shares x %.4f -> %d shares",
                     Double(ocrQuantity),

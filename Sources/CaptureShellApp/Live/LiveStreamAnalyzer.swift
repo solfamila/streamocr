@@ -103,6 +103,32 @@ final class LiveStreamAnalyzer {
             throw lastStartupError ?? LiveStreamAnalyzerError.noFramesDecoded(seedURL)
         }
 
+        if let webSocketURL = preferredWebSocketURL(seedURL: seedURL, resolved: resolved) {
+            do {
+                return try analyzeViaWebSocket(
+                    seedURL: seedURL,
+                    webSocketURL: webSocketURL,
+                    resolved: resolved,
+                    runtimeConfigURL: runtimeConfigURL,
+                    runtimeConfig: runtimeConfig,
+                    runSeconds: runSeconds,
+                    runDeadline: runDeadline,
+                    analysisStart: start,
+                    loggingEnabled: loggingEnabled,
+                    eventCollector: eventCollector,
+                    messageSender: messageSender,
+                    pipeline: pipeline,
+                    captureCoordinator: captureCoordinator,
+                    metadataURL: metadataURL
+                )
+            } catch {
+                lastStartupError = error
+                if loggingEnabled {
+                    print("[live] websocket_path_failed falling_back_to_source_chunks due_to=\"\(error.localizedDescription)\"")
+                }
+            }
+        }
+
         if let sourceChunkURL = preferredSourceChunkURL(seedURL: seedURL, resolved: resolved) {
             do {
                 return try analyzeViaSourceChunks(
@@ -209,12 +235,109 @@ final class LiveStreamAnalyzer {
         )
     }
 
+    private func preferredWebSocketURL(seedURL: URL, resolved: ResolvedLiveStream) -> URL? {
+        let candidates = [seedURL, resolved.playbackURL, resolved.streamURL, resolved.playlistURL] +
+            resolved.alternatePlaybackURLs
+        for candidate in candidates {
+            if let webSocketURL = NanocosmosWebSocketFrameSource.normalizedWebSocketURL(from: candidate),
+               NanocosmosWebSocketFrameSource.supports(webSocketURL: webSocketURL) {
+                return webSocketURL
+            }
+        }
+        return nil
+    }
+
     private func preferredSourceChunkURL(seedURL: URL, resolved: ResolvedLiveStream) -> URL? {
         let sourceURL = LiveMediaCaptureCoordinator.preferredRecordingSourceURL(
             seedURL: seedURL,
             resolved: resolved
         )
         return NanocosmosStreamingChunkPuller.supports(sourceURL: sourceURL) ? sourceURL : nil
+    }
+
+    private func analyzeViaWebSocket(
+        seedURL: URL,
+        webSocketURL: URL,
+        resolved: ResolvedLiveStream,
+        runtimeConfigURL: URL?,
+        runtimeConfig: CaptureRuntimeConfig?,
+        runSeconds: Double,
+        runDeadline: Date,
+        analysisStart: Date,
+        loggingEnabled: Bool,
+        eventCollector: PipelineEventCollector,
+        messageSender: any TradingMessageSending,
+        pipeline: LowLatencyOCRFramePipeline,
+        captureCoordinator: LiveMediaCaptureCoordinator?,
+        metadataURL: URL?
+    ) throws -> LiveStreamAnalysisResult {
+        var frameCount = 0
+        var frameSize = "unknown"
+        var firstFrameLatencySeconds: Double?
+        var activeDecodeSeconds: Double?
+        var adjustedConfigByFrameSize: [String: CaptureRuntimeConfig] = [:]
+        let frameProcessingLock = NSLock()
+
+        try captureCoordinator?.ensureRecordingStarted(
+            seedURL: seedURL,
+            remainingSeconds: runDeadline.timeIntervalSinceNow,
+            resolved: resolved
+        )
+
+        let summary = try NanocosmosWebSocketFrameSource().decode(
+            webSocketURL: webSocketURL,
+            runSeconds: max(0.1, runDeadline.timeIntervalSinceNow),
+            loggingEnabled: loggingEnabled
+        ) { frame in
+            frameProcessingLock.lock()
+            defer { frameProcessingLock.unlock() }
+
+            try self.processDecodedFrame(
+                frame,
+                runtimeConfig: runtimeConfig,
+                pipeline: pipeline,
+                captureCoordinator: captureCoordinator,
+                analysisStart: analysisStart,
+                loggingEnabled: loggingEnabled,
+                frameCount: &frameCount,
+                frameSize: &frameSize,
+                firstFrameLatencySeconds: &firstFrameLatencySeconds,
+                activeDecodeSeconds: &activeDecodeSeconds,
+                adjustedConfigByFrameSize: &adjustedConfigByFrameSize
+            )
+        }
+
+        if loggingEnabled {
+            print(
+                "[live] websocket_decoded frames=\(summary.decodedFrameCount) " +
+                "first_binary_seconds=\(formatOptionalSeconds(summary.firstBinaryElapsedSeconds)) " +
+                "first_media_seconds=\(formatOptionalSeconds(summary.firstMediaElapsedSeconds)) " +
+                "first_frame_seconds=\(formatOptionalSeconds(summary.firstFrameElapsedSeconds)) " +
+                "bytes=\(summary.binaryByteCount) source_url=\(webSocketURL.absoluteString)"
+            )
+        }
+
+        guard frameCount > 0 else {
+            throw LiveStreamAnalyzerError.noFramesDecoded(webSocketURL)
+        }
+
+        return try buildResult(
+            seedURL: seedURL,
+            resolvedForResult: resolved,
+            playbackURL: webSocketURL,
+            runtimeConfigURL: runtimeConfigURL,
+            metadataURL: metadataURL,
+            runSeconds: runSeconds,
+            analysisStart: analysisStart,
+            firstFrameLatencySeconds: firstFrameLatencySeconds,
+            activeDecodeSeconds: activeDecodeSeconds,
+            frameCount: frameCount,
+            frameSize: frameSize,
+            eventCollector: eventCollector,
+            messageSender: messageSender,
+            captureCoordinator: captureCoordinator,
+            loggingEnabled: loggingEnabled
+        )
     }
 
     private func analyzeViaSourceChunks(
@@ -257,33 +380,93 @@ final class LiveStreamAnalyzer {
                     resolved: resolved
                 )
 
-                let chunkURL = chunkDirectory.appendingPathComponent(
-                    String(format: "chunk_%06d.mp4", chunkIndex)
+                let chunkBaseName = String(format: "chunk_%06d", chunkIndex)
+                let lowLatencyChunkURL = chunkDirectory.appendingPathComponent(
+                    "\(chunkBaseName)_low_latency.mp4"
                 )
-                let capturedChunk = try chunkPuller.captureChunk(
-                    sourceURL: sourceURL,
-                    destinationURL: chunkURL,
-                    firstByteTimeoutSeconds: min(max(runDeadline.timeIntervalSinceNow, 4), 12),
-                    captureWindowSeconds: 2.0
+                let fallbackChunkURL = chunkDirectory.appendingPathComponent(
+                    "\(chunkBaseName)_fallback.mp4"
                 )
+                defer {
+                    try? FileManager.default.removeItem(at: lowLatencyChunkURL)
+                    try? FileManager.default.removeItem(at: fallbackChunkURL)
+                }
 
-                let decodeSummary = try decoder.decode(
-                    videoURL: capturedChunk.fileURL,
-                    presentationTimeOffsetSeconds: presentationTimeOffsetSeconds
-                ) { frame in
-                    try processDecodedFrame(
-                        frame,
-                        runtimeConfig: runtimeConfig,
-                        pipeline: pipeline,
-                        captureCoordinator: captureCoordinator,
-                        analysisStart: analysisStart,
-                        loggingEnabled: loggingEnabled,
-                        frameCount: &frameCount,
-                        frameSize: &frameSize,
-                        firstFrameLatencySeconds: &firstFrameLatencySeconds,
-                        activeDecodeSeconds: &activeDecodeSeconds,
-                        adjustedConfigByFrameSize: &adjustedConfigByFrameSize
+                var capturedChunk = try chunkPuller.captureChunk(
+                    sourceURL: sourceURL,
+                    destinationURL: lowLatencyChunkURL,
+                    firstByteTimeoutSeconds: min(max(runDeadline.timeIntervalSinceNow, 4), 12),
+                    captureWindowSeconds: LiveSourceChunkCapturePolicy.lowLatencyCaptureWindowSeconds,
+                    minimumPlayableProbeWindowSeconds: LiveSourceChunkCapturePolicy.minimumPlayableProbeWindowSeconds,
+                    playableProbeIntervalSeconds: LiveSourceChunkCapturePolicy.playableProbeIntervalSeconds,
+                    playableProbe: { [decoder] partialChunkURL in
+                        let summary = try? decoder.decode(
+                            videoURL: partialChunkURL,
+                            maximumFrameCount: 1
+                        ) { _ in }
+                        return (summary?.frameCount ?? 0) > 0
+                    }
+                )
+                var captureWindowSeconds = LiveSourceChunkCapturePolicy.lowLatencyCaptureWindowSeconds
+
+                var decodedFramesInAttempt = 0
+                func decodeCapturedChunk(_ capturedChunk: NanocosmosCapturedChunk) throws -> LocalVideoDecodingSummary {
+                    try decoder.decode(
+                        videoURL: capturedChunk.fileURL,
+                        presentationTimeOffsetSeconds: presentationTimeOffsetSeconds,
+                        allowsPartialDecode: true
+                    ) { frame in
+                        try processDecodedFrame(
+                            frame,
+                            runtimeConfig: runtimeConfig,
+                            pipeline: pipeline,
+                            captureCoordinator: captureCoordinator,
+                            analysisStart: analysisStart,
+                            loggingEnabled: loggingEnabled,
+                            frameCount: &frameCount,
+                            frameSize: &frameSize,
+                            firstFrameLatencySeconds: &firstFrameLatencySeconds,
+                            activeDecodeSeconds: &activeDecodeSeconds,
+                            adjustedConfigByFrameSize: &adjustedConfigByFrameSize
+                        )
+                        decodedFramesInAttempt += 1
+                    }
+                }
+
+                let decodeSummary: LocalVideoDecodingSummary
+                do {
+                    decodedFramesInAttempt = 0
+                    let lowLatencySummary = try decodeCapturedChunk(capturedChunk)
+                    if lowLatencySummary.frameCount == 0 {
+                        throw LocalVideoFrameDecoderError.assetReaderFailed(
+                            "No frames decoded from low-latency streaming chunk."
+                        )
+                    }
+                    decodeSummary = lowLatencySummary
+                } catch {
+                    guard decodedFramesInAttempt == 0 else {
+                        throw error
+                    }
+
+                    if loggingEnabled {
+                        print(
+                            "[live] low_latency_source_chunk_decode_failed index=\(chunkIndex) " +
+                            "fallback_capture_window_seconds=" +
+                            "\(String(format: "%.3f", LiveSourceChunkCapturePolicy.analyzerFallbackCaptureWindowSeconds)) " +
+                            "due_to=\"\(error.localizedDescription)\""
+                        )
+                    }
+
+                    capturedChunk = try chunkPuller.captureChunk(
+                        sourceURL: sourceURL,
+                        destinationURL: fallbackChunkURL,
+                        firstByteTimeoutSeconds: min(max(runDeadline.timeIntervalSinceNow, 4), 12),
+                        captureWindowSeconds: LiveSourceChunkCapturePolicy.analyzerFallbackCaptureWindowSeconds
                     )
+                    captureWindowSeconds = LiveSourceChunkCapturePolicy.analyzerFallbackCaptureWindowSeconds
+
+                    decodedFramesInAttempt = 0
+                    decodeSummary = try decodeCapturedChunk(capturedChunk)
                 }
 
                 if let lastPresentationTimeSeconds = decodeSummary.lastPresentationTimeSeconds {
@@ -295,11 +478,14 @@ final class LiveStreamAnalyzer {
                     print(
                         "[live] source_chunk_captured index=\(chunkIndex) bytes=\(capturedChunk.byteCount) " +
                         "capture_seconds=\(String(format: "%.3f", capturedChunk.elapsedSeconds)) " +
+                        "first_byte_seconds=\(formatOptionalSeconds(capturedChunk.firstByteElapsedSeconds)) " +
+                        "active_capture_seconds=\(formatOptionalSeconds(capturedChunk.activeCaptureSeconds)) " +
+                        "max_capture_window_seconds=\(String(format: "%.3f", captureWindowSeconds)) " +
+                        "finish_reason=\(capturedChunk.finishReason.rawValue) " +
                         "frames=\(decodeSummary.frameCount) source_url=\(capturedChunk.sourceURL.absoluteString)"
                     )
                 }
 
-                try? FileManager.default.removeItem(at: capturedChunk.fileURL)
                 chunkIndex += 1
             } catch {
                 lastChunkError = error
@@ -604,6 +790,10 @@ final class LiveStreamAnalyzer {
             return nil
         }
         return Double(frameCount) / activeDecodeSeconds
+    }
+
+    private func formatOptionalSeconds(_ value: Double?) -> String {
+        value.map { String(format: "%.3f", $0) } ?? "nil"
     }
 }
 

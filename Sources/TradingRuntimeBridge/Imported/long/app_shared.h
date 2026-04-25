@@ -93,7 +93,6 @@ inline constexpr int MARKET_DEPTH_NUM_ROWS = 20;
 inline constexpr int WEBSOCKET_PORT = 8080;
 inline constexpr const char* WEBSOCKET_HOST = "127.0.0.1"; // localhost only
 inline constexpr const char* TRADE_TRACE_LOG_FILENAME = "trade_trace_events.jsonl";
-inline constexpr const char* RUNTIME_JOURNAL_LOG_FILENAME = "trade_runtime_journal.jsonl";
 
 enum class ControllerArmMode {
     OneShot = 0,
@@ -319,83 +318,6 @@ struct TradeTrace {
     std::string commissionCurrency;
 };
 
-struct BridgeAnchorIdentity {
-    std::uint64_t traceId = 0;
-    OrderId orderId = 0;
-    long long permId = 0;
-    std::string execId;
-};
-
-struct BridgeOutboxRecord {
-    std::uint64_t sourceSeq = 0;
-    std::string recordType;
-    std::string source;
-    std::string symbol;
-    std::string instrumentId;
-    std::string side;
-    int marketField = -1;
-    int bookPosition = -1;
-    int bookOperation = -1;
-    int bookSide = -1;
-    double price = std::numeric_limits<double>::quiet_NaN();
-    double size = std::numeric_limits<double>::quiet_NaN();
-    std::uint64_t tsReceiveNs = 0;
-    std::uint64_t tsExchangeNs = 0;
-    std::uint64_t vendorSeq = 0;
-    BridgeAnchorIdentity anchor;
-    std::string fallbackState;
-    std::string fallbackReason;
-    std::string note;
-    std::string wallTime;
-};
-
-struct BridgeOutboxRecordInput {
-    std::string recordType;
-    std::string source;
-    std::string symbol;
-    std::string instrumentId;
-    std::string side;
-    int marketField = -1;
-    int bookPosition = -1;
-    int bookOperation = -1;
-    int bookSide = -1;
-    double price = std::numeric_limits<double>::quiet_NaN();
-    double size = std::numeric_limits<double>::quiet_NaN();
-    std::uint64_t tsReceiveNs = 0;
-    std::uint64_t tsExchangeNs = 0;
-    std::uint64_t vendorSeq = 0;
-    std::uint64_t traceId = 0;
-    OrderId orderId = 0;
-    long long permId = 0;
-    std::string execId;
-    std::string note;
-};
-
-struct BridgeOutboxEnqueueResult {
-    std::uint64_t sourceSeq = 0;
-    bool queued = false;
-    bool lossMarked = false;
-    std::string fallbackState;
-    std::string fallbackReason;
-    bool recoveryRequired = false;
-};
-
-struct BridgeOutboxSnapshot {
-    std::string fallbackState;
-    std::string fallbackReason;
-    bool recoveryRequired = false;
-    int pendingCount = 0;
-    int lossCount = 0;
-    std::uint64_t lastSourceSeq = 0;
-    std::vector<BridgeOutboxRecord> records;
-};
-
-struct BridgeDispatchSnapshot {
-    std::string appSessionId;
-    std::string runtimeSessionId;
-    std::vector<BridgeOutboxRecord> records;
-};
-
 struct SharedData {
     std::recursive_mutex mutex;
     std::recursive_mutex clientMutex;
@@ -491,16 +413,6 @@ struct SharedData {
     std::map<long long, std::uint64_t> traceIdByPermId;
     std::map<std::string, std::uint64_t> traceIdByExecId;
     std::uint64_t latestTraceId = 0;
-    std::atomic<std::uint64_t> nextBridgeSourceSeq{1};
-    std::deque<BridgeOutboxRecord> bridgeOutbox;
-    std::uint64_t bridgeOutboxLossCount = 0;
-    std::uint64_t lastBridgeSourceSeq = 0;
-    int bridgeRecoveredPendingCount = 0;
-    int bridgeRecoveredLossCount = 0;
-    std::uint64_t bridgeRecoveredLastSourceSeq = 0;
-    std::string bridgeFallbackState = "queued_for_recovery";
-    std::string bridgeFallbackReason = "engine_unavailable";
-    bool bridgeRecoveryRequired = false;
 
     void addMessage(const std::string& msg);
 
@@ -634,17 +546,12 @@ struct RuntimeRecoverySnapshot {
     std::string priorAppSessionId;
     std::string priorRuntimeSessionId;
     int unfinishedTraceCount = 0;
-    int pendingOutboxCount = 0;
-    int outboxLossCount = 0;
-    std::uint64_t lastOutboxSourceSeq = 0;
-    bool bridgeRecoveryRequired = false;
     std::vector<std::string> unfinishedTraceSummaries;
     std::string bannerText;
 };
 
 struct RuntimeLogDeleteResult {
     bool deletedTradeTraceLog = false;
-    bool deletedRuntimeJournalLog = false;
     std::string error;
 };
 
@@ -838,7 +745,6 @@ std::string orderRoutingModeToString(OrderRoutingMode mode);
 std::string localOrderStateToString(LocalOrderState state);
 std::string appDataDirectory();
 std::string tradeTraceLogPath();
-std::string runtimeJournalLogPath();
 void setRuntimeSessionState(RuntimeSessionState state);
 int allocateReqId();
 int toShareCount(double qty);
@@ -877,13 +783,7 @@ int adjustWebSocketConnectedClients(int delta);
 std::string ensureWebSocketAuthToken();
 bool consumeWebSocketOrderRateLimit(std::string* error = nullptr);
 bool reserveWebSocketIdempotencyKey(const std::string& key, std::string* error = nullptr);
-BridgeOutboxEnqueueResult enqueueBridgeOutboxRecord(const BridgeOutboxRecordInput& input);
-void seedBridgeOutboxRecoveryState(const RuntimeRecoverySnapshot& recovery);
-BridgeOutboxSnapshot captureBridgeOutboxSnapshot(std::size_t maxItems = 100);
-BridgeDispatchSnapshot captureBridgeDispatchSnapshot(std::size_t maxItems = 0);
 std::string captureCurrentInstrumentIdForSymbol(const std::string& symbol);
-std::size_t acknowledgeDeliveredBridgeRecords(const std::vector<BridgeOutboxRecord>& records);
-void noteBridgeTransportUnavailable(const std::string& reason);
 double calculateOpenBuyExposureUnlocked(const std::string& account);
 double calculatePositionMarketValueUnlocked(const std::string& account, const std::string& symbol);
 std::vector<std::pair<OrderId, OrderInfo>> captureOrdersSnapshot();
@@ -971,8 +871,6 @@ std::vector<TradeTraceListItem> captureTradeTraceListItems(std::size_t maxItems 
 TradeTraceSnapshot captureTradeTraceSnapshot(std::uint64_t traceId);
 void resetSharedDataForTesting();
 void appendTradeTraceLogLine(const json& line);
-void appendRuntimeJournalLine(const json& line);
-void appendRuntimeJournalEvent(const std::string& event, const json& details = {});
 std::string canonicalInstrumentIdForSymbol(const std::string& symbol);
 std::vector<std::string> recoverUnfinishedTraceSummariesFromLog(std::size_t maxItems = 20);
 RuntimeRecoverySnapshot recoverRuntimeRecoverySnapshot(std::size_t maxTraceItems = 20);

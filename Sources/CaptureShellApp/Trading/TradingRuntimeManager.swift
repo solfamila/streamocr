@@ -149,9 +149,7 @@ struct TradingActionResponse: Decodable, Equatable {
     var sent: [Bool]?
     var bannerText: String?
     var unfinishedTraceCount: Int?
-    var pendingOutboxCount: Int?
     var deletedTradeTraceLog: Bool?
-    var deletedRuntimeJournalLog: Bool?
     var baseName: String?
     var reportText: String?
     var summaryCsv: String?
@@ -199,9 +197,15 @@ final class TradingRuntimeManager: @unchecked Sendable {
     private(set) var isStarted = false
 
     private static let autoDetectFallbackPorts = [4001, 4002, 7497]
+    private static let bridgeQueueSpecificValue = 1
+    private static let bridgeQueueSpecificKey = DispatchSpecificKey<Int>()
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
+    private let bridgeQueue = DispatchQueue(label: "capture-shell.trading-runtime-bridge", qos: .userInitiated)
     private var handle: OpaquePointer?
+    private let dashboardRefreshStateLock = NSLock()
+    private var dashboardRefreshInFlight = false
+    private var dashboardRefreshNeedsAnotherPass = false
     private(set) var dashboard = TradingDashboardSnapshot(
         inputs: .init(
             symbolInput: "",
@@ -277,6 +281,10 @@ final class TradingRuntimeManager: @unchecked Sendable {
     )
 
     init() {
+        bridgeQueue.setSpecific(
+            key: Self.bridgeQueueSpecificKey,
+            value: Self.bridgeQueueSpecificValue
+        )
         handle = TradingRuntimeBridgeCreate()
         if let handle {
             let context = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
@@ -395,15 +403,151 @@ final class TradingRuntimeManager: @unchecked Sendable {
     }
 
     func refreshDashboard() {
-        guard let handle else { return }
-        do {
-            dashboard = try decodeJSONString(
-                TradingRuntimeBridgeCopyDashboardJSON(handle),
-                as: TradingDashboardSnapshot.self
-            )
-            onDashboardChanged?(dashboard)
-        } catch {
-            print("[trading] dashboard_refresh_failed error=\(error.localizedDescription)")
+        scheduleDashboardRefresh()
+    }
+
+    func startWithAutoConnectFallbackAsync() async -> TradingRuntimeStartResult {
+        await performOnBridgeQueueValue {
+            self.startWithAutoConnectFallback()
+        }
+    }
+
+    func shutdownAsync() async {
+        await performOnBridgeQueue {
+            self.shutdown()
+        }
+    }
+
+    func currentConnectionConfigAsync() async throws -> TradingConnectionConfigSnapshot {
+        try await performOnBridgeQueueThrowing {
+            try self.currentConnectionConfig()
+        }
+    }
+
+    func currentRiskControlsAsync() async throws -> TradingRiskControlsSnapshot {
+        try await performOnBridgeQueueThrowing {
+            try self.currentRiskControls()
+        }
+    }
+
+    func updateConnectionConfigAsync(_ config: TradingConnectionConfigSnapshot) async throws {
+        try await performOnBridgeQueueThrowing {
+            try self.updateConnectionConfig(config)
+        }
+    }
+
+    func updateRiskControlsAsync(_ risk: TradingRiskControlsSnapshot) async throws {
+        try await performOnBridgeQueueThrowing {
+            try self.updateRiskControls(risk)
+        }
+    }
+
+    @discardableResult
+    func requestSubscriptionAsync(symbol: String, recalcQtyFromFirstAsk: Bool) async throws -> TradingActionResponse {
+        try await performOnBridgeQueueThrowing {
+            try self.requestSubscription(symbol: symbol, recalcQtyFromFirstAsk: recalcQtyFromFirstAsk)
+        }
+    }
+
+    @discardableResult
+    func submitBuyAsync(source: String, note: String) async throws -> TradingActionResponse {
+        try await performOnBridgeQueueThrowing {
+            try self.submitBuy(source: source, note: note)
+        }
+    }
+
+    @discardableResult
+    func submitCloseAsync(source: String, note: String) async throws -> TradingActionResponse {
+        try await performOnBridgeQueueThrowing {
+            try self.submitClose(source: source, note: note)
+        }
+    }
+
+    @discardableResult
+    func cancelAllAsync() async throws -> TradingActionResponse {
+        try await performOnBridgeQueueThrowing {
+            try self.cancelAll()
+        }
+    }
+
+    func setControllerArmedAsync(_ armed: Bool) async {
+        await performOnBridgeQueue {
+            self.setControllerArmed(armed)
+        }
+    }
+
+    func setTradingKillSwitchAsync(_ enabled: Bool) async {
+        await performOnBridgeQueue {
+            self.setTradingKillSwitch(enabled)
+        }
+    }
+
+    func appendMessageAsync(_ message: String) async {
+        await performOnBridgeQueue {
+            self.appendMessage(message)
+        }
+    }
+
+    @discardableResult
+    func cancelSelectedAsync(orderIDs: [Int]) async throws -> TradingActionResponse {
+        try await performOnBridgeQueueThrowing {
+            try self.cancelSelected(orderIDs: orderIDs)
+        }
+    }
+
+    @discardableResult
+    func reconcileSelectedAsync(orderIDs: [Int]) async throws -> TradingActionResponse {
+        try await performOnBridgeQueueThrowing {
+            try self.reconcileSelected(orderIDs: orderIDs)
+        }
+    }
+
+    @discardableResult
+    func acknowledgeSelectedAsync(orderIDs: [Int]) async throws -> TradingActionResponse {
+        try await performOnBridgeQueueThrowing {
+            try self.acknowledgeSelected(orderIDs: orderIDs)
+        }
+    }
+
+    @discardableResult
+    func loadRecoveryFromLogsAsync() async throws -> TradingActionResponse {
+        try await performOnBridgeQueueThrowing {
+            try self.loadRecoveryFromLogs()
+        }
+    }
+
+    @discardableResult
+    func deletePersistentLogsAsync() async throws -> TradingActionResponse {
+        try await performOnBridgeQueueThrowing {
+            try self.deletePersistentLogs()
+        }
+    }
+
+    func traceExportBundleAsync(traceID: UInt64) async throws -> TradingTraceExportBundle {
+        try await performOnBridgeQueueThrowing {
+            try self.traceExportBundle(traceID: traceID)
+        }
+    }
+
+    func allTradesSummaryCSVAsync() async throws -> String {
+        try await performOnBridgeQueueThrowing {
+            try self.allTradesSummaryCSV()
+        }
+    }
+
+    private func scheduleDashboardRefresh() {
+        dashboardRefreshStateLock.lock()
+        if dashboardRefreshInFlight {
+            dashboardRefreshNeedsAnotherPass = true
+            dashboardRefreshStateLock.unlock()
+            return
+        }
+        dashboardRefreshInFlight = true
+        dashboardRefreshNeedsAnotherPass = false
+        dashboardRefreshStateLock.unlock()
+
+        bridgeQueue.async { [weak self] in
+            self?.performScheduledDashboardRefreshLoop()
         }
     }
 
@@ -655,9 +799,97 @@ final class TradingRuntimeManager: @unchecked Sendable {
     }
 
     fileprivate func handleInvalidation() {
-        DispatchQueue.main.async { [weak self] in
-            self?.refreshDashboard()
+        scheduleDashboardRefresh()
+    }
+}
+
+private extension TradingRuntimeManager {
+    func performOnBridgeQueueThrowing<T>(
+        _ operation: @escaping @Sendable () throws -> T
+    ) async throws -> T {
+        if DispatchQueue.getSpecific(key: Self.bridgeQueueSpecificKey) == Self.bridgeQueueSpecificValue {
+            return try operation()
         }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            bridgeQueue.async {
+                do {
+                    continuation.resume(returning: try operation())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    func performOnBridgeQueueValue<T>(
+        _ operation: @escaping @Sendable () -> T
+    ) async -> T {
+        if DispatchQueue.getSpecific(key: Self.bridgeQueueSpecificKey) == Self.bridgeQueueSpecificValue {
+            return operation()
+        }
+
+        return await withCheckedContinuation { continuation in
+            bridgeQueue.async {
+                continuation.resume(returning: operation())
+            }
+        }
+    }
+
+    func performOnBridgeQueue(
+        _ operation: @escaping @Sendable () -> Void
+    ) async {
+        if DispatchQueue.getSpecific(key: Self.bridgeQueueSpecificKey) == Self.bridgeQueueSpecificValue {
+            operation()
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            bridgeQueue.async {
+                operation()
+                continuation.resume()
+            }
+        }
+    }
+
+    func performScheduledDashboardRefreshLoop() {
+        while true {
+            let nextSnapshotResult: Result<TradingDashboardSnapshot, Error>
+            do {
+                nextSnapshotResult = .success(try loadDashboardSnapshot())
+            } catch {
+                nextSnapshotResult = .failure(error)
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                switch nextSnapshotResult {
+                case let .success(snapshot):
+                    self.dashboard = snapshot
+                    self.onDashboardChanged?(snapshot)
+                case let .failure(error):
+                    print("[trading] dashboard_refresh_failed error=\(error.localizedDescription)")
+                }
+            }
+
+            dashboardRefreshStateLock.lock()
+            if dashboardRefreshNeedsAnotherPass {
+                dashboardRefreshNeedsAnotherPass = false
+                dashboardRefreshStateLock.unlock()
+                continue
+            }
+            dashboardRefreshInFlight = false
+            dashboardRefreshStateLock.unlock()
+            break
+        }
+    }
+
+    func loadDashboardSnapshot() throws -> TradingDashboardSnapshot {
+        guard let handle else { throw TradingRuntimeManagerError.unavailable }
+        return try decodeJSONString(
+            TradingRuntimeBridgeCopyDashboardJSON(handle),
+            as: TradingDashboardSnapshot.self
+        )
     }
 }
 

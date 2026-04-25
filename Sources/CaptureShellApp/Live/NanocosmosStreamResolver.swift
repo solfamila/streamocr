@@ -30,6 +30,9 @@ enum NanocosmosStreamResolverError: Error, LocalizedError {
 }
 
 enum NanocosmosStreamResolver {
+    private static let defaultBintuPlaybackHost = "bintu-play.nanocosmos.de"
+    private static let defaultBintuRTMPURL = "rtmp://bintu-play.nanocosmos.de/play"
+
     static func resolve(seedURL: URL, timeoutSeconds: TimeInterval = 10) throws -> ResolvedLiveStream {
         let candidates = try derivePlaylistCandidates(seedURL: seedURL)
         let directPlaybackCandidates = try deriveDirectPlaybackCandidates(seedURL: seedURL)
@@ -227,13 +230,35 @@ enum NanocosmosStreamResolver {
     }
 
     private static func playbackComponents(seedURL: URL) throws -> (URLComponents, [URLQueryItem], [URLQueryItem], [URLQueryItem]) {
+        if let directSeed = directH5LivePlaybackSeed(seedURL: seedURL) {
+            return (
+                directSeed.components,
+                directSeed.originalItems,
+                directSeed.minimalItems,
+                directSeed.withoutURLItems
+            )
+        }
+
+        if let nanoplayerSeed = nanoplayerPlaybackSeed(seedURL: seedURL) {
+            return (
+                nanoplayerSeed.components,
+                nanoplayerSeed.originalItems,
+                nanoplayerSeed.minimalItems,
+                nanoplayerSeed.withoutURLItems
+            )
+        }
+
+        throw NanocosmosStreamResolverError.invalidSeedURL(seedURL)
+    }
+
+    private static func directH5LivePlaybackSeed(seedURL: URL) -> PlaybackSeed? {
         guard
             let components = URLComponents(url: seedURL, resolvingAgainstBaseURL: false),
             let host = components.host?.lowercased(),
             host.contains("nanocosmos") || host.contains("nanostream") || host.contains("bintu"),
             components.path.lowercased().contains("/h5live/")
         else {
-            throw NanocosmosStreamResolverError.invalidSeedURL(seedURL)
+            return nil
         }
 
         let originalItems = components.queryItems ?? []
@@ -241,7 +266,139 @@ enum NanocosmosStreamResolver {
         let preferredKeys: Set<String> = ["stream", "cid", "pid", "token", "expires", "options", "tag", "jwtoken"]
         let minimalItems = withoutURLItems.filter { preferredKeys.contains($0.name.lowercased()) }
 
-        return (components, originalItems, minimalItems, withoutURLItems)
+        return PlaybackSeed(
+            components: components,
+            originalItems: originalItems,
+            minimalItems: minimalItems,
+            withoutURLItems: withoutURLItems
+        )
+    }
+
+    private static func nanoplayerPlaybackSeed(seedURL: URL) -> PlaybackSeed? {
+        guard
+            let seedComponents = URLComponents(url: seedURL, resolvingAgainstBaseURL: false),
+            let host = seedComponents.host?.lowercased(),
+            host.contains("nanocosmos") || host.contains("nanostream") || host.contains("bintu"),
+            seedComponents.path.lowercased().contains("/nanoplayer/")
+        else {
+            return nil
+        }
+
+        let queryItems = seedComponents.queryItems ?? []
+        guard
+            let streamName = queryValue(
+                in: queryItems,
+                names: [
+                    "entry.rtmp.streamname",
+                    "entry.h5live.rtmp.streamname",
+                    "streamname"
+                ]
+            )?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !streamName.isEmpty
+        else {
+            return nil
+        }
+
+        let serverDomain = queryValue(
+            in: queryItems,
+            names: [
+                "source.general.serverdomain",
+                "general.serverdomain",
+                "entry.server",
+                "server"
+            ]
+        )?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let playbackHost = serverDomain.flatMap { value in
+            value.isEmpty ? nil : value
+        } ?? defaultBintuPlaybackHost
+
+        let rtmpURL = queryValue(
+            in: queryItems,
+            names: [
+                "entry.h5live.rtmp.url",
+                "entry.rtmp.url",
+                "h5live.rtmp.url",
+                "rtmp.url"
+            ]
+        )?.trimmingCharacters(in: .whitespacesAndNewlines) ?? defaultBintuRTMPURL
+
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = playbackHost
+        components.path = "/h5live/http/playlist.m3u8"
+
+        var originalItems = [
+            URLQueryItem(name: "stream", value: streamName),
+            URLQueryItem(name: "url", value: rtmpURL)
+        ]
+        appendQueryItem(
+            from: queryItems,
+            sourceNames: [
+                "entry.h5live.security.jwtoken",
+                "entry.security.jwtoken",
+                "source.group.security.jwtoken",
+                "security.jwtoken",
+                "jwtoken"
+            ],
+            targetName: "jwtoken",
+            to: &originalItems
+        )
+        appendQueryItem(
+            from: queryItems,
+            sourceNames: [
+                "entry.h5live.security.token",
+                "entry.security.token",
+                "security.token",
+                "token"
+            ],
+            targetName: "token",
+            to: &originalItems
+        )
+        appendQueryItem(
+            from: queryItems,
+            sourceNames: [
+                "entry.h5live.security.expires",
+                "entry.security.expires",
+                "security.expires",
+                "expires"
+            ],
+            targetName: "expires",
+            to: &originalItems
+        )
+        appendQueryItem(
+            from: queryItems,
+            sourceNames: [
+                "entry.h5live.security.options",
+                "entry.security.options",
+                "security.options",
+                "options"
+            ],
+            targetName: "options",
+            to: &originalItems
+        )
+        appendQueryItem(
+            from: queryItems,
+            sourceNames: [
+                "entry.h5live.security.tag",
+                "entry.security.tag",
+                "security.tag",
+                "tag"
+            ],
+            targetName: "tag",
+            to: &originalItems
+        )
+
+        let withoutURLItems = originalItems.filter { $0.name.lowercased() != "url" }
+        let preferredKeys: Set<String> = ["stream", "cid", "pid", "token", "expires", "options", "tag", "jwtoken"]
+        let minimalItems = withoutURLItems.filter { preferredKeys.contains($0.name.lowercased()) }
+
+        return PlaybackSeed(
+            components: components,
+            originalItems: originalItems,
+            minimalItems: minimalItems,
+            withoutURLItems: withoutURLItems
+        )
     }
 
     private static func playlistTargetPath(from path: String) -> String {
@@ -335,6 +492,30 @@ enum NanocosmosStreamResolver {
         allowed.remove(charactersIn: ":/?#[]@!$&'()*+,;=")
         return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
     }
+
+    private static func queryValue(in queryItems: [URLQueryItem], names: [String]) -> String? {
+        let lowercasedNames = Set(names.map { $0.lowercased() })
+        return queryItems.first(where: { lowercasedNames.contains($0.name.lowercased()) })?.value
+    }
+
+    private static func appendQueryItem(
+        from sourceItems: [URLQueryItem],
+        sourceNames: [String],
+        targetName: String,
+        to targetItems: inout [URLQueryItem]
+    ) {
+        guard let value = queryValue(in: sourceItems, names: sourceNames) else {
+            return
+        }
+        targetItems.append(URLQueryItem(name: targetName, value: value))
+    }
+}
+
+private struct PlaybackSeed {
+    let components: URLComponents
+    let originalItems: [URLQueryItem]
+    let minimalItems: [URLQueryItem]
+    let withoutURLItems: [URLQueryItem]
 }
 
 private final class HTTPFetchResultBox: @unchecked Sendable {

@@ -44,7 +44,8 @@ let package = Package(
                 .linkedFramework("GameController"),
                 .linkedFramework("Metal"),
                 .linkedFramework("QuartzCore"),
-                .linkedFramework("ScreenCaptureKit")
+                .linkedFramework("ScreenCaptureKit"),
+                .linkedFramework("VideoToolbox")
             ]
         ),
         .testTarget(

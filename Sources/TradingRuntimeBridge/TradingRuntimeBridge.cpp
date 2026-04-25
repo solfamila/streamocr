@@ -481,8 +481,7 @@ public:
         return json{
             {"ok", true},
             {"bannerText", recovery.bannerText},
-            {"unfinishedTraceCount", recovery.unfinishedTraceCount},
-            {"pendingOutboxCount", recovery.pendingOutboxCount}
+            {"unfinishedTraceCount", recovery.unfinishedTraceCount}
         };
     }
 
@@ -491,8 +490,7 @@ public:
         return json{
             {"ok", result.error.empty()},
             {"error", result.error.empty() ? json(nullptr) : json(result.error)},
-            {"deletedTradeTraceLog", result.deletedTradeTraceLog},
-            {"deletedRuntimeJournalLog", result.deletedRuntimeJournalLog}
+            {"deletedTradeTraceLog", result.deletedTradeTraceLog}
         };
     }
 

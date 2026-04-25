@@ -1,3 +1,4 @@
+import CoreImage
 import Foundation
 
 struct LiveOCRSessionStatusSnapshot: Equatable, Sendable {
@@ -36,6 +37,8 @@ struct LiveOCRSessionStatusSnapshot: Equatable, Sendable {
 enum LiveOCRSessionControllerError: Error, LocalizedError {
     case invalidSeedURL(String)
     case unsupportedSource(URL)
+    case noActiveLiveFrame
+    case timedOutWaitingForLiveFrame
 
     var errorDescription: String? {
         switch self {
@@ -43,6 +46,10 @@ enum LiveOCRSessionControllerError: Error, LocalizedError {
             return "Invalid live stream URL: \(text)"
         case let .unsupportedSource(url):
             return "This live source is not supported by the native stream.mp4 OCR path: \(url.absoluteString)"
+        case .noActiveLiveFrame:
+            return "No active live OCR frame is available yet."
+        case .timedOutWaitingForLiveFrame:
+            return "Timed out waiting for the next live OCR frame."
         }
     }
 }
@@ -58,12 +65,14 @@ final class LiveOCRSessionController: @unchecked Sendable {
     private let chunkPuller = NanocosmosStreamingChunkPuller()
     private let decoder = LocalVideoFrameDecoder()
     private let stateLock = NSLock()
+    private let snapshotCIContext = CIContext(options: [.cacheIntermediates: false])
 
     private var latestStatus = LiveOCRSessionStatusSnapshot.off
     private var activeSessionID: UUID?
     private var activeRuntimeConfig: CaptureRuntimeConfig?
     private var buyQuantityRatio = 0.5
     private var activeMessageSender: OCRAutomationTradingMessageSender?
+    private var pendingFrameSnapshotRequest: PendingFrameSnapshotRequest?
 
     init(manager: TradingRuntimeManager) {
         self.manager = manager
@@ -143,6 +152,32 @@ final class LiveOCRSessionController: @unchecked Sendable {
         return latestStatus
     }
 
+    func captureCurrentFrameSnapshot(timeoutSeconds: TimeInterval = 3) throws -> LiveStreamFrameSnapshot {
+        let request: PendingFrameSnapshotRequest
+
+        stateLock.lock()
+        guard let activeSessionID, latestStatus.isRunning else {
+            stateLock.unlock()
+            throw LiveOCRSessionControllerError.noActiveLiveFrame
+        }
+        request = PendingFrameSnapshotRequest(sessionID: activeSessionID)
+        pendingFrameSnapshotRequest = request
+        stateLock.unlock()
+
+        if request.semaphore.wait(timeout: .now() + timeoutSeconds) != .success {
+            stateLock.lock()
+            if pendingFrameSnapshotRequest === request {
+                pendingFrameSnapshotRequest = nil
+            }
+            stateLock.unlock()
+            throw LiveOCRSessionControllerError.timedOutWaitingForLiveFrame
+        }
+
+        return try request.result?.get() ?? {
+            throw LiveOCRSessionControllerError.noActiveLiveFrame
+        }()
+    }
+
     private func runSession(sessionID: UUID, seedURL: URL, loggingEnabled: Bool) {
         let sessionStart = Date()
         let temporaryDirectory = FileManager.default.temporaryDirectory
@@ -216,6 +251,46 @@ final class LiveOCRSessionController: @unchecked Sendable {
         var resolvedStream: ResolvedLiveStream?
         var chunkIndex = 0
 
+        if let webSocketURL = NanocosmosWebSocketFrameSource.normalizedWebSocketURL(from: seedURL),
+           NanocosmosWebSocketFrameSource.supports(webSocketURL: webSocketURL) {
+            do {
+                try runWebSocketSession(
+                    webSocketURL: webSocketURL,
+                    seedURL: seedURL,
+                    sessionID: sessionID,
+                    sessionStart: sessionStart,
+                    pipeline: pipeline,
+                    totalFrameCount: &totalFrameCount,
+                    totalActiveDecodeSeconds: &totalActiveDecodeSeconds,
+                    firstFrameLatencySeconds: &firstFrameLatencySeconds,
+                    frameSize: &frameSize,
+                    lastSubscribedSymbol: &lastSubscribedSymbol,
+                    loggingEnabled: loggingEnabled
+                )
+                if shouldContinue(sessionID: sessionID) {
+                    publishStatus(.off)
+                }
+                return
+            } catch LiveOCRSessionCancellation.cancelled {
+                return
+            } catch {
+                if loggingEnabled {
+                    print("[live-session] websocket_path_failed falling_back_to_source_chunks due_to=\"\(error.localizedDescription)\"")
+                }
+                publishStatus(
+                    makeStatus(
+                        state: .connecting,
+                        seedURLText: seedURL.absoluteString,
+                        fps: nil,
+                        frameSize: frameSize,
+                        firstFrameLatencySeconds: firstFrameLatencySeconds,
+                        lastSubscribedSymbol: lastSubscribedSymbol,
+                        messageOverride: "Native WSS attach failed, retrying with source chunks: \(error.localizedDescription)"
+                    )
+                )
+            }
+        }
+
         while shouldContinue(sessionID: sessionID) {
             do {
                 try autoreleasepool {
@@ -236,45 +311,126 @@ final class LiveOCRSessionController: @unchecked Sendable {
                         throw LiveOCRSessionControllerError.unsupportedSource(sourceURL)
                     }
 
-                    let chunkURL = temporaryDirectory.appendingPathComponent("chunk-\(chunkIndex).mp4")
+                    let chunkBaseName = "chunk-\(chunkIndex)"
                     chunkIndex += 1
-                    defer { try? FileManager.default.removeItem(at: chunkURL) }
-
-                    let capturedChunk = try chunkPuller.captureChunk(
-                        sourceURL: sourceURL,
-                        destinationURL: chunkURL,
-                        firstByteTimeoutSeconds: 8,
-                        captureWindowSeconds: 1.5
+                    let lowLatencyChunkURL = temporaryDirectory.appendingPathComponent(
+                        "\(chunkBaseName)-low-latency.mp4"
                     )
+                    let fallbackChunkURL = temporaryDirectory.appendingPathComponent(
+                        "\(chunkBaseName)-fallback.mp4"
+                    )
+                    defer {
+                        try? FileManager.default.removeItem(at: lowLatencyChunkURL)
+                        try? FileManager.default.removeItem(at: fallbackChunkURL)
+                    }
+
+                    var capturedChunk = try chunkPuller.captureChunk(
+                        sourceURL: sourceURL,
+                        destinationURL: lowLatencyChunkURL,
+                        firstByteTimeoutSeconds: 8,
+                        captureWindowSeconds: LiveSourceChunkCapturePolicy.lowLatencyCaptureWindowSeconds,
+                        minimumPlayableProbeWindowSeconds: LiveSourceChunkCapturePolicy.minimumPlayableProbeWindowSeconds,
+                        playableProbeIntervalSeconds: LiveSourceChunkCapturePolicy.playableProbeIntervalSeconds,
+                        playableProbe: { [decoder] partialChunkURL in
+                            let summary = try? decoder.decode(
+                                videoURL: partialChunkURL,
+                                maximumFrameCount: 1
+                            ) { _ in }
+                            return (summary?.frameCount ?? 0) > 0
+                        }
+                    )
+                    var captureWindowSeconds = LiveSourceChunkCapturePolicy.lowLatencyCaptureWindowSeconds
 
                     if loggingEnabled {
                         print(
                             "[live-session] chunk_captured bytes=\(capturedChunk.byteCount) " +
-                                "elapsed_seconds=\(String(format: "%.2f", capturedChunk.elapsedSeconds))"
+                                "elapsed_seconds=\(String(format: "%.2f", capturedChunk.elapsedSeconds)) " +
+                                "first_byte_seconds=\(formatOptionalSeconds(capturedChunk.firstByteElapsedSeconds)) " +
+                                "active_capture_seconds=\(formatOptionalSeconds(capturedChunk.activeCaptureSeconds)) " +
+                                "max_capture_window_seconds=\(String(format: "%.2f", captureWindowSeconds)) " +
+                                "finish_reason=\(capturedChunk.finishReason.rawValue)"
                         )
                     }
 
-                    let summary = try decoder.decode(
-                        videoURL: capturedChunk.fileURL,
-                        presentationTimeOffsetSeconds: presentationTimeOffsetSeconds
-                    ) { [weak self] frame in
-                        guard let self else { return }
-                        guard self.shouldContinue(sessionID: sessionID) else {
-                            throw LiveOCRSessionCancellation.cancelled
+                    var decodedFramesInAttempt = 0
+                    func decodeCapturedChunk(_ capturedChunk: NanocosmosCapturedChunk) throws -> LocalVideoDecodingSummary {
+                        try decoder.decode(
+                            videoURL: capturedChunk.fileURL,
+                            presentationTimeOffsetSeconds: presentationTimeOffsetSeconds,
+                            allowsPartialDecode: true
+                        ) { [weak self] frame in
+                            guard let self else { return }
+                            guard self.shouldContinue(sessionID: sessionID) else {
+                                throw LiveOCRSessionCancellation.cancelled
+                            }
+
+                            if firstFrameLatencySeconds == nil {
+                                firstFrameLatencySeconds = Date().timeIntervalSince(sessionStart)
+                            }
+
+                            self.fulfillPendingFrameSnapshotIfNeeded(
+                                frame: frame,
+                                seedURL: seedURL,
+                                sessionID: sessionID
+                            )
+
+                            let adjustedRuntimeConfig = self.runtimeConfigSnapshot()?.adjustedForFrameSize(
+                                width: frame.width,
+                                height: frame.height,
+                                displayID: 0
+                            )
+                            pipeline.process(frame, runtimeConfig: adjustedRuntimeConfig)
+                            decodedFramesInAttempt += 1
+                            totalFrameCount += 1
+                            frameSize = frame.sizeSummary
+                        }
+                    }
+
+                    let summary: LocalVideoDecodingSummary
+                    do {
+                        decodedFramesInAttempt = 0
+                        let lowLatencySummary = try decodeCapturedChunk(capturedChunk)
+                        if lowLatencySummary.frameCount == 0 {
+                            throw LocalVideoFrameDecoderError.assetReaderFailed(
+                                "No frames decoded from low-latency streaming chunk."
+                            )
+                        }
+                        summary = lowLatencySummary
+                    } catch {
+                        guard decodedFramesInAttempt == 0 else {
+                            throw error
                         }
 
-                        if firstFrameLatencySeconds == nil {
-                            firstFrameLatencySeconds = Date().timeIntervalSince(sessionStart)
+                        if loggingEnabled {
+                            print(
+                                "[live-session] low_latency_chunk_decode_failed " +
+                                    "fallback_capture_window_seconds=" +
+                                    "\(String(format: "%.2f", LiveSourceChunkCapturePolicy.guiFallbackCaptureWindowSeconds)) " +
+                                    "due_to=\"\(error.localizedDescription)\""
+                            )
                         }
 
-                        let adjustedRuntimeConfig = self.runtimeConfigSnapshot()?.adjustedForFrameSize(
-                            width: frame.width,
-                            height: frame.height,
-                            displayID: 0
+                        capturedChunk = try chunkPuller.captureChunk(
+                            sourceURL: sourceURL,
+                            destinationURL: fallbackChunkURL,
+                            firstByteTimeoutSeconds: 8,
+                            captureWindowSeconds: LiveSourceChunkCapturePolicy.guiFallbackCaptureWindowSeconds
                         )
-                        pipeline.process(frame, runtimeConfig: adjustedRuntimeConfig)
-                        totalFrameCount += 1
-                        frameSize = frame.sizeSummary
+                        captureWindowSeconds = LiveSourceChunkCapturePolicy.guiFallbackCaptureWindowSeconds
+
+                        if loggingEnabled {
+                            print(
+                                "[live-session] chunk_captured bytes=\(capturedChunk.byteCount) " +
+                                    "elapsed_seconds=\(String(format: "%.2f", capturedChunk.elapsedSeconds)) " +
+                                    "first_byte_seconds=\(formatOptionalSeconds(capturedChunk.firstByteElapsedSeconds)) " +
+                                    "active_capture_seconds=\(formatOptionalSeconds(capturedChunk.activeCaptureSeconds)) " +
+                                    "max_capture_window_seconds=\(String(format: "%.2f", captureWindowSeconds)) " +
+                                    "finish_reason=\(capturedChunk.finishReason.rawValue)"
+                            )
+                        }
+
+                        decodedFramesInAttempt = 0
+                        summary = try decodeCapturedChunk(capturedChunk)
                     }
 
                     let frameDurationSeconds = frameDuration(
@@ -349,6 +505,132 @@ final class LiveOCRSessionController: @unchecked Sendable {
         if shouldContinue(sessionID: sessionID) {
             publishStatus(.off)
         }
+    }
+
+    private func runWebSocketSession(
+        webSocketURL: URL,
+        seedURL: URL,
+        sessionID: UUID,
+        sessionStart: Date,
+        pipeline: LowLatencyOCRFramePipeline,
+        totalFrameCount: inout Int,
+        totalActiveDecodeSeconds: inout Double,
+        firstFrameLatencySeconds: inout Double?,
+        frameSize: inout String?,
+        lastSubscribedSymbol: inout String?,
+        loggingEnabled: Bool
+    ) throws {
+        var localTotalFrameCount = totalFrameCount
+        var localTotalActiveDecodeSeconds = totalActiveDecodeSeconds
+        var localFirstFrameLatencySeconds = firstFrameLatencySeconds
+        var localFrameSize = frameSize
+        var localLastSubscribedSymbol = lastSubscribedSymbol
+        var firstPresentationTimeSeconds: Double?
+        var lastPresentationTimeSeconds: Double?
+        var lastStatusPublish = Date.distantPast
+        let frameStateLock = NSLock()
+
+        defer {
+            totalFrameCount = localTotalFrameCount
+            totalActiveDecodeSeconds = localTotalActiveDecodeSeconds
+            firstFrameLatencySeconds = localFirstFrameLatencySeconds
+            frameSize = localFrameSize
+            lastSubscribedSymbol = localLastSubscribedSymbol
+        }
+
+        if loggingEnabled {
+            print("[live-session] websocket_attach source_url=\(webSocketURL.absoluteString)")
+        }
+
+        let summary = try NanocosmosWebSocketFrameSource().decode(
+            webSocketURL: webSocketURL,
+            runSeconds: 24 * 60 * 60,
+            loggingEnabled: loggingEnabled,
+            shouldContinue: { [weak self] in
+                self?.shouldContinue(sessionID: sessionID) ?? false
+            }
+        ) { [weak self] frame in
+            guard let self else { return }
+            guard self.shouldContinue(sessionID: sessionID) else {
+                throw LiveOCRSessionCancellation.cancelled
+            }
+
+            frameStateLock.lock()
+            defer { frameStateLock.unlock() }
+
+            if localFirstFrameLatencySeconds == nil {
+                localFirstFrameLatencySeconds = Date().timeIntervalSince(sessionStart)
+            }
+
+            self.fulfillPendingFrameSnapshotIfNeeded(
+                frame: frame,
+                seedURL: seedURL,
+                sessionID: sessionID
+            )
+
+            let adjustedRuntimeConfig = self.runtimeConfigSnapshot()?.adjustedForFrameSize(
+                width: frame.width,
+                height: frame.height,
+                displayID: 0
+            )
+            pipeline.process(frame, runtimeConfig: adjustedRuntimeConfig)
+
+            localTotalFrameCount += 1
+            localFrameSize = frame.sizeSummary
+            if let presentationTimeSeconds = frame.presentationTimeSeconds {
+                firstPresentationTimeSeconds = firstPresentationTimeSeconds ?? presentationTimeSeconds
+                lastPresentationTimeSeconds = presentationTimeSeconds
+                if let firstPresentationTimeSeconds {
+                    localTotalActiveDecodeSeconds = max(
+                        localTotalActiveDecodeSeconds,
+                        presentationTimeSeconds - firstPresentationTimeSeconds
+                    )
+                }
+            } else {
+                localTotalActiveDecodeSeconds += self.frameDuration(
+                    nominalFrameRate: frame.nominalFrameRate,
+                    frameCount: 1
+                )
+            }
+
+            if let status = self.latestStatusSnapshot(for: sessionID),
+               let symbol = status.lastSubscribedSymbol {
+                localLastSubscribedSymbol = symbol
+            }
+
+            let shouldPublish = localTotalFrameCount == 1 ||
+                localTotalFrameCount.isMultiple(of: 30) ||
+                Date().timeIntervalSince(lastStatusPublish) >= 0.5
+
+            if shouldPublish {
+                lastStatusPublish = Date()
+                let effectiveFPS = localTotalActiveDecodeSeconds > 0
+                    ? Double(localTotalFrameCount) / localTotalActiveDecodeSeconds
+                    : nil
+                let snapshot = self.makeStatus(
+                    state: .live,
+                    seedURLText: seedURL.absoluteString,
+                    fps: effectiveFPS,
+                    frameSize: localFrameSize,
+                    firstFrameLatencySeconds: localFirstFrameLatencySeconds,
+                    lastSubscribedSymbol: localLastSubscribedSymbol,
+                    messageOverride: nil
+                )
+                self.publishStatus(snapshot)
+            }
+        }
+
+        if loggingEnabled {
+            print(
+                "[live-session] websocket_decoded frames=\(summary.decodedFrameCount) " +
+                "first_binary_seconds=\(formatOptionalSeconds(summary.firstBinaryElapsedSeconds)) " +
+                "first_media_seconds=\(formatOptionalSeconds(summary.firstMediaElapsedSeconds)) " +
+                "first_frame_seconds=\(formatOptionalSeconds(summary.firstFrameElapsedSeconds)) " +
+                "bytes=\(summary.binaryByteCount)"
+            )
+        }
+
+        _ = lastPresentationTimeSeconds
     }
 
     private func handlePipelineEvent(_ event: OCRPipelineEvent, sessionID: UUID) {
@@ -531,5 +813,59 @@ final class LiveOCRSessionController: @unchecked Sendable {
             return 1 / 30
         }
         return 0
+    }
+
+    private func formatOptionalSeconds(_ value: Double?) -> String {
+        value.map { String(format: "%.2f", $0) } ?? "nil"
+    }
+}
+
+private final class PendingFrameSnapshotRequest {
+    let sessionID: UUID
+    let semaphore = DispatchSemaphore(value: 0)
+    var result: Result<LiveStreamFrameSnapshot, Error>?
+
+    init(sessionID: UUID) {
+        self.sessionID = sessionID
+    }
+}
+
+private extension LiveOCRSessionController {
+    func fulfillPendingFrameSnapshotIfNeeded(
+        frame: VideoFrame,
+        seedURL: URL,
+        sessionID: UUID
+    ) {
+        let request: PendingFrameSnapshotRequest?
+        stateLock.lock()
+        if let pendingFrameSnapshotRequest, pendingFrameSnapshotRequest.sessionID == sessionID {
+            request = pendingFrameSnapshotRequest
+            self.pendingFrameSnapshotRequest = nil
+        } else {
+            request = nil
+        }
+        stateLock.unlock()
+
+        guard let request else {
+            return
+        }
+
+        let result: Result<LiveStreamFrameSnapshot, Error>
+        let image = CIImage(cvPixelBuffer: frame.pixelBuffer)
+        if let cgImage = snapshotCIContext.createCGImage(image, from: image.extent) {
+            result = .success(
+                LiveStreamFrameSnapshot(
+                    cgImage: cgImage,
+                    width: cgImage.width,
+                    height: cgImage.height,
+                    sourceURL: seedURL
+                )
+            )
+        } else {
+            result = .failure(LiveStreamFrameSnapshotterError.unableToRenderFrame(seedURL))
+        }
+
+        request.result = result
+        request.semaphore.signal()
     }
 }

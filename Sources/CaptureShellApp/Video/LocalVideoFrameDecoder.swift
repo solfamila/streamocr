@@ -39,6 +39,8 @@ final class LocalVideoFrameDecoder {
     func decode(
         videoURL: URL,
         presentationTimeOffsetSeconds: Double = 0,
+        maximumFrameCount: Int? = nil,
+        allowsPartialDecode: Bool = false,
         onFrame: (VideoFrame) throws -> Void
     ) throws -> LocalVideoDecodingSummary {
         try autoreleasepool {
@@ -79,8 +81,10 @@ final class LocalVideoFrameDecoder {
             var frameCount = 0
             var firstPresentationTimeSeconds: Double?
             var lastPresentationTimeSeconds: Double?
+            var reachedFrameLimit = false
 
-            while let sampleBuffer = autoreleasepool(invoking: { output.copyNextSampleBuffer() }) {
+            while !reachedFrameLimit,
+                  let sampleBuffer = autoreleasepool(invoking: { output.copyNextSampleBuffer() }) {
                 try autoreleasepool {
                     guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
                         return
@@ -110,10 +114,15 @@ final class LocalVideoFrameDecoder {
                         firstPresentationTimeSeconds = firstPresentationTimeSeconds ?? presentationTimeSeconds
                         lastPresentationTimeSeconds = presentationTimeSeconds
                     }
+
+                    if let maximumFrameCount, frameCount >= maximumFrameCount {
+                        reachedFrameLimit = true
+                    }
                 }
             }
 
-            if reader.status == .failed {
+            if reader.status == .failed,
+               !(allowsPartialDecode && frameCount > 0) {
                 let message = reader.error?.localizedDescription ?? "unknown decode error"
                 throw LocalVideoFrameDecoderError.assetReaderFailed(message)
             }

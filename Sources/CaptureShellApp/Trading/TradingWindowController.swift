@@ -269,6 +269,7 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     private var liveStatus = LiveOCRSessionStatusSnapshot.off
     private var refreshTimer: Timer?
     private var recoveryMaintenanceInFlight = false
+    private var activelyEditedFields = Set<ObjectIdentifier>()
 
     private let twsStatusLabel = makeLegacyLabel("TWS: Disconnected", font: .systemFont(ofSize: 13, weight: .semibold), color: .systemRed)
     private let accountStatusLabel = makeLegacyLabel("Account: --", font: .systemFont(ofSize: 13, weight: .medium))
@@ -364,12 +365,15 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
         NSApp.activate(ignoringOtherApps: true)
         startRefreshTimer()
         if !manager.isStarted {
-            let startResult = manager.startWithAutoConnectFallback()
-            if let autoDetectedConfig = startResult.autoDetectedConfig {
-                appendMessage("Auto-detected IB connection at \(autoDetectedConfig.host):\(autoDetectedConfig.port)")
-            } else if !startResult.connected, !startResult.attemptedFallbackPorts.isEmpty {
-                let ports = startResult.attemptedFallbackPorts.map(String.init).joined(separator: ", ")
-                appendMessage("Tried common IB ports (\(ports)) after the default connection failed")
+            Task { [weak self] in
+                guard let self else { return }
+                let startResult = await manager.startWithAutoConnectFallbackAsync()
+                if let autoDetectedConfig = startResult.autoDetectedConfig {
+                    self.appendMessage("Auto-detected IB connection at \(autoDetectedConfig.host):\(autoDetectedConfig.port)")
+                } else if !startResult.connected, !startResult.attemptedFallbackPorts.isEmpty {
+                    let ports = startResult.attemptedFallbackPorts.map(String.init).joined(separator: ", ")
+                    self.appendMessage("Tried common IB ports (\(ports)) after the default connection failed")
+                }
             }
         } else {
             manager.refreshDashboard()
@@ -422,11 +426,23 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
         }
     }
 
+    func controlTextDidBeginEditing(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField else {
+            return
+        }
+        activelyEditedFields.insert(ObjectIdentifier(field))
+    }
+
     func controlTextDidEndEditing(_ notification: Notification) {
-        if let field = notification.object as? NSTextField, field === liveURLField {
-            onLiveStreamURLChanged(currentLiveStreamURLText)
-        } else if let field = notification.object as? NSTextField, field === ocrRatioField {
-            onOCRBuyRatioChanged(sanitizedOCRBuyRatio())
+        if let field = notification.object as? NSTextField {
+            activelyEditedFields.remove(ObjectIdentifier(field))
+            if field === liveURLField {
+                onLiveStreamURLChanged(currentLiveStreamURLText)
+            } else if field === ocrRatioField {
+                onOCRBuyRatioChanged(sanitizedOCRBuyRatio())
+            }
+        } else {
+            activelyEditedFields.removeAll()
         }
         syncInputsToRuntime()
     }
@@ -730,23 +746,26 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     }
 
     private func refreshInterface() {
+        let deferNoncriticalUIUpdates = !activelyEditedFields.isEmpty
         updateInputFieldsFromState()
         refreshStatusLabels()
         refreshLiveSection()
         refreshMarketSection()
-        refreshOrders()
-        refreshTracePopup()
+        if !deferNoncriticalUIUpdates {
+            refreshOrders()
+            refreshTracePopup()
 
-        if traceTextView.string != dashboard.traceDetailsText {
-            traceTextView.string = dashboard.traceDetailsText
-        }
+            if traceTextView.string != dashboard.traceDetailsText {
+                traceTextView.string = dashboard.traceDetailsText
+            }
 
-        exportTraceButton.isEnabled = dashboard.canExportSelectedTrace ?? false
-        exportAllButton.isEnabled = dashboard.canExportAllTraces ?? false
+            exportTraceButton.isEnabled = dashboard.canExportSelectedTrace ?? false
+            exportAllButton.isEnabled = dashboard.canExportAllTraces ?? false
 
-        let nextMessages = dashboard.messagesText
-        if messagesTextView.string != nextMessages {
-            messagesTextView.string = nextMessages
+            let nextMessages = dashboard.messagesText
+            if messagesTextView.string != nextMessages {
+                messagesTextView.string = nextMessages
+            }
         }
     }
 
@@ -980,10 +999,7 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     }
 
     private func isEditingField(_ field: NSTextField) -> Bool {
-        guard let editor = field.currentEditor(), let window = field.window else {
-            return false
-        }
-        return window.firstResponder == editor
+        activelyEditedFields.contains(ObjectIdentifier(field))
     }
 
     private func sanitizedOCRBuyRatio() -> Double {
@@ -1029,12 +1045,15 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     }
 
     private func appendMessage(_ message: String) {
-        manager.appendMessage(message)
+        Task {
+            await manager.appendMessageAsync(message)
+        }
     }
 
     @objc
     private func refreshTimerFired() {
         guard window?.isVisible == true else { return }
+        guard activelyEditedFields.isEmpty else { return }
         manager.refreshDashboard()
     }
 
@@ -1078,31 +1097,40 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     @objc
     private func subscribeAction() {
         syncInputsToRuntime()
-        do {
-            let response = try manager.requestSubscription(symbol: symbolField.stringValue, recalcQtyFromFirstAsk: false)
-            appendMessage("Subscribed to \(response.normalizedSymbol ?? symbolField.stringValue)")
-        } catch {
-            appendMessage("Subscribe failed: \(error.localizedDescription)")
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let response = try await manager.requestSubscriptionAsync(symbol: symbolField.stringValue, recalcQtyFromFirstAsk: false)
+                self.appendMessage("Subscribed to \(response.normalizedSymbol ?? symbolField.stringValue)")
+            } catch {
+                self.appendMessage("Subscribe failed: \(error.localizedDescription)")
+            }
         }
     }
 
     @objc
     private func buyAction() {
         syncInputsToRuntime()
-        do {
-            _ = try manager.submitBuy(source: "GUI Button", note: "Buy Limit button pressed")
-        } catch {
-            appendMessage("Buy failed: \(error.localizedDescription)")
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await manager.submitBuyAsync(source: "GUI Button", note: "Buy Limit button pressed")
+            } catch {
+                self.appendMessage("Buy failed: \(error.localizedDescription)")
+            }
         }
     }
 
     @objc
     private func closeAction() {
         syncInputsToRuntime()
-        do {
-            _ = try manager.submitClose(source: "GUI Button", note: "Close Long button pressed")
-        } catch {
-            appendMessage("Close failed: \(error.localizedDescription)")
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await manager.submitCloseAsync(source: "GUI Button", note: "Close Long button pressed")
+            } catch {
+                self.appendMessage("Close failed: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -1116,12 +1144,15 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
         confirm.addButton(withTitle: "Keep Orders")
         guard confirm.runModal() == .alertFirstButtonReturn else { return }
 
-        do {
-            let response = try manager.cancelAll()
-            let count = response.orderIds?.count ?? 0
-            appendMessage(count > 0 ? "Cancel requested for \(count) order(s)" : "No pending orders to cancel")
-        } catch {
-            appendMessage("Cancel all failed: \(error.localizedDescription)")
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let response = try await manager.cancelAllAsync()
+                let count = response.orderIds?.count ?? 0
+                self.appendMessage(count > 0 ? "Cancel requested for \(count) order(s)" : "No pending orders to cancel")
+            } catch {
+                self.appendMessage("Cancel all failed: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -1132,18 +1163,21 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
             appendMessage("No orders selected for cancellation")
             return
         }
-        do {
-            let response = try manager.cancelSelected(orderIDs: orderIDs)
-            let sentFlags = response.sent ?? []
-            for (index, orderID) in (response.orderIds ?? orderIDs).enumerated() {
-                if index < sentFlags.count, sentFlags[index] {
-                    appendMessage("Cancel request sent for order \(orderID)")
-                } else {
-                    appendMessage("Cancel failed (not connected) for order \(orderID)")
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let response = try await manager.cancelSelectedAsync(orderIDs: orderIDs)
+                let sentFlags = response.sent ?? []
+                for (index, orderID) in (response.orderIds ?? orderIDs).enumerated() {
+                    if index < sentFlags.count, sentFlags[index] {
+                        self.appendMessage("Cancel request sent for order \(orderID)")
+                    } else {
+                        self.appendMessage("Cancel failed (not connected) for order \(orderID)")
+                    }
                 }
+            } catch {
+                self.appendMessage("Cancel selected failed: \(error.localizedDescription)")
             }
-        } catch {
-            appendMessage("Cancel selected failed: \(error.localizedDescription)")
         }
     }
 
@@ -1154,16 +1188,19 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
             appendMessage("No orders selected for reconciliation")
             return
         }
-        do {
-            let response = try manager.reconcileSelected(orderIDs: orderIDs)
-            let accepted = response.orderIds ?? []
-            if accepted.isEmpty {
-                appendMessage("Selected orders do not need reconciliation right now")
-            } else {
-                accepted.forEach { appendMessage("Manual reconcile requested for order \($0)") }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let response = try await manager.reconcileSelectedAsync(orderIDs: orderIDs)
+                let accepted = response.orderIds ?? []
+                if accepted.isEmpty {
+                    self.appendMessage("Selected orders do not need reconciliation right now")
+                } else {
+                    accepted.forEach { self.appendMessage("Manual reconcile requested for order \($0)") }
+                }
+            } catch {
+                self.appendMessage("Reconcile failed: \(error.localizedDescription)")
             }
-        } catch {
-            appendMessage("Reconcile failed: \(error.localizedDescription)")
         }
     }
 
@@ -1174,31 +1211,40 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
             appendMessage("No orders selected for acknowledgement")
             return
         }
-        do {
-            let response = try manager.acknowledgeSelected(orderIDs: orderIDs)
-            if (response.orderIds ?? []).isEmpty {
-                appendMessage("Selected orders do not require manual review acknowledgement")
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let response = try await manager.acknowledgeSelectedAsync(orderIDs: orderIDs)
+                if (response.orderIds ?? []).isEmpty {
+                    self.appendMessage("Selected orders do not require manual review acknowledgement")
+                }
+            } catch {
+                self.appendMessage("Acknowledge failed: \(error.localizedDescription)")
             }
-        } catch {
-            appendMessage("Acknowledge failed: \(error.localizedDescription)")
         }
     }
 
     @objc
     private func toggleControllerArmed() {
         let nextArmed = !dashboard.panel.status.controllerArmed
-        manager.setControllerArmed(nextArmed)
-        appendMessage(nextArmed ? "Controller trading armed" : "Controller trading disarmed")
+        Task { [weak self] in
+            guard let self else { return }
+            await manager.setControllerArmedAsync(nextArmed)
+            self.appendMessage(nextArmed ? "Controller trading armed" : "Controller trading disarmed")
+        }
     }
 
     @objc
     private func toggleKillSwitch() {
         let nextEnabled = !dashboard.panel.status.tradingKillSwitch
-        manager.setTradingKillSwitch(nextEnabled)
-        if nextEnabled {
-            manager.setControllerArmed(false)
+        Task { [weak self] in
+            guard let self else { return }
+            await manager.setTradingKillSwitchAsync(nextEnabled)
+            if nextEnabled {
+                await manager.setControllerArmedAsync(false)
+            }
+            self.appendMessage(nextEnabled ? "Kill switch enabled: trading halted" : "Kill switch disabled: trading may resume")
         }
-        appendMessage(nextEnabled ? "Kill switch enabled: trading halted" : "Kill switch disabled: trading may resume")
     }
 
     @objc
@@ -1213,22 +1259,21 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
         recoveryMaintenanceInFlight = true
         appendMessage("Loading persisted trade logs on demand...")
         refreshInterface()
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        Task { [weak self] in
             guard let self else { return }
-            let result = Result { try self.manager.loadRecoveryFromLogs() }
-            DispatchQueue.main.async {
+            defer {
                 self.recoveryMaintenanceInFlight = false
-                switch result {
-                case let .success(response):
-                    if let banner = response.bannerText, !banner.isEmpty {
-                        self.appendMessage("Loaded persisted runtime recovery: \(banner)")
-                    } else {
-                        self.appendMessage("Loaded persisted logs; no prior-session recovery work was found")
-                    }
-                case let .failure(error):
-                    self.appendMessage("Failed to load persisted logs: \(error.localizedDescription)")
-                }
                 self.refreshInterface()
+            }
+            do {
+                let response = try await self.manager.loadRecoveryFromLogsAsync()
+                if let banner = response.bannerText, !banner.isEmpty {
+                    self.appendMessage("Loaded persisted runtime recovery: \(banner)")
+                } else {
+                    self.appendMessage("Loaded persisted logs; no prior-session recovery work was found")
+                }
+            } catch {
+                self.appendMessage("Failed to load persisted logs: \(error.localizedDescription)")
             }
         }
     }
@@ -1239,7 +1284,7 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
 
         let confirm = NSAlert()
         confirm.messageText = "Delete Persisted Trade Logs?"
-        confirm.informativeText = "This removes the saved trade trace and runtime journal JSONL files. The app can recreate fresh logs after deletion."
+        confirm.informativeText = "This removes the saved trade trace JSONL file. The app can recreate a fresh trace log after deletion."
         confirm.alertStyle = .warning
         confirm.addButton(withTitle: "Delete Logs")
         confirm.addButton(withTitle: "Keep Logs")
@@ -1247,27 +1292,25 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
 
         recoveryMaintenanceInFlight = true
         refreshInterface()
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        Task { [weak self] in
             guard let self else { return }
-            let result = Result { try self.manager.deletePersistentLogs() }
-            DispatchQueue.main.async {
+            defer {
                 self.recoveryMaintenanceInFlight = false
-                switch result {
-                case let .success(response):
-                    if let error = response.error, !error.isEmpty {
-                        self.appendMessage("Failed to delete persisted logs: \(error)")
-                    } else if response.deletedTradeTraceLog != true && response.deletedRuntimeJournalLog != true {
-                        self.appendMessage("No persisted trade log files were present")
-                    } else {
-                        var parts: [String] = []
-                        if response.deletedTradeTraceLog == true { parts.append("trade_trace_events.jsonl") }
-                        if response.deletedRuntimeJournalLog == true { parts.append("trade_runtime_journal.jsonl") }
-                        self.appendMessage("Deleted persisted logs: \(parts.joined(separator: ", ")). Fresh logs will be created as new activity occurs.")
-                    }
-                case let .failure(error):
-                    self.appendMessage("Failed to delete persisted logs: \(error.localizedDescription)")
-                }
                 self.refreshInterface()
+            }
+            do {
+                let response = try await self.manager.deletePersistentLogsAsync()
+                if let error = response.error, !error.isEmpty {
+                    self.appendMessage("Failed to delete persisted logs: \(error)")
+                } else if response.deletedTradeTraceLog != true {
+                    self.appendMessage("No persisted trade log files were present")
+                } else {
+                    var parts: [String] = []
+                    if response.deletedTradeTraceLog == true { parts.append("trade_trace_events.jsonl") }
+                    self.appendMessage("Deleted persisted logs: \(parts.joined(separator: ", ")). Fresh logs will be created as new activity occurs.")
+                }
+            } catch {
+                self.appendMessage("Failed to delete persisted logs: \(error.localizedDescription)")
             }
         }
     }
@@ -1292,46 +1335,53 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
             return
         }
 
-        do {
-            let bundle = try manager.traceExportBundle(traceID: traceID)
-            let panel = NSOpenPanel()
-            panel.canChooseDirectories = true
-            panel.canChooseFiles = false
-            panel.canCreateDirectories = true
-            panel.prompt = "Export"
-            panel.message = "Choose a folder for the selected trace export."
-            guard panel.runModal() == .OK, let directoryURL = panel.url else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Export"
+        panel.message = "Choose a folder for the selected trace export."
+        guard panel.runModal() == .OK, let directoryURL = panel.url else { return }
 
-            try writeText(bundle.reportText, to: directoryURL.appendingPathComponent("\(bundle.baseName)-report.txt"))
-            try writeText(bundle.summaryCsv, to: directoryURL.appendingPathComponent("\(bundle.baseName)-summary.csv"))
-            try writeText(bundle.fillsCsv, to: directoryURL.appendingPathComponent("\(bundle.baseName)-fills.csv"))
-            try writeText(bundle.timelineCsv, to: directoryURL.appendingPathComponent("\(bundle.baseName)-timeline.csv"))
-            appendMessage("Exported trace bundle to \(directoryURL.path)")
-        } catch {
-            let alert = NSAlert()
-            alert.messageText = "Export Failed"
-            alert.informativeText = error.localizedDescription
-            alert.alertStyle = .critical
-            alert.beginSheetModal(for: window!, completionHandler: nil)
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let bundle = try await manager.traceExportBundleAsync(traceID: traceID)
+                try writeText(bundle.reportText, to: directoryURL.appendingPathComponent("\(bundle.baseName)-report.txt"))
+                try writeText(bundle.summaryCsv, to: directoryURL.appendingPathComponent("\(bundle.baseName)-summary.csv"))
+                try writeText(bundle.fillsCsv, to: directoryURL.appendingPathComponent("\(bundle.baseName)-fills.csv"))
+                try writeText(bundle.timelineCsv, to: directoryURL.appendingPathComponent("\(bundle.baseName)-timeline.csv"))
+                self.appendMessage("Exported trace bundle to \(directoryURL.path)")
+            } catch {
+                let alert = NSAlert()
+                alert.messageText = "Export Failed"
+                alert.informativeText = error.localizedDescription
+                alert.alertStyle = .critical
+                alert.beginSheetModal(for: self.window!, completionHandler: nil)
+            }
         }
     }
 
     @objc
     private func exportAllTracesSummary() {
-        do {
-            let csv = try manager.allTradesSummaryCSV()
-            let panel = NSSavePanel()
-            panel.nameFieldStringValue = "all-trades-summary.csv"
-            panel.prompt = "Save CSV"
-            guard panel.runModal() == .OK, let url = panel.url else { return }
-            try writeText(csv, to: url)
-            appendMessage("Exported trade summary CSV to \(url.path)")
-        } catch {
-            let alert = NSAlert()
-            alert.messageText = "Export Failed"
-            alert.informativeText = error.localizedDescription
-            alert.alertStyle = .critical
-            alert.beginSheetModal(for: window!, completionHandler: nil)
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "all-trades-summary.csv"
+        panel.prompt = "Save CSV"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let csv = try await manager.allTradesSummaryCSVAsync()
+                try writeText(csv, to: url)
+                self.appendMessage("Exported trade summary CSV to \(url.path)")
+            } catch {
+                let alert = NSAlert()
+                alert.messageText = "Export Failed"
+                alert.informativeText = error.localizedDescription
+                alert.alertStyle = .critical
+                alert.beginSheetModal(for: self.window!, completionHandler: nil)
+            }
         }
     }
 }

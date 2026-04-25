@@ -16,7 +16,6 @@
 namespace {
 constexpr std::size_t kMaxTraceEvents = 512;
 constexpr std::size_t kMaxTraceFills = 256;
-constexpr std::size_t kMaxBridgeOutboxRecords = 512;
 constexpr auto kRecentSubmitWindow = std::chrono::milliseconds(750);
 constexpr auto kRecentWebSocketOrderWindow = std::chrono::seconds(2);
 constexpr int kMaxWebSocketOrdersPerWindow = 5;
@@ -93,40 +92,6 @@ std::uint64_t recoverHighestTraceIdFromLog(const std::string& logPath) {
         highestTraceId = std::max(highestTraceId, parsed.value("traceId", 0ULL));
     }
     return highestTraceId;
-}
-
-std::uint64_t recoverHighestBridgeSourceSeqFromJournal(const std::string& logPath) {
-    std::ifstream in(logPath, std::ios::binary);
-    if (!in.is_open()) {
-        return 0;
-    }
-
-    std::error_code sizeEc;
-    const std::uintmax_t size = std::filesystem::file_size(logPath, sizeEc);
-    if (!sizeEc && size > kRecoveryScanTailBytes) {
-        in.seekg(static_cast<std::streamoff>(size - kRecoveryScanTailBytes));
-        std::string ignored;
-        std::getline(in, ignored);
-    }
-
-    std::uint64_t highestSourceSeq = 0;
-    std::string line;
-    while (std::getline(in, line)) {
-        if (line.empty()) {
-            continue;
-        }
-        const json parsed = json::parse(line, nullptr, false);
-        if (parsed.is_discarded()) {
-            continue;
-        }
-        if (!parsed.contains("details") || !parsed["details"].is_object()) {
-            continue;
-        }
-        const json& details = parsed["details"];
-        highestSourceSeq = std::max(highestSourceSeq, details.value("sourceSeq", 0ULL));
-        highestSourceSeq = std::max(highestSourceSeq, details.value("droppedSourceSeq", 0ULL));
-    }
-    return highestSourceSeq;
 }
 
 SharedData& bootstrapSharedData() {
@@ -230,16 +195,6 @@ void copySharedDataState(const SharedData& src, SharedData& dst) {
     dst.traceIdByPermId = src.traceIdByPermId;
     dst.traceIdByExecId = src.traceIdByExecId;
     dst.latestTraceId = src.latestTraceId;
-    dst.nextBridgeSourceSeq.store(src.nextBridgeSourceSeq.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    dst.bridgeOutbox = src.bridgeOutbox;
-    dst.bridgeOutboxLossCount = src.bridgeOutboxLossCount;
-    dst.lastBridgeSourceSeq = src.lastBridgeSourceSeq;
-    dst.bridgeRecoveredPendingCount = src.bridgeRecoveredPendingCount;
-    dst.bridgeRecoveredLossCount = src.bridgeRecoveredLossCount;
-    dst.bridgeRecoveredLastSourceSeq = src.bridgeRecoveredLastSourceSeq;
-    dst.bridgeFallbackState = src.bridgeFallbackState;
-    dst.bridgeFallbackReason = src.bridgeFallbackReason;
-    dst.bridgeRecoveryRequired = src.bridgeRecoveryRequired;
 }
 
 std::mutex& uiInvalidationCallbackMutex() {
@@ -263,11 +218,6 @@ SharedDataMutationDispatcher& sharedDataMutationDispatcherSlot() {
 }
 
 std::mutex& tradeTraceFileMutex() {
-    static std::mutex m;
-    return m;
-}
-
-std::mutex& runtimeJournalFileMutex() {
     static std::mutex m;
     return m;
 }
@@ -345,15 +295,6 @@ struct ImmutableSharedDataSnapshot {
     std::deque<std::uint64_t> traceRecency;
     std::map<OrderId, std::uint64_t> traceIdByOrderId;
     std::uint64_t latestTraceId = 0;
-    std::deque<BridgeOutboxRecord> bridgeOutbox;
-    std::uint64_t bridgeOutboxLossCount = 0;
-    std::uint64_t lastBridgeSourceSeq = 0;
-    int bridgeRecoveredPendingCount = 0;
-    int bridgeRecoveredLossCount = 0;
-    std::uint64_t bridgeRecoveredLastSourceSeq = 0;
-    std::string bridgeFallbackState;
-    std::string bridgeFallbackReason;
-    bool bridgeRecoveryRequired = false;
 };
 
 std::shared_ptr<const ImmutableSharedDataSnapshot>& publishedSharedDataSnapshotSlot() {
@@ -367,12 +308,6 @@ void emitMacTraceObservation(std::uint64_t traceId,
                              TradeEventType type,
                              const std::string& stage,
                              const std::string& details);
-BridgeOutboxEnqueueResult enqueueBridgeOutboxRecordLocked(SharedData& state, const BridgeOutboxRecordInput& input);
-void appendBridgeRecordDetails(json& details, const BridgeOutboxRecord& record);
-std::string bridgeTickSideLabel(TickType field);
-std::string buildBridgeTickNote(TickType field, double price);
-std::string bridgeBookSideLabel(int side);
-std::string buildBridgeDepthNote(int side, int operation, int position, double price, double size);
 std::string canonicalInstrumentIdFromContract(const Contract& contract);
 std::string defaultCanonicalInstrumentIdForSymbol(const std::string& symbol);
 std::uint64_t nowSystemNs();
@@ -502,189 +437,6 @@ std::uint64_t nowSystemNs() {
         std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
-void appendBridgeRecordDetails(json& details, const BridgeOutboxRecord& record) {
-    if (!record.source.empty()) {
-        details["source"] = record.source;
-    }
-    if (!record.symbol.empty()) {
-        details["symbol"] = record.symbol;
-    }
-    if (!record.instrumentId.empty()) {
-        details["instrumentId"] = record.instrumentId;
-    }
-    if (!record.side.empty()) {
-        details["side"] = record.side;
-    }
-    if (record.marketField >= 0) {
-        details["marketField"] = record.marketField;
-    }
-    if (record.bookPosition >= 0) {
-        details["bookPosition"] = record.bookPosition;
-    }
-    if (record.bookOperation >= 0) {
-        details["bookOperation"] = record.bookOperation;
-    }
-    if (record.bookSide >= 0) {
-        details["bookSide"] = record.bookSide;
-    }
-    if (std::isfinite(record.price)) {
-        details["price"] = record.price;
-    }
-    if (std::isfinite(record.size)) {
-        details["size"] = record.size;
-    }
-    if (record.tsReceiveNs > 0) {
-        details["tsReceiveNs"] = record.tsReceiveNs;
-    }
-    if (record.tsExchangeNs > 0) {
-        details["tsExchangeNs"] = record.tsExchangeNs;
-    }
-    if (record.vendorSeq > 0) {
-        details["vendorSeq"] = record.vendorSeq;
-    }
-    if (record.anchor.traceId > 0) {
-        details["traceId"] = static_cast<unsigned long long>(record.anchor.traceId);
-    }
-    if (record.anchor.orderId > 0) {
-        details["orderId"] = static_cast<long long>(record.anchor.orderId);
-    }
-    if (record.anchor.permId > 0) {
-        details["permId"] = record.anchor.permId;
-    }
-    if (!record.anchor.execId.empty()) {
-        details["execId"] = record.anchor.execId;
-    }
-    if (!record.note.empty()) {
-        details["note"] = record.note;
-    }
-}
-
-std::string bridgeTickSideLabel(TickType field) {
-    switch (field) {
-        case 1:
-            return "BID";
-        case 2:
-            return "ASK";
-        case 4:
-            return "LAST";
-        default:
-            return {};
-    }
-}
-
-std::string buildBridgeTickNote(TickType field, double price) {
-    std::ostringstream oss;
-    const std::string side = bridgeTickSideLabel(field);
-    if (side.empty()) {
-        oss << "tick field " << static_cast<int>(field);
-    } else {
-        oss << side << " tick";
-    }
-    if (std::isfinite(price)) {
-        oss << ' ' << std::fixed << std::setprecision(2) << price;
-    }
-    return oss.str();
-}
-
-std::string bridgeBookSideLabel(int side) {
-    return side == 0 ? "ASK" : "BID";
-}
-
-std::string buildBridgeDepthNote(int side, int operation, int position, double price, double size) {
-    static constexpr const char* kOperationNames[] = {"insert", "update", "delete"};
-    std::ostringstream oss;
-    oss << bridgeBookSideLabel(side) << " depth ";
-    if (operation >= 0 && operation < 3) {
-        oss << kOperationNames[operation];
-    } else {
-        oss << "op=" << operation;
-    }
-    oss << " pos=" << position;
-    if (std::isfinite(price)) {
-        oss << " px=" << std::fixed << std::setprecision(2) << price;
-    }
-    if (std::isfinite(size)) {
-        oss << " sz=" << std::setprecision(0) << size;
-    }
-    return oss.str();
-}
-
-BridgeOutboxEnqueueResult enqueueBridgeOutboxRecordLocked(SharedData& state, const BridgeOutboxRecordInput& input) {
-    BridgeOutboxEnqueueResult result;
-
-    BridgeOutboxRecord record;
-    record.sourceSeq = state.nextBridgeSourceSeq.fetch_add(1, std::memory_order_relaxed);
-    record.recordType = input.recordType;
-    record.source = input.source;
-    record.symbol = toUpperCase(input.symbol);
-    if (!input.instrumentId.empty()) {
-        record.instrumentId = input.instrumentId;
-    } else if (!record.symbol.empty() && record.symbol == state.currentSymbol && !state.currentInstrumentId.empty()) {
-        record.instrumentId = state.currentInstrumentId;
-    } else if (!record.symbol.empty()) {
-        record.instrumentId = canonicalInstrumentIdForSymbol(record.symbol);
-    } else {
-        record.instrumentId = state.currentInstrumentId;
-    }
-    record.side = input.side;
-    record.marketField = input.marketField;
-    record.bookPosition = input.bookPosition;
-    record.bookOperation = input.bookOperation;
-    record.bookSide = input.bookSide;
-    record.price = input.price;
-    record.size = input.size;
-    record.tsReceiveNs = input.tsReceiveNs > 0 ? input.tsReceiveNs : nowSystemNs();
-    record.tsExchangeNs = input.tsExchangeNs;
-    record.vendorSeq = input.vendorSeq;
-    record.anchor.traceId = input.traceId;
-    record.anchor.orderId = input.orderId;
-    record.anchor.permId = input.permId;
-    record.anchor.execId = input.execId;
-    record.note = input.note;
-    record.wallTime = formatWallTime(std::chrono::system_clock::now());
-
-    state.lastBridgeSourceSeq = record.sourceSeq;
-    state.bridgeFallbackState = "queued_for_recovery";
-    state.bridgeFallbackReason = "engine_unavailable";
-    record.fallbackState = state.bridgeFallbackState;
-    record.fallbackReason = state.bridgeFallbackReason;
-    state.bridgeOutbox.push_back(record);
-
-    result.sourceSeq = record.sourceSeq;
-    result.queued = true;
-    result.fallbackState = record.fallbackState;
-    result.fallbackReason = record.fallbackReason;
-
-    json queuedDetails = {
-        {"sourceSeq", static_cast<unsigned long long>(record.sourceSeq)},
-        {"recordType", record.recordType},
-        {"fallbackState", record.fallbackState},
-        {"fallbackReason", record.fallbackReason}
-    };
-    appendBridgeRecordDetails(queuedDetails, record);
-    appendRuntimeJournalEvent("bridge_outbox_queued", queuedDetails);
-
-    if (state.bridgeOutbox.size() > kMaxBridgeOutboxRecords) {
-        const BridgeOutboxRecord dropped = state.bridgeOutbox.front();
-        state.bridgeOutbox.pop_front();
-        ++state.bridgeOutboxLossCount;
-        result.lossMarked = true;
-
-        json lossDetails = {
-            {"reason", "queue_overflow"},
-            {"recordType", dropped.recordType},
-            {"droppedSourceSeq", static_cast<unsigned long long>(dropped.sourceSeq)}
-        };
-        appendBridgeRecordDetails(lossDetails, dropped);
-        appendRuntimeJournalEvent("bridge_outbox_loss", lossDetails);
-    }
-
-    state.bridgeRecoveryRequired = (state.bridgeRecoveredPendingCount + static_cast<int>(state.bridgeOutbox.size())) > 0 ||
-                                   (state.bridgeRecoveredLossCount + static_cast<int>(state.bridgeOutboxLossCount)) > 0;
-    result.recoveryRequired = state.bridgeRecoveryRequired;
-    return result;
-}
-
 std::string randomHexToken(std::size_t bytes) {
     static constexpr char kHex[] = "0123456789abcdef";
     std::random_device rd;
@@ -712,25 +464,6 @@ void pruneWebSocketStateLocked(SharedData& state, std::chrono::steady_clock::tim
             ++it;
         }
     }
-}
-
-json makeRuntimeJournalLine(const std::string& event, const json& details) {
-    json line;
-    line["event"] = event;
-    line["wallTime"] = formatWallTime(std::chrono::system_clock::now());
-    {
-        std::lock_guard<std::recursive_mutex> lock(g_data.mutex);
-        if (!g_data.appSessionId.empty()) {
-            line["appSessionId"] = g_data.appSessionId;
-        }
-        if (!g_data.runtimeSessionId.empty()) {
-            line["runtimeSessionId"] = g_data.runtimeSessionId;
-        }
-    }
-    if (!details.is_null() && !details.empty()) {
-        line["details"] = details;
-    }
-    return line;
 }
 
 std::string makeOrderFingerprint(const SubmitIntent& intent) {
@@ -904,14 +637,6 @@ std::uint64_t ensureRecoveredTraceLocked(SharedData& state,
                                                   tradeTraceLogPath()) &&
         replayedSnapshot.found) {
         traceId = registerRecoveredTraceLocked(state, replayedSnapshot.trace, orderId, permId, execId);
-        appendRuntimeJournalEvent("recovered_trace_hydrated", {
-            {"traceId", static_cast<unsigned long long>(traceId)},
-            {"orderId", static_cast<long long>(orderId)},
-            {"permId", permId},
-            {"execId", execId},
-            {"symbol", replayedSnapshot.trace.symbol},
-            {"side", replayedSnapshot.trace.side}
-        });
         return traceId;
     }
 
@@ -951,14 +676,6 @@ std::uint64_t ensureRecoveredTraceLocked(SharedData& state,
     }
     appendTradeTraceLogLine(makeTraceEventLogLine(trace, event));
     emitMacTraceObservation(trace.traceId, TradeEventType::Note, event.stage, event.details);
-    appendRuntimeJournalEvent("recovered_trace_created", {
-        {"traceId", static_cast<unsigned long long>(trace.traceId)},
-        {"orderId", static_cast<long long>(orderId)},
-        {"permId", permId},
-        {"execId", execId},
-        {"symbol", symbol},
-        {"side", side}
-    });
     return trace.traceId;
 }
 
@@ -1090,10 +807,6 @@ std::string tradeTraceLogPath() {
     return (std::filesystem::path(resolvedAppDataDirectory()) / TRADE_TRACE_LOG_FILENAME).string();
 }
 
-std::string runtimeJournalLogPath() {
-    return (std::filesystem::path(resolvedAppDataDirectory()) / RUNTIME_JOURNAL_LOG_FILENAME).string();
-}
-
 void bindSharedDataOwner(SharedData* owner) {
     if (owner == nullptr) {
         return;
@@ -1107,7 +820,6 @@ void bindSharedDataOwner(SharedData* owner) {
         copySharedDataState(*current, *owner);
     }
     reserveTraceIdFloor(owner->nextTraceId, recoverHighestTraceIdFromLog(tradeTraceLogPath()));
-    reserveTraceIdFloor(owner->nextBridgeSourceSeq, recoverHighestBridgeSourceSeqFromJournal(runtimeJournalLogPath()));
     activeSharedDataSlot().store(owner, std::memory_order_release);
     publishSharedDataSnapshot();
 }
@@ -1342,17 +1054,12 @@ void reduce(SharedData& state, const MarketSubscriptionStartedEvent& event) {
 }
 
 void reduce(SharedData& state, const BrokerConnectAckEvent&) {
-    std::string host;
-    int port = DEFAULT_PORT;
     {
         std::lock_guard<std::recursive_mutex> lock(state.mutex);
         state.connected = true;
         state.sessionReady = false;
         state.sessionState = RuntimeSessionState::SocketConnected;
-        host = state.twsHost;
-        port = state.twsPort;
     }
-    appendRuntimeJournalEvent("tws_connect_ack", {{"host", host}, {"port", port}});
     state.addMessage("Connected to TWS (awaiting nextValidId)");
 }
 
@@ -1383,7 +1090,6 @@ void reduce(SharedData& state, const BrokerConnectionClosedEvent&) {
             }
         }
     }
-    appendRuntimeJournalEvent("tws_connection_closed");
     state.addMessage("Disconnected from TWS");
 }
 
@@ -1397,18 +1103,15 @@ void reduce(SharedData& state, const BrokerNextValidIdEvent& event) {
         state.executionsLoaded = false;
         state.nextOrderId.store(event.orderId, std::memory_order_relaxed);
     }
-    appendRuntimeJournalEvent("tws_session_ready", {{"nextOrderId", static_cast<long long>(event.orderId)}});
     state.addMessage("Next valid order ID: " + std::to_string(event.orderId));
 }
 
 void reduce(SharedData& state, const BrokerManagedAccountsEvent& event) {
     std::string message;
-    std::string selectedAccount;
     {
         std::lock_guard<std::recursive_mutex> lock(state.mutex);
         state.managedAccounts = event.accountsList;
         state.selectedAccount = chooseConfiguredAccount(event.accountsList);
-        selectedAccount = state.selectedAccount;
 
         if (!state.selectedAccount.empty()) {
             message = "Managed accounts: " + event.accountsList + " | using account " + state.selectedAccount;
@@ -1417,7 +1120,6 @@ void reduce(SharedData& state, const BrokerManagedAccountsEvent& event) {
                       " | configured account not found: " + std::string(HARDCODED_ACCOUNT);
         }
     }
-    appendRuntimeJournalEvent("managed_accounts", {{"accounts", event.accountsList}, {"selectedAccount", selectedAccount}});
     state.addMessage(message);
 }
 
@@ -1429,27 +1131,14 @@ void reduce(SharedData& state, const BrokerTickPriceEvent& event) {
             return;
         }
 
-        BridgeOutboxRecordInput bridgeRecord;
-        bridgeRecord.recordType = "market_tick";
-        bridgeRecord.source = "BrokerTickPrice";
-        bridgeRecord.symbol = state.currentSymbol;
-        bridgeRecord.instrumentId = state.currentInstrumentId;
-        bridgeRecord.marketField = static_cast<int>(event.field);
-        bridgeRecord.price = event.price;
-        bridgeRecord.side = bridgeTickSideLabel(event.field);
-
         switch (event.field) {
             case 1:
                 state.bidPrice = event.price;
                 state.lastQuoteUpdate = std::chrono::steady_clock::now();
-                bridgeRecord.note = buildBridgeTickNote(event.field, event.price);
-                enqueueBridgeOutboxRecordLocked(state, bridgeRecord);
                 break;
             case 2: {
                 state.askPrice = event.price;
                 state.lastQuoteUpdate = std::chrono::steady_clock::now();
-                bridgeRecord.note = buildBridgeTickNote(event.field, event.price);
-                enqueueBridgeOutboxRecordLocked(state, bridgeRecord);
                 if (state.pendingWSQuantityCalc && event.price > 0.0) {
                     int maxQty = static_cast<int>(std::floor(state.maxPositionDollars / event.price));
                     if (maxQty < 1) maxQty = 1;
@@ -1469,8 +1158,6 @@ void reduce(SharedData& state, const BrokerTickPriceEvent& event) {
             case 4:
                 state.lastPrice = event.price;
                 state.lastQuoteUpdate = std::chrono::steady_clock::now();
-                bridgeRecord.note = buildBridgeTickNote(event.field, event.price);
-                enqueueBridgeOutboxRecordLocked(state, bridgeRecord);
                 break;
             default:
                 break;
@@ -1505,26 +1192,10 @@ void reduce(SharedData& state, const BrokerMarketDepthEvent& event) {
             book.erase(book.begin() + event.position);
         }
     }
-
-    BridgeOutboxRecordInput bridgeRecord;
-    bridgeRecord.recordType = "market_depth";
-    bridgeRecord.source = "BrokerMarketDepth";
-    bridgeRecord.symbol = state.currentSymbol;
-    bridgeRecord.instrumentId = state.currentInstrumentId;
-    bridgeRecord.side = bridgeBookSideLabel(event.side);
-    bridgeRecord.bookPosition = event.position;
-    bridgeRecord.bookOperation = event.operation;
-    bridgeRecord.bookSide = event.side;
-    bridgeRecord.price = event.price;
-    bridgeRecord.size = event.size;
-    bridgeRecord.note = buildBridgeDepthNote(event.side, event.operation, event.position, event.price, event.size);
-    enqueueBridgeOutboxRecordLocked(state, bridgeRecord);
 }
 
 void reduce(SharedData& state, const BrokerOrderStatusEvent& event) {
     std::string msg;
-    std::string reconciliationJournalEvent;
-    json reconciliationJournalDetails;
     {
         std::lock_guard<std::recursive_mutex> lock(state.mutex);
         floorNextOrderIdLocked(state, event.orderId);
@@ -1544,8 +1215,6 @@ void reduce(SharedData& state, const BrokerOrderStatusEvent& event) {
 
         OrderInfo& ord = it->second;
         const LocalOrderState previousLocalState = ord.localState;
-        const int previousReconciliationAttempts = ord.watchdogs.reconciliationAttempts;
-        const std::string previousReconciliationReason = ord.lastReconciliationReason;
         if (ord.isTerminal() && !isTerminalStatus(event.status) && event.status != ord.status) {
             return;
         }
@@ -1624,46 +1293,14 @@ void reduce(SharedData& state, const BrokerOrderStatusEvent& event) {
                           ord.filledQty, ord.avgFillPrice);
         }
         msg = buf;
-
-        const bool wasAwaitingOrReconciling =
-            previousLocalState == LocalOrderState::AwaitingBrokerEcho ||
-            previousLocalState == LocalOrderState::AwaitingCancelAck ||
-            previousLocalState == LocalOrderState::NeedsReconciliation;
-        if (wasAwaitingOrReconciling) {
-            if (ord.localState == LocalOrderState::Working || ord.localState == LocalOrderState::PartiallyFilled) {
-                reconciliationJournalEvent = "reconcile_resolved_working";
-            } else if (ord.localState == LocalOrderState::Filled) {
-                reconciliationJournalEvent = "reconcile_resolved_filled";
-            } else if (ord.localState == LocalOrderState::Cancelled) {
-                reconciliationJournalEvent = "reconcile_resolved_cancelled";
-            } else if (ord.localState == LocalOrderState::Rejected) {
-                reconciliationJournalEvent = "reconcile_resolved_rejected";
-            } else if (ord.localState == LocalOrderState::Inactive) {
-                reconciliationJournalEvent = "reconcile_resolved_inactive";
-            }
-            if (!reconciliationJournalEvent.empty()) {
-                reconciliationJournalDetails = {
-                    {"orderId", static_cast<long long>(event.orderId)},
-                    {"localState", localOrderStateToString(ord.localState)},
-                    {"brokerStatus", ord.status},
-                    {"reconciliationAttempts", previousReconciliationAttempts},
-                    {"reason", previousReconciliationReason}
-                };
-            }
-        }
     }
 
     state.addMessage(msg);
-    if (!reconciliationJournalEvent.empty()) {
-        appendRuntimeJournalEvent(reconciliationJournalEvent, reconciliationJournalDetails);
-    }
     recordTraceOrderStatus(event.orderId, event.status, event.filled, event.remaining, event.avgFillPrice,
                            event.permId, event.lastFillPrice, event.mktCapPrice);
 }
 
 void reduce(SharedData& state, const BrokerOpenOrderEvent& event) {
-    std::string reconciliationJournalEvent;
-    json reconciliationJournalDetails;
     {
         std::lock_guard<std::recursive_mutex> lock(state.mutex);
         floorNextOrderIdLocked(state, event.orderId);
@@ -1686,8 +1323,6 @@ void reduce(SharedData& state, const BrokerOpenOrderEvent& event) {
         it = state.orders.find(event.orderId);
         OrderInfo& ord = it->second;
         const LocalOrderState previousLocalState = ord.localState;
-        const int previousReconciliationAttempts = ord.watchdogs.reconciliationAttempts;
-        const std::string previousReconciliationReason = ord.lastReconciliationReason;
         const auto now = std::chrono::steady_clock::now();
 
         if (!ord.isTerminal()) {
@@ -1708,21 +1343,6 @@ void reduce(SharedData& state, const BrokerOpenOrderEvent& event) {
             }
         }
 
-        const bool wasAwaitingOrReconciling =
-            previousLocalState == LocalOrderState::AwaitingBrokerEcho ||
-            previousLocalState == LocalOrderState::AwaitingCancelAck ||
-            previousLocalState == LocalOrderState::NeedsReconciliation;
-        if (wasAwaitingOrReconciling &&
-            (ord.localState == LocalOrderState::Working || ord.localState == LocalOrderState::PartiallyFilled)) {
-            reconciliationJournalEvent = "reconcile_resolved_working";
-            reconciliationJournalDetails = {
-                {"orderId", static_cast<long long>(event.orderId)},
-                {"localState", localOrderStateToString(ord.localState)},
-                {"brokerStatus", ord.status},
-                {"reconciliationAttempts", previousReconciliationAttempts},
-                {"reason", previousReconciliationReason}
-            };
-        }
     }
 
     recordTraceOpenOrder(event.orderId, event.contract, event.order, event.orderState);
@@ -1736,14 +1356,9 @@ void reduce(SharedData& state, const BrokerOpenOrderEvent& event) {
                   event.order.lmtPrice,
                   event.orderState.status.c_str());
     state.addMessage(msg);
-    if (!reconciliationJournalEvent.empty()) {
-        appendRuntimeJournalEvent(reconciliationJournalEvent, reconciliationJournalDetails);
-    }
 }
 
 void reduce(SharedData& state, const BrokerExecutionEvent& event) {
-    std::string reconciliationJournalEvent;
-    json reconciliationJournalDetails;
     {
         std::lock_guard<std::recursive_mutex> lock(state.mutex);
         const OrderId orderId = static_cast<OrderId>(event.execution.orderId);
@@ -1763,9 +1378,6 @@ void reduce(SharedData& state, const BrokerExecutionEvent& event) {
             return;
         }
 
-        const LocalOrderState previousLocalState = ord.localState;
-        const int previousReconciliationAttempts = ord.watchdogs.reconciliationAttempts;
-        const std::string previousReconciliationReason = ord.lastReconciliationReason;
         const auto now = std::chrono::steady_clock::now();
         noteOrderBrokerCallback(ord, now);
 
@@ -1797,43 +1409,18 @@ void reduce(SharedData& state, const BrokerExecutionEvent& event) {
             transitionOrderToResolvedState(ord, LocalOrderState::Filled, now);
         }
 
-        const bool wasAwaitingOrReconciling =
-            previousLocalState == LocalOrderState::AwaitingBrokerEcho ||
-            previousLocalState == LocalOrderState::AwaitingCancelAck ||
-            previousLocalState == LocalOrderState::NeedsReconciliation;
-        if (wasAwaitingOrReconciling) {
-            reconciliationJournalEvent = (ord.localState == LocalOrderState::Filled)
-                ? "reconcile_resolved_filled"
-                : "reconcile_resolved_working";
-            reconciliationJournalDetails = {
-                {"orderId", static_cast<long long>(orderId)},
-                {"localState", localOrderStateToString(ord.localState)},
-                {"reconciliationAttempts", previousReconciliationAttempts},
-                {"reason", previousReconciliationReason}
-            };
-        }
     }
 
     recordTraceExecution(event.contract, event.execution);
-    appendRuntimeJournalEvent("execution_seen", {
-        {"orderId", static_cast<long long>(event.execution.orderId)},
-        {"symbol", event.contract.symbol},
-        {"execId", event.execution.execId},
-        {"shares", DecimalFunctions::decimalToDouble(event.execution.shares)},
-        {"price", event.execution.price}
-    });
 
     char msg[256];
     std::snprintf(msg, sizeof(msg),
                   "Execution %s: order %lld %s %.0f @ %.2f (cum %.0f)",
                   event.execution.execId.c_str(), static_cast<long long>(event.execution.orderId),
-                  event.contract.symbol.c_str(),
-                  DecimalFunctions::decimalToDouble(event.execution.shares), event.execution.price,
-                  DecimalFunctions::decimalToDouble(event.execution.cumQty));
+	                  event.contract.symbol.c_str(),
+	                  DecimalFunctions::decimalToDouble(event.execution.shares), event.execution.price,
+	                  DecimalFunctions::decimalToDouble(event.execution.cumQty));
     state.addMessage(msg);
-    if (!reconciliationJournalEvent.empty()) {
-        appendRuntimeJournalEvent(reconciliationJournalEvent, reconciliationJournalDetails);
-    }
 }
 
 void reduce(SharedData& state, const BrokerExecutionsLoadedEvent&) {
@@ -1847,7 +1434,6 @@ void reduce(SharedData& state, const BrokerExecutionsLoadedEvent&) {
             sessionReadyNow = true;
         }
     }
-    appendRuntimeJournalEvent("executions_loaded");
     if (sessionReadyNow) {
         state.addMessage("TWS session is ready after reconciliation");
     }
@@ -1855,11 +1441,6 @@ void reduce(SharedData& state, const BrokerExecutionsLoadedEvent&) {
 
 void reduce(SharedData& state, const BrokerCommissionEvent& event) {
     recordTraceCommission(event.commissionReport);
-    appendRuntimeJournalEvent("commission_seen", {
-        {"execId", event.commissionReport.execId},
-        {"commission", commissionValue(event.commissionReport)},
-        {"currency", event.commissionReport.currency}
-    });
 
     char msg[256];
     std::snprintf(msg, sizeof(msg), "Commission %s: %.4f %s",
@@ -1869,8 +1450,6 @@ void reduce(SharedData& state, const BrokerCommissionEvent& event) {
 }
 
 void reduce(SharedData& state, const BrokerErrorEvent& event) {
-    std::string reconciliationJournalEvent;
-    json reconciliationJournalDetails;
     {
         std::lock_guard<std::recursive_mutex> lock(state.mutex);
         if (event.errorCode == 300 && state.suppressedMktDataCancelIds.erase(event.id) > 0) return;
@@ -1915,46 +1494,19 @@ void reduce(SharedData& state, const BrokerErrorEvent& event) {
         std::lock_guard<std::recursive_mutex> lock(state.mutex);
         auto it = state.orders.find(static_cast<OrderId>(event.id));
         if (it != state.orders.end()) {
-            const LocalOrderState previousLocalState = it->second.localState;
-            const int previousReconciliationAttempts = it->second.watchdogs.reconciliationAttempts;
-            const std::string previousReconciliationReason = it->second.lastReconciliationReason;
             const auto now = std::chrono::steady_clock::now();
             if (event.errorCode == 201) {
                 it->second.status = "Rejected";
                 transitionOrderToResolvedState(it->second, LocalOrderState::Rejected, now);
-                reconciliationJournalEvent = "reconcile_resolved_rejected";
             } else {
                 it->second.status = "Cancelled";
                 it->second.cancelPending = false;
                 transitionOrderToResolvedState(it->second, LocalOrderState::Cancelled, now);
-                reconciliationJournalEvent = "reconcile_resolved_cancelled";
-            }
-            const bool wasAwaitingOrReconciling =
-                previousLocalState == LocalOrderState::AwaitingBrokerEcho ||
-                previousLocalState == LocalOrderState::AwaitingCancelAck ||
-                previousLocalState == LocalOrderState::NeedsReconciliation;
-            if (!wasAwaitingOrReconciling) {
-                reconciliationJournalEvent.clear();
-            } else if (!reconciliationJournalEvent.empty()) {
-                reconciliationJournalDetails = {
-                    {"orderId", static_cast<long long>(event.id)},
-                    {"localState", localOrderStateToString(it->second.localState)},
-                    {"reconciliationAttempts", previousReconciliationAttempts},
-                    {"reason", previousReconciliationReason}
-                };
             }
         }
     }
 
     recordTraceError(event.id, event.errorCode, event.errorString);
-    appendRuntimeJournalEvent("broker_error", {
-        {"id", event.id},
-        {"code", event.errorCode},
-        {"message", event.errorString}
-    });
-    if (!reconciliationJournalEvent.empty()) {
-        appendRuntimeJournalEvent(reconciliationJournalEvent, reconciliationJournalDetails);
-    }
 }
 
 void reduce(SharedData& state, const BrokerPositionEvent& event) {
@@ -1984,7 +1536,6 @@ void reduce(SharedData& state, const BrokerPositionsLoadedEvent&) {
             sessionReadyNow = true;
         }
     }
-    appendRuntimeJournalEvent("positions_loaded");
     state.addMessage("Positions loaded");
     if (sessionReadyNow) {
         state.addMessage("TWS session is ready after reconciliation");
@@ -2349,7 +1900,6 @@ void setRuntimeSessionState(RuntimeSessionState state) {
     });
     if (changed) {
         macLogInfo("runtime", "Session state changed: " + runtimeSessionStateToString(state));
-        appendRuntimeJournalEvent("session_state_changed", {{"state", runtimeSessionStateToString(state)}});
         requestUiInvalidation();
     }
 }
@@ -2587,15 +2137,6 @@ std::shared_ptr<const ImmutableSharedDataSnapshot> buildImmutableSharedDataSnaps
     snapshot->traceRecency = state.traceRecency;
     snapshot->traceIdByOrderId = state.traceIdByOrderId;
     snapshot->latestTraceId = state.latestTraceId;
-    snapshot->bridgeOutbox = state.bridgeOutbox;
-    snapshot->bridgeOutboxLossCount = state.bridgeOutboxLossCount;
-    snapshot->lastBridgeSourceSeq = state.lastBridgeSourceSeq;
-    snapshot->bridgeRecoveredPendingCount = state.bridgeRecoveredPendingCount;
-    snapshot->bridgeRecoveredLossCount = state.bridgeRecoveredLossCount;
-    snapshot->bridgeRecoveredLastSourceSeq = state.bridgeRecoveredLastSourceSeq;
-    snapshot->bridgeFallbackState = state.bridgeFallbackState;
-    snapshot->bridgeFallbackReason = state.bridgeFallbackReason;
-    snapshot->bridgeRecoveryRequired = state.bridgeRecoveryRequired;
     return snapshot;
 }
 
@@ -2963,7 +2504,6 @@ void setControllerArmed(bool armed) {
         return trading_engine::reduce(appState(), trading_engine::ControllerArmedChangedEvent{armed});
     });
     if (changed) {
-        appendRuntimeJournalEvent("controller_armed_changed", {{"armed", armed}});
         requestUiInvalidation();
     }
 }
@@ -2973,7 +2513,6 @@ void setTradingKillSwitch(bool enabled) {
         return trading_engine::reduce(appState(), trading_engine::TradingKillSwitchChangedEvent{enabled});
     });
     if (changed) {
-        appendRuntimeJournalEvent("trading_kill_switch_changed", {{"enabled", enabled}});
         requestUiInvalidation();
     }
 }
@@ -3044,75 +2583,6 @@ bool reserveWebSocketIdempotencyKey(const std::string& key, std::string* error) 
     return result.reserved;
 }
 
-BridgeOutboxEnqueueResult enqueueBridgeOutboxRecord(const BridgeOutboxRecordInput& input) {
-    return invokeSharedDataMutation([&]() {
-        SharedData& state = appState();
-        std::lock_guard<std::recursive_mutex> lock(state.mutex);
-        return enqueueBridgeOutboxRecordLocked(state, input);
-    });
-}
-
-void seedBridgeOutboxRecoveryState(const RuntimeRecoverySnapshot& recovery) {
-    invokeSharedDataMutation([&]() {
-        SharedData& state = appState();
-        std::lock_guard<std::recursive_mutex> lock(state.mutex);
-        state.bridgeRecoveredPendingCount = std::max(0, recovery.pendingOutboxCount);
-        state.bridgeRecoveredLossCount = std::max(0, recovery.outboxLossCount);
-        state.bridgeRecoveredLastSourceSeq = recovery.lastOutboxSourceSeq;
-        state.lastBridgeSourceSeq = std::max(state.lastBridgeSourceSeq, recovery.lastOutboxSourceSeq);
-        if (state.bridgeFallbackState.empty()) {
-            state.bridgeFallbackState = "queued_for_recovery";
-        }
-        if (state.bridgeFallbackReason.empty()) {
-            state.bridgeFallbackReason = "engine_unavailable";
-        }
-        state.bridgeRecoveryRequired = (state.bridgeRecoveredPendingCount + static_cast<int>(state.bridgeOutbox.size())) > 0 ||
-                                       (state.bridgeRecoveredLossCount + static_cast<int>(state.bridgeOutboxLossCount)) > 0;
-    });
-}
-
-BridgeOutboxSnapshot captureBridgeOutboxSnapshot(std::size_t maxItems) {
-    BridgeOutboxSnapshot snapshot;
-    const auto published = ensurePublishedSharedDataSnapshot();
-    snapshot.fallbackState = published->bridgeFallbackState;
-    snapshot.fallbackReason = published->bridgeFallbackReason;
-    snapshot.recoveryRequired = published->bridgeRecoveryRequired;
-    snapshot.pendingCount = published->bridgeRecoveredPendingCount + static_cast<int>(published->bridgeOutbox.size());
-    snapshot.lossCount = published->bridgeRecoveredLossCount + static_cast<int>(published->bridgeOutboxLossCount);
-    snapshot.lastSourceSeq = std::max(published->lastBridgeSourceSeq, published->bridgeRecoveredLastSourceSeq);
-
-    if (maxItems > 0) {
-        snapshot.records.reserve(std::min(maxItems, published->bridgeOutbox.size()));
-        for (auto it = published->bridgeOutbox.rbegin();
-             it != published->bridgeOutbox.rend() && snapshot.records.size() < maxItems;
-             ++it) {
-            snapshot.records.push_back(*it);
-        }
-    }
-    return snapshot;
-}
-
-BridgeDispatchSnapshot captureBridgeDispatchSnapshot(std::size_t maxItems) {
-    BridgeDispatchSnapshot snapshot;
-    const auto published = ensurePublishedSharedDataSnapshot();
-    snapshot.appSessionId = published->appSessionId;
-    snapshot.runtimeSessionId = published->runtimeSessionId;
-    if (published->bridgeOutbox.empty()) {
-        return snapshot;
-    }
-
-    const std::size_t limit = maxItems == 0
-        ? published->bridgeOutbox.size()
-        : std::min(maxItems, published->bridgeOutbox.size());
-    snapshot.records.reserve(limit);
-    for (auto it = published->bridgeOutbox.begin();
-         it != published->bridgeOutbox.end() && snapshot.records.size() < limit;
-         ++it) {
-        snapshot.records.push_back(*it);
-    }
-    return snapshot;
-}
-
 std::string captureCurrentInstrumentIdForSymbol(const std::string& symbol) {
     const auto published = ensurePublishedSharedDataSnapshot();
     const std::string normalizedSymbol = toUpperCase(symbol);
@@ -3124,54 +2594,6 @@ std::string captureCurrentInstrumentIdForSymbol(const std::string& symbol) {
         return canonicalInstrumentIdForSymbol(normalizedSymbol);
     }
     return published->currentInstrumentId;
-}
-
-std::size_t acknowledgeDeliveredBridgeRecords(const std::vector<BridgeOutboxRecord>& records) {
-    if (records.empty()) {
-        return 0;
-    }
-    return invokeSharedDataMutation([&]() {
-        SharedData& state = appState();
-        std::lock_guard<std::recursive_mutex> lock(state.mutex);
-
-        std::size_t removed = 0;
-        while (removed < records.size() && !state.bridgeOutbox.empty()) {
-            const BridgeOutboxRecord& expected = records[removed];
-            const BridgeOutboxRecord& queued = state.bridgeOutbox.front();
-            if (queued.sourceSeq != expected.sourceSeq) {
-                break;
-            }
-
-            json deliveredDetails = {
-                {"sourceSeq", static_cast<unsigned long long>(queued.sourceSeq)},
-                {"recordType", queued.recordType}
-            };
-            appendBridgeRecordDetails(deliveredDetails, queued);
-            appendRuntimeJournalEvent("bridge_outbox_delivered", deliveredDetails);
-
-            state.bridgeOutbox.pop_front();
-            ++removed;
-        }
-
-        state.bridgeRecoveryRequired = (state.bridgeRecoveredPendingCount + static_cast<int>(state.bridgeOutbox.size())) > 0 ||
-                                       (state.bridgeRecoveredLossCount + static_cast<int>(state.bridgeOutboxLossCount)) > 0;
-        if (!state.bridgeRecoveryRequired && state.bridgeOutbox.empty()) {
-            state.bridgeFallbackState = "live_delivery";
-            state.bridgeFallbackReason = "engine_connected";
-        }
-        return removed;
-    });
-}
-
-void noteBridgeTransportUnavailable(const std::string& reason) {
-    invokeSharedDataMutation([&]() {
-        SharedData& state = appState();
-        std::lock_guard<std::recursive_mutex> lock(state.mutex);
-        state.bridgeFallbackState = "queued_for_recovery";
-        state.bridgeFallbackReason = reason.empty() ? "engine_unavailable" : reason;
-        state.bridgeRecoveryRequired = (state.bridgeRecoveredPendingCount + static_cast<int>(state.bridgeOutbox.size())) > 0 ||
-                                       (state.bridgeRecoveredLossCount + static_cast<int>(state.bridgeOutboxLossCount)) > 0;
-    });
 }
 
 std::vector<std::pair<OrderId, OrderInfo>> captureOrdersSnapshot() {
@@ -3266,7 +2688,6 @@ std::vector<bool> sendCancelRequests(EClientSocket* client, const std::vector<Or
         if (sent[i]) {
             sentOrderIds.push_back(orderIds[i]);
             recordTraceCancelRequest(orderIds[i]);
-            appendRuntimeJournalEvent("cancel_request_sent", {{"orderId", static_cast<long long>(orderIds[i])}});
         }
     }
     noteCancelRequestsSent(sentOrderIds, std::chrono::steady_clock::now());
@@ -3388,11 +2809,6 @@ bool requestSymbolSubscription(EClientSocket* client,
     }
 
     appendSharedMessage("Subscription request sent for " + symbol);
-    appendRuntimeJournalEvent("subscribe_request_sent", {
-        {"instrumentId", instrumentId},
-        {"symbol", symbol},
-        {"recalculateQuantity", recalcQtyFromFirstAsk}
-    });
     return true;
 }
 
@@ -3629,15 +3045,6 @@ bool submitLimitOrder(EClientSocket* client,
 
     appendTraceEventByTraceId(traceId, TradeEventType::PlaceOrderCallStart,
                               "placeOrder", "Calling EClientSocket::placeOrder()");
-    appendRuntimeJournalEvent("submit_order_requested", {
-        {"traceId", static_cast<unsigned long long>(traceId)},
-        {"symbol", symbol},
-        {"action", action},
-        {"quantity", quantity},
-        {"limitPrice", limitPrice},
-        {"source", effectiveIntent.source},
-        {"routing", effectiveIntent.routingSummary}
-    });
 
     {
         std::lock_guard<std::recursive_mutex> clientLock(g_data.clientMutex);
@@ -3762,17 +3169,6 @@ void appendTradeTraceLogLine(const json& line) {
     out << line.dump() << '\n';
 }
 
-void appendRuntimeJournalLine(const json& line) {
-    std::lock_guard<std::mutex> lock(runtimeJournalFileMutex());
-    std::ofstream out(runtimeJournalLogPath(), std::ios::app);
-    if (!out.is_open()) return;
-    out << line.dump() << '\n';
-}
-
-void appendRuntimeJournalEvent(const std::string& event, const json& details) {
-    appendRuntimeJournalLine(makeRuntimeJournalLine(event, details));
-}
-
 std::vector<std::string> recoverUnfinishedTraceSummariesFromLog(std::size_t maxItems) {
     std::ifstream in(tradeTraceLogPath());
     if (!in.is_open()) {
@@ -3826,114 +3222,13 @@ RuntimeRecoverySnapshot recoverRuntimeRecoverySnapshot(std::size_t maxTraceItems
     snapshot.unfinishedTraceSummaries = recoverUnfinishedTraceSummariesFromLog(maxTraceItems);
     snapshot.unfinishedTraceCount = static_cast<int>(snapshot.unfinishedTraceSummaries.size());
 
-    std::ifstream in(runtimeJournalLogPath());
-    if (!in.is_open()) {
-        return snapshot;
-    }
-
-    struct SessionInfo {
-        bool started = false;
-        bool cleanShutdown = false;
-        std::string appSessionId;
-        std::string runtimeSessionId;
-        int outboxQueued = 0;
-        int outboxDelivered = 0;
-        int outboxLoss = 0;
-        std::uint64_t lastOutboxSourceSeq = 0;
-    };
-
-    std::map<std::string, SessionInfo> sessions;
-    std::string lastAppSessionId;
-    std::string line;
-    while (std::getline(in, line)) {
-        if (line.empty()) {
-            continue;
-        }
-        json parsed = json::parse(line, nullptr, false);
-        if (parsed.is_discarded()) {
-            continue;
-        }
-
-        const std::string appSessionId = parsed.value("appSessionId", std::string());
-        if (appSessionId.empty()) {
-            continue;
-        }
-        SessionInfo& info = sessions[appSessionId];
-        info.appSessionId = appSessionId;
-        info.runtimeSessionId = parsed.value("runtimeSessionId", info.runtimeSessionId);
-        lastAppSessionId = appSessionId;
-
-        const std::string event = parsed.value("event", std::string());
-        const json details = parsed.contains("details") && parsed["details"].is_object()
-            ? parsed["details"]
-            : json::object();
-        if (event == "runtime_start") {
-            info.started = true;
-        } else if (event == "runtime_shutdown") {
-            info.cleanShutdown = true;
-        } else if (event == "bridge_outbox_queued") {
-            ++info.outboxQueued;
-            info.lastOutboxSourceSeq = std::max(info.lastOutboxSourceSeq,
-                                                details.value("sourceSeq", 0ULL));
-        } else if (event == "bridge_outbox_delivered") {
-            ++info.outboxDelivered;
-            info.lastOutboxSourceSeq = std::max(info.lastOutboxSourceSeq,
-                                                details.value("sourceSeq", 0ULL));
-        } else if (event == "bridge_outbox_loss") {
-            ++info.outboxLoss;
-            info.lastOutboxSourceSeq = std::max(info.lastOutboxSourceSeq,
-                                                details.value("droppedSourceSeq", 0ULL));
-        }
-    }
-
-    if (lastAppSessionId.empty()) {
-        return snapshot;
-    }
-
-    const auto it = sessions.find(lastAppSessionId);
-    if (it == sessions.end()) {
-        return snapshot;
-    }
-
-    snapshot.priorAppSessionId = it->second.appSessionId;
-    snapshot.priorRuntimeSessionId = it->second.runtimeSessionId;
-    snapshot.priorSessionAbnormal = it->second.started && !it->second.cleanShutdown;
-    snapshot.pendingOutboxCount = std::max(0, it->second.outboxQueued - it->second.outboxDelivered - it->second.outboxLoss);
-    snapshot.outboxLossCount = it->second.outboxLoss;
-    snapshot.lastOutboxSourceSeq = it->second.lastOutboxSourceSeq;
-    snapshot.bridgeRecoveryRequired = snapshot.pendingOutboxCount > 0 || snapshot.outboxLossCount > 0;
-    if (snapshot.priorSessionAbnormal) {
+    if (snapshot.unfinishedTraceCount > 0) {
         std::ostringstream oss;
-        oss << "Previous session ended unexpectedly";
-        if (snapshot.unfinishedTraceCount > 0) {
-            oss << " with " << snapshot.unfinishedTraceCount << " unfinished trace";
-            if (snapshot.unfinishedTraceCount != 1) {
-                oss << 's';
-            }
+        oss << snapshot.unfinishedTraceCount << " unfinished trade trace";
+        if (snapshot.unfinishedTraceCount != 1) {
+            oss << 's';
         }
         snapshot.bannerText = oss.str();
-    }
-    if (snapshot.bridgeRecoveryRequired) {
-        std::ostringstream bridge;
-        bridge << "Bridge recovery pending: " << snapshot.pendingOutboxCount << " queued intent";
-        if (snapshot.pendingOutboxCount != 1) {
-            bridge << 's';
-        }
-        if (snapshot.outboxLossCount > 0) {
-            bridge << ", " << snapshot.outboxLossCount << " loss marker";
-            if (snapshot.outboxLossCount != 1) {
-                bridge << 's';
-            }
-        }
-        if (snapshot.lastOutboxSourceSeq > 0) {
-            bridge << " (last source_seq=" << snapshot.lastOutboxSourceSeq << ")";
-        }
-        if (!snapshot.bannerText.empty()) {
-            snapshot.bannerText += ". ";
-            snapshot.bannerText += bridge.str();
-        } else {
-            snapshot.bannerText = bridge.str();
-        }
     }
     return snapshot;
 }
@@ -3941,17 +3236,14 @@ RuntimeRecoverySnapshot recoverRuntimeRecoverySnapshot(std::size_t maxTraceItems
 RuntimeRecoverySnapshot loadRuntimeRecoverySnapshotFromLogs(std::size_t maxTraceItems) {
     RuntimeRecoverySnapshot snapshot = recoverRuntimeRecoverySnapshot(maxTraceItems);
     const std::uint64_t highestTraceId = recoverHighestTraceIdFromLog(tradeTraceLogPath());
-    const std::uint64_t highestSourceSeq = recoverHighestBridgeSourceSeqFromJournal(runtimeJournalLogPath());
 
     invokeSharedDataMutation([&]() {
         SharedData& state = appState();
         std::lock_guard<std::recursive_mutex> lock(state.mutex);
         reserveTraceIdFloor(state.nextTraceId, highestTraceId);
-        reserveTraceIdFloor(state.nextBridgeSourceSeq, highestSourceSeq);
         state.startupRecoveryBanner = snapshot.bannerText;
     });
 
-    seedBridgeOutboxRecoveryState(snapshot);
     requestUiInvalidation();
     return snapshot;
 }
@@ -3960,7 +3252,6 @@ RuntimeLogDeleteResult deletePersistentRuntimeLogs() {
     RuntimeLogDeleteResult result;
 
     const std::filesystem::path tracePath = tradeTraceLogPath();
-    const std::filesystem::path journalPath = runtimeJournalLogPath();
     std::error_code ec;
 
     if (std::filesystem::exists(tracePath, ec)) {
@@ -3971,25 +3262,11 @@ RuntimeLogDeleteResult deletePersistentRuntimeLogs() {
         }
     }
 
-    ec.clear();
-    if (std::filesystem::exists(journalPath, ec)) {
-        ec.clear();
-        result.deletedRuntimeJournalLog = std::filesystem::remove(journalPath, ec);
-        if (ec && result.error.empty()) {
-            result.error = "Failed to delete " + journalPath.string() + ": " + ec.message();
-        }
-    }
-
     invokeSharedDataMutation([&]() {
         SharedData& state = appState();
         std::lock_guard<std::recursive_mutex> lock(state.mutex);
         state.startupRecoveryBanner.clear();
-        state.bridgeRecoveredPendingCount = 0;
-        state.bridgeRecoveredLossCount = 0;
-        state.bridgeRecoveredLastSourceSeq = 0;
-        state.bridgeRecoveryRequired = !state.bridgeOutbox.empty() || state.bridgeOutboxLossCount > 0;
         reserveTraceIdFloor(state.nextTraceId, runtimeSequenceSeed());
-        reserveTraceIdFloor(state.nextBridgeSourceSeq, runtimeSequenceSeed());
     });
 
     requestUiInvalidation();
@@ -4645,71 +3922,6 @@ void flushTraceMutationResult(const trading_engine::TraceMutationResult& result)
     emitMacTraceObservation(result.traceId, result.type, result.stage, result.details);
 }
 
-void enqueueBridgeLifecycleRecord(const std::string& recordType,
-                                  const std::string& source,
-                                  std::uint64_t traceId,
-                                  OrderId orderId,
-                                  long long permId,
-                                  const std::string& execId,
-                                  const std::string& note,
-                                  const std::string& symbol = {},
-                                  const std::string& side = {},
-                                  const std::string& instrumentId = {}) {
-    const auto published = ensurePublishedSharedDataSnapshot();
-
-    BridgeOutboxRecordInput bridgeRecord;
-    bridgeRecord.recordType = recordType;
-    bridgeRecord.source = source;
-    bridgeRecord.traceId = traceId;
-    bridgeRecord.orderId = orderId;
-    bridgeRecord.permId = permId;
-    bridgeRecord.execId = execId;
-    bridgeRecord.note = note;
-    bridgeRecord.symbol = symbol;
-    bridgeRecord.side = side;
-    bridgeRecord.instrumentId = instrumentId;
-
-    if ((bridgeRecord.traceId == 0 || bridgeRecord.symbol.empty() || bridgeRecord.side.empty() || bridgeRecord.permId == 0) &&
-        orderId > 0) {
-        const auto traceIdIt = published->traceIdByOrderId.find(orderId);
-        if (bridgeRecord.traceId == 0 && traceIdIt != published->traceIdByOrderId.end()) {
-            bridgeRecord.traceId = traceIdIt->second;
-        }
-    }
-
-    const auto traceIt = published->traces.find(bridgeRecord.traceId);
-    if (traceIt != published->traces.end()) {
-        if (bridgeRecord.symbol.empty()) {
-            bridgeRecord.symbol = traceIt->second.symbol;
-        }
-        if (bridgeRecord.side.empty()) {
-            bridgeRecord.side = traceIt->second.side;
-        }
-        if (bridgeRecord.permId == 0 && traceIt->second.permId > 0) {
-            bridgeRecord.permId = traceIt->second.permId;
-        }
-        if (bridgeRecord.orderId == 0 && traceIt->second.orderId > 0) {
-            bridgeRecord.orderId = traceIt->second.orderId;
-        }
-    }
-
-    if (bridgeRecord.instrumentId.empty()) {
-        if (!bridgeRecord.symbol.empty() &&
-            bridgeRecord.symbol == published->currentSymbol &&
-            !published->currentInstrumentId.empty()) {
-            bridgeRecord.instrumentId = published->currentInstrumentId;
-        } else if (!bridgeRecord.symbol.empty()) {
-            bridgeRecord.instrumentId = canonicalInstrumentIdForSymbol(bridgeRecord.symbol);
-        }
-    }
-
-    if (bridgeRecord.traceId == 0 && bridgeRecord.orderId == 0 && bridgeRecord.permId == 0 && bridgeRecord.execId.empty()) {
-        return;
-    }
-
-    enqueueBridgeOutboxRecord(bridgeRecord);
-}
-
 std::uint64_t beginTradeTrace(const SubmitIntent& intent) {
     auto result = invokeSharedDataMutation([&]() {
         return trading_engine::reduce(appState(), trading_engine::BeginTradeTraceEvent{intent});
@@ -4792,18 +4004,6 @@ void recordTraceOpenOrder(OrderId orderId, const Contract& contract, const Order
         });
     });
     flushTraceMutationResult(result);
-    if (result.traceId != 0) {
-        enqueueBridgeLifecycleRecord("open_order",
-                                     "BrokerOpenOrder",
-                                     result.traceId,
-                                     orderId,
-                                     static_cast<long long>(order.permId),
-                                     {},
-                                     result.stage + ": " + result.details,
-                                     contract.symbol,
-                                     order.action,
-                                     canonicalInstrumentIdFromContract(contract));
-    }
 }
 
 void recordTraceOrderStatus(OrderId orderId,
@@ -4820,15 +4020,6 @@ void recordTraceOrderStatus(OrderId orderId,
         });
     });
     flushTraceMutationResult(result.mutation);
-    if (result.mutation.traceId != 0) {
-        enqueueBridgeLifecycleRecord("order_status",
-                                     "BrokerOrderStatus",
-                                     result.mutation.traceId,
-                                     result.orderId,
-                                     permId,
-                                     {},
-                                     result.mutation.stage + ": " + result.mutation.details);
-    }
     if (result.appendCancelAck) {
         appendTraceEventByOrderId(result.orderId, TradeEventType::CancelAck,
                                   "Cancel", "Broker acknowledged cancellation",
@@ -4844,22 +4035,6 @@ void recordTraceExecution(const Contract& contract, const Execution& execution) 
         return trading_engine::reduce(appState(), trading_engine::TraceExecutionRecordedEvent{contract, execution});
     });
     flushTraceMutationResult(result);
-    if (result.traceId != 0) {
-        BridgeOutboxRecordInput bridgeRecord;
-        bridgeRecord.recordType = "fill_execution";
-        bridgeRecord.source = "BrokerExecution";
-        bridgeRecord.symbol = contract.symbol;
-        bridgeRecord.instrumentId = canonicalInstrumentIdFromContract(contract);
-        bridgeRecord.side = execution.side;
-        bridgeRecord.traceId = result.traceId;
-        bridgeRecord.orderId = static_cast<OrderId>(execution.orderId);
-        bridgeRecord.permId = static_cast<long long>(execution.permId);
-        bridgeRecord.execId = execution.execId;
-        bridgeRecord.price = execution.price;
-        bridgeRecord.size = DecimalFunctions::decimalToDouble(execution.shares);
-        bridgeRecord.note = "execution details observed";
-        enqueueBridgeOutboxRecord(bridgeRecord);
-    }
 }
 
 void recordTraceCommission(const CommissionReport& commissionReport) {
@@ -4867,15 +4042,6 @@ void recordTraceCommission(const CommissionReport& commissionReport) {
         return trading_engine::reduce(appState(), trading_engine::TraceCommissionRecordedEvent{commissionReport});
     });
     flushTraceMutationResult(result);
-    if (result.traceId != 0) {
-        enqueueBridgeLifecycleRecord("commission_report",
-                                     "BrokerCommission",
-                                     result.traceId,
-                                     0,
-                                     0,
-                                     commissionReport.execId,
-                                     result.stage + ": " + result.details);
-    }
 }
 
 void recordTraceError(int id, int errorCode, const std::string& errorString) {
@@ -4883,15 +4049,6 @@ void recordTraceError(int id, int errorCode, const std::string& errorString) {
         return trading_engine::reduce(appState(), trading_engine::TraceErrorRecordedEvent{id, errorCode, errorString});
     });
     flushTraceMutationResult(result.mutation);
-    if (result.mutation.traceId != 0) {
-        enqueueBridgeLifecycleRecord(errorCode == 201 ? "order_reject" : "broker_error",
-                                     "BrokerError",
-                                     result.mutation.traceId,
-                                     result.orderId,
-                                     0,
-                                     {},
-                                     result.mutation.details);
-    }
     if (result.appendCancelAck) {
         appendTraceEventByOrderId(result.orderId, TradeEventType::CancelAck,
                                   "Cancel", errorString, -1.0, -1.0, 0.0, 0, result.errorCode);
@@ -4904,13 +4061,6 @@ void recordTraceError(int id, int errorCode, const std::string& errorString) {
 void recordTraceCancelRequest(OrderId orderId) {
     appendTraceEventByOrderId(orderId, TradeEventType::CancelRequestSent,
                               "Cancel", "Cancel request sent to TWS");
-    enqueueBridgeLifecycleRecord("cancel_request",
-                                 "LocalCancel",
-                                 0,
-                                 orderId,
-                                 0,
-                                 {},
-                                 "Cancel request sent to TWS");
 }
 
 std::uint64_t findTraceIdByOrderId(OrderId orderId) {

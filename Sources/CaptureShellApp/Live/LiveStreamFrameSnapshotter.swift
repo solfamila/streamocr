@@ -34,11 +34,17 @@ final class LiveStreamFrameSnapshotter {
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
 
     func captureSnapshot(seedURL: URL) throws -> LiveStreamFrameSnapshot {
-        let resolved = try NanocosmosStreamResolver.resolve(seedURL: seedURL)
-        let sourceURL = LiveMediaCaptureCoordinator.preferredRecordingSourceURL(
-            seedURL: seedURL,
-            resolved: resolved
-        )
+        let directSourceURL = LiveMediaCaptureCoordinator.preferredRecordingSourceURL(seedURL: seedURL)
+        let sourceURL: URL
+        if NanocosmosStreamingChunkPuller.supports(sourceURL: directSourceURL) {
+            sourceURL = directSourceURL
+        } else {
+            let resolved = try NanocosmosStreamResolver.resolve(seedURL: seedURL)
+            sourceURL = LiveMediaCaptureCoordinator.preferredRecordingSourceURL(
+                seedURL: seedURL,
+                resolved: resolved
+            )
+        }
 
         guard NanocosmosStreamingChunkPuller.supports(sourceURL: sourceURL) else {
             throw LiveStreamFrameSnapshotterError.unsupportedSource(sourceURL)

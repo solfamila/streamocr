@@ -24,6 +24,16 @@ enum ROISelectionError: Error {
     }
 }
 
+struct PreparedROISelectionInput {
+    let previewCGImage: CGImage
+    let previewWidth: Int
+    let previewHeight: Int
+    let initialRect: PixelRect?
+    let contextDescription: String?
+    let outputOffsetX: Int
+    let outputOffsetY: Int
+}
+
 struct ROISelectionContext {
     let parentRect: PixelRect
     let label: String
@@ -51,7 +61,7 @@ final class ROISelector {
             throw ROISelectionError.screenshotUnavailable(display.id)
         }
 
-        let selectionInput = try makeSelectionInput(
+        let preparedInput = try Self.prepareSelectionInput(
             cgImage: cgImage,
             coordinateWidth: display.width,
             coordinateHeight: display.height,
@@ -59,8 +69,8 @@ final class ROISelector {
             context: context
         )
 
-        return try selectRect(
-            selectionInput: selectionInput,
+        return try selectPreparedRect(
+            preparedInput,
             prompt: prompt,
             displayTitle: display.title,
             maxWidth: display.width,
@@ -75,7 +85,7 @@ final class ROISelector {
         initialRect: PixelRect?,
         context: ROISelectionContext? = nil
     ) throws -> PixelRect {
-        let selectionInput = try makeSelectionInput(
+        let preparedInput = try Self.prepareSelectionInput(
             cgImage: cgImage,
             coordinateWidth: cgImage.width,
             coordinateHeight: cgImage.height,
@@ -83,12 +93,28 @@ final class ROISelector {
             context: context
         )
 
-        return try selectRect(
-            selectionInput: selectionInput,
+        return try selectPreparedRect(
+            preparedInput,
             prompt: prompt,
             displayTitle: frameTitle,
             maxWidth: cgImage.width,
             maxHeight: cgImage.height
+        )
+    }
+
+    func selectPreparedRect(
+        _ preparedInput: PreparedROISelectionInput,
+        prompt: String,
+        displayTitle: String,
+        maxWidth: Int,
+        maxHeight: Int
+    ) throws -> PixelRect {
+        try selectRect(
+            selectionInput: makeSelectionInput(from: preparedInput),
+            prompt: prompt,
+            displayTitle: displayTitle,
+            maxWidth: maxWidth,
+            maxHeight: maxHeight
         )
     }
 
@@ -139,18 +165,18 @@ final class ROISelector {
         return translatedRect.clamped(maxWidth: maxWidth, maxHeight: maxHeight) ?? translatedRect
     }
 
-    private func makeSelectionInput(
+    nonisolated static func prepareSelectionInput(
         cgImage: CGImage,
         coordinateWidth: Int,
         coordinateHeight: Int,
         initialRect: PixelRect?,
         context: ROISelectionContext?
-    ) throws -> SelectionInput {
+    ) throws -> PreparedROISelectionInput {
         guard let context else {
-            return SelectionInput(
-                image: NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height)),
-                coordinateWidth: coordinateWidth,
-                coordinateHeight: coordinateHeight,
+            return PreparedROISelectionInput(
+                previewCGImage: cgImage,
+                previewWidth: coordinateWidth,
+                previewHeight: coordinateHeight,
                 initialRect: initialRect,
                 contextDescription: nil,
                 outputOffsetX: 0,
@@ -191,17 +217,29 @@ final class ROISelector {
             ).clamped(maxWidth: clampedParent.width, maxHeight: clampedParent.height)
         }
 
-        return SelectionInput(
-            image: NSImage(
-                cgImage: nestedCGImage,
-                size: NSSize(width: clampedParent.width, height: clampedParent.height)
-            ),
-            coordinateWidth: clampedParent.width,
-            coordinateHeight: clampedParent.height,
+        return PreparedROISelectionInput(
+            previewCGImage: nestedCGImage,
+            previewWidth: clampedParent.width,
+            previewHeight: clampedParent.height,
             initialRect: nestedInitialRect,
             contextDescription: "Nested inside \(context.label): \(clampedParent.summary)",
             outputOffsetX: clampedParent.x,
             outputOffsetY: clampedParent.y
+        )
+    }
+
+    private func makeSelectionInput(from preparedInput: PreparedROISelectionInput) -> SelectionInput {
+        SelectionInput(
+            image: NSImage(
+                cgImage: preparedInput.previewCGImage,
+                size: NSSize(width: preparedInput.previewWidth, height: preparedInput.previewHeight)
+            ),
+            coordinateWidth: preparedInput.previewWidth,
+            coordinateHeight: preparedInput.previewHeight,
+            initialRect: preparedInput.initialRect,
+            contextDescription: preparedInput.contextDescription,
+            outputOffsetX: preparedInput.outputOffsetX,
+            outputOffsetY: preparedInput.outputOffsetY
         )
     }
 }

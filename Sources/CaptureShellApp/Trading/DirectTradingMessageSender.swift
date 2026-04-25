@@ -24,10 +24,10 @@ final class DirectTradingMessageSender: TradingMessageSending, @unchecked Sendab
             do {
                 switch event {
                 case "BUY":
-                    _ = try manager.submitBuy(source: "OCR", note: "OCR trigger")
+                    _ = try await manager.submitBuyAsync(source: "OCR", note: "OCR trigger")
                 case "SUBSCRIBE":
                     let symbol = try parseSubscribeSymbol(from: payload)
-                    _ = try manager.requestSubscription(symbol: symbol, recalcQtyFromFirstAsk: false)
+                    _ = try await manager.requestSubscriptionAsync(symbol: symbol, recalcQtyFromFirstAsk: false)
                 default:
                     throw TradingRuntimeManagerError.actionFailed("Unsupported direct trading event: \(event)")
                 }
