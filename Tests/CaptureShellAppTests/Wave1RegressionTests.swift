@@ -1853,8 +1853,11 @@ struct SymbolTemplateMetalMatcherTests {
         guard ProcessInfo.processInfo.environment["OCR_REAL_CROP_PARITY"] == "1" else {
             return
         }
-        let videoPath = ProcessInfo.processInfo.environment["OCR_REAL_CROP_VIDEO"]
-            ?? "/Users/foxy/Downloads/streamocr/pullback_first_2min_1080p.mp4"
+        guard let videoPath = ProcessInfo.processInfo.environment["OCR_REAL_CROP_VIDEO"],
+              !videoPath.isEmpty else {
+            #expect(Bool(false), "Set OCR_REAL_CROP_VIDEO to run OCR_REAL_CROP_PARITY=1.")
+            return
+        }
         let videoURL = URL(fileURLWithPath: videoPath)
         #expect(FileManager.default.fileExists(atPath: videoURL.path), "Missing real PLRZ video fixture at \(videoURL.path)")
         guard FileManager.default.fileExists(atPath: videoURL.path),

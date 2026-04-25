@@ -90,6 +90,9 @@ Stopping live OCR moves the GUI through a stopping/draining state until pending
 OCR trading tasks finish or time out. Stop prevents new or not-yet-submitted OCR
 actions; it cannot cancel an order after the app has already crossed into
 `submitBuyAsync`.
+Display capture uses the same OCR automation sender. Stopping capture cancels
+pending OCR actions for that capture session, drains them before reporting fully
+stopped, and starts the next capture session with a fresh sender generation.
 
 Both live and offline result JSON now include `buySignalTimings`, which lists
 each `buy_triggered` event with the media `presentationTimeSeconds` and the

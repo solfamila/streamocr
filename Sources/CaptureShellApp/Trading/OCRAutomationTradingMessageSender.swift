@@ -15,9 +15,10 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
     private let manager: TradingRuntimeManager
     private let configurationProvider: @MainActor () -> OCRAutomationTradingConfiguration
     private let lock = NSLock()
+    private var currentGeneration = 0
     private var pendingOperations = 0
-    private var isCancelled = false
-    private var cancellationReason: String?
+    private var pendingOperationsByGeneration: [Int: Int] = [:]
+    private var cancellationReasonsByGeneration: [Int: String] = [:]
 
     private let buyAvailabilityPollIntervalNanoseconds: UInt64 = 100_000_000
     private let buyAvailabilityTimeoutSeconds: TimeInterval = 2.0
@@ -32,26 +33,33 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
 
     var reportsTransportOutcomes: Bool { false }
 
+    func beginMessageSession() {
+        lock.lock()
+        currentGeneration += 1
+        cleanupCompletedCancelledGenerationsLocked()
+        lock.unlock()
+    }
+
     func send(
         _ payload: String,
         event: String,
         completion: @escaping @Sendable (Result<TradingMessageSendOutcome, any Error>) -> Void
     ) {
-        beginPendingOperation()
+        let generation = beginPendingOperation()
 
         Task { @MainActor [self] in
             let result: Result<TradingMessageSendOutcome, any Error>
 
             do {
-                if let cancellationReason = cancellationReasonSnapshot() {
+                if let cancellationReason = cancellationReasonSnapshot(for: generation) {
                     result = .failure(TradingMessageSendError.cancelled(reason: cancellationReason))
                 } else {
                     switch event {
                     case "BUY":
-                        result = .success(try await handleBuy(payload: payload))
+                        result = .success(try await handleBuy(payload: payload, generation: generation))
                     case "SUBSCRIBE":
-                        try throwIfCancelled()
-                        result = .success(try await handleSubscribe(payload: payload))
+                        try throwIfCancelled(generation: generation)
+                        result = .success(try await handleSubscribe(payload: payload, generation: generation))
                     default:
                         throw TradingRuntimeManagerError.actionFailed("Unsupported OCR automation event: \(event)")
                     }
@@ -61,7 +69,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
             }
 
             completion(result)
-            finishPendingOperation()
+            finishPendingOperation(generation: generation)
         }
     }
 
@@ -80,13 +88,12 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
 
     func cancelPendingMessages(reason: String) {
         lock.lock()
-        isCancelled = true
-        cancellationReason = reason
+        cancellationReasonsByGeneration[currentGeneration] = reason
         lock.unlock()
     }
 
     @MainActor
-    private func handleSubscribe(payload: String) async throws -> TradingMessageSendOutcome {
+    private func handleSubscribe(payload: String, generation: Int) async throws -> TradingMessageSendOutcome {
         guard
             let data = payload.data(using: .utf8),
             let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -100,13 +107,14 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
             throw TradingRuntimeManagerError.actionFailed("Invalid subscribe symbol in OCR payload.")
         }
 
+        try throwIfCancelled(generation: generation)
         _ = try await manager.requestSubscriptionAsync(symbol: normalized, recalcQtyFromFirstAsk: false)
         await manager.appendMessageAsync("OCR subscribed to \(normalized)")
         return .submitted
     }
 
     @MainActor
-    private func handleBuy(payload: String) async throws -> TradingMessageSendOutcome {
+    private func handleBuy(payload: String, generation: Int) async throws -> TradingMessageSendOutcome {
         let configuration = configurationProvider()
         let buyMessage = try TradingMessageContract.parseBuyMessage(payload)
         let quantityInput = resolvedBuyQuantity(
@@ -120,7 +128,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
             return .intentionallyIgnored(reason: "Controller trading is not armed.")
         }
 
-        try throwIfCancelled()
+        try throwIfCancelled(generation: generation)
 
         let dashboard = manager.dashboard
 
@@ -134,7 +142,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
             selectedTraceId: dashboard.inputs.selectedTraceId
         )
 
-        let preSubmitDashboard = try await awaitBuyAvailability(quantityInput: quantityInput)
+        let preSubmitDashboard = try await awaitBuyAvailability(quantityInput: quantityInput, generation: generation)
         print(armedBuyAttemptLogLine(
             snapshot: preSubmitDashboard,
             ocrQuantity: buyMessage.ocrQuantity,
@@ -161,7 +169,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
             }
         }
 
-        try throwIfCancelled()
+        try throwIfCancelled(generation: generation)
 
         do {
             _ = try await manager.submitBuyAsync(
@@ -436,7 +444,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
     }
 
     @MainActor
-    private func awaitBuyAvailability(quantityInput: Int) async throws -> TradingDashboardSnapshot {
+    private func awaitBuyAvailability(quantityInput: Int, generation: Int) async throws -> TradingDashboardSnapshot {
         manager.refreshDashboard()
         var snapshot = manager.dashboard
         if snapshot.panel.canBuy {
@@ -445,7 +453,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
 
         let deadline = Date().addingTimeInterval(buyAvailabilityTimeoutSeconds)
         while Date() < deadline {
-            try throwIfCancelled()
+            try throwIfCancelled(generation: generation)
             try await Task.sleep(nanoseconds: buyAvailabilityPollIntervalNanoseconds)
             manager.refreshDashboard()
             snapshot = manager.dashboard
@@ -484,26 +492,29 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         return pendingOperations
     }
 
-    private func cancellationReasonSnapshot() -> String? {
+    private func cancellationReasonSnapshot(for generation: Int) -> String? {
         lock.lock()
         defer { lock.unlock() }
-        return isCancelled ? (cancellationReason ?? "OCR automation session stopped.") : nil
+        return cancellationReasonsByGeneration[generation]
     }
 
     @MainActor
-    private func throwIfCancelled() throws {
-        if let cancellationReason = cancellationReasonSnapshot() {
+    private func throwIfCancelled(generation: Int) throws {
+        if let cancellationReason = cancellationReasonSnapshot(for: generation) {
             throw TradingMessageSendError.cancelled(reason: cancellationReason)
         }
     }
 
-    private func beginPendingOperation() {
+    private func beginPendingOperation() -> Int {
         lock.lock()
+        let generation = currentGeneration
         pendingOperations += 1
+        pendingOperationsByGeneration[generation, default: 0] += 1
         lock.unlock()
+        return generation
     }
 
-    private func finishPendingOperation() {
+    private func finishPendingOperation(generation: Int) {
         lock.lock()
         #if DEBUG
         precondition(pendingOperations > 0, "finishPendingOperation called with no pending operations")
@@ -511,6 +522,23 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         if pendingOperations > 0 {
             pendingOperations -= 1
         }
+        if let generationCount = pendingOperationsByGeneration[generation] {
+            let nextCount = generationCount - 1
+            if nextCount > 0 {
+                pendingOperationsByGeneration[generation] = nextCount
+            } else {
+                pendingOperationsByGeneration[generation] = nil
+            }
+        }
+        cleanupCompletedCancelledGenerationsLocked()
         lock.unlock()
+    }
+
+    private func cleanupCompletedCancelledGenerationsLocked() {
+        for generation in cancellationReasonsByGeneration.keys where
+            generation != currentGeneration &&
+            pendingOperationsByGeneration[generation, default: 0] == 0 {
+            cancellationReasonsByGeneration[generation] = nil
+        }
     }
 }

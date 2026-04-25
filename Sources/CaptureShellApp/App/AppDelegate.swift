@@ -37,7 +37,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         timingLogger: FrameTimingLogger(),
         pipeline: LowLatencyOCRFramePipeline(
             messageSender: displayCaptureMessageSender
-        )
+        ),
+        messageSender: displayCaptureMessageSender
     )
 
     private let runtimeConfigStore = RuntimeConfigStore()

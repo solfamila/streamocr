@@ -33,8 +33,9 @@ enum TradingMessageSendError: LocalizedError, Equatable, Sendable {
     }
 }
 
-protocol TradingMessageSending: AnyObject {
+protocol TradingMessageSending: AnyObject, Sendable {
     var reportsTransportOutcomes: Bool { get }
+    func beginMessageSession()
     func send(
         _ payload: String,
         event: String,
@@ -47,6 +48,8 @@ protocol TradingMessageSending: AnyObject {
 
 extension TradingMessageSending {
     var reportsTransportOutcomes: Bool { false }
+
+    func beginMessageSession() {}
 
     func send(_ payload: String, event: String) {
         send(payload, event: event) { _ in }

@@ -14,6 +14,7 @@ final class DisplayCaptureController: NSObject {
     private let permissionManager: ScreenRecordingPermissionManager
     private let timingLogger: FrameTimingLogger
     private let pipeline: any FramePipeline
+    private let messageSender: (any TradingMessageSending)?
 
     private var stream: SCStream?
     private var displayByID: [CGDirectDisplayID: SCDisplay] = [:]
@@ -26,10 +27,16 @@ final class DisplayCaptureController: NSObject {
     var onStatus: ((String) -> Void)?
     var onCaptureStateChanged: ((Bool) -> Void)?
 
-    init(permissionManager: ScreenRecordingPermissionManager, timingLogger: FrameTimingLogger, pipeline: any FramePipeline) {
+    init(
+        permissionManager: ScreenRecordingPermissionManager,
+        timingLogger: FrameTimingLogger,
+        pipeline: any FramePipeline,
+        messageSender: (any TradingMessageSending)? = nil
+    ) {
         self.permissionManager = permissionManager
         self.timingLogger = timingLogger
         self.pipeline = pipeline
+        self.messageSender = messageSender
     }
 
     @MainActor
@@ -93,6 +100,7 @@ final class DisplayCaptureController: NSObject {
 
         do {
             timingLogger.reset()
+            messageSender?.beginMessageSession()
             pipeline.reset()
 
             let filter = SCContentFilter(display: display, excludingWindows: [])
@@ -124,6 +132,9 @@ final class DisplayCaptureController: NSObject {
             return
         }
 
+        messageSender?.cancelPendingMessages(reason: "Display capture stopped before pending OCR trading actions completed.")
+        onStatus?("Stopping capture and draining pending OCR trading actions...")
+
         do {
             try await stream.stopCapture()
         } catch {
@@ -132,8 +143,9 @@ final class DisplayCaptureController: NSObject {
 
         self.stream = nil
         pipeline.reset()
+        let drained = await drainPendingMessages(timeout: 2)
         onCaptureStateChanged?(false)
-        onStatus?("Capture stopped.")
+        onStatus?(drained ? "Capture stopped." : "Capture stopped. Pending OCR trading actions did not finish before timeout.")
     }
 
 }
@@ -159,13 +171,31 @@ extension DisplayCaptureController: SCStreamDelegate {
             return
         }
         self.stream = nil
+        messageSender?.cancelPendingMessages(reason: "Display capture stream stopped before pending OCR trading actions completed.")
         pipeline.reset()
-        onCaptureStateChanged?(false)
-        onStatus?(message)
+        drainPendingMessagesAfterStop(message: message)
     }
 }
 
 private extension DisplayCaptureController {
+    @MainActor
+    func drainPendingMessages(timeout: TimeInterval) async -> Bool {
+        guard let messageSender else {
+            return true
+        }
+
+        return await Task.detached(priority: .userInitiated) {
+            messageSender.waitForPendingMessages(timeout: timeout)
+        }.value
+    }
+
+    func drainPendingMessagesAfterStop(message: String) {
+        let drained = messageSender?.waitForPendingMessages(timeout: 2) ?? true
+        let suffix = drained ? "" : " Pending OCR trading actions did not finish before timeout."
+        onCaptureStateChanged?(false)
+        onStatus?(message + suffix)
+    }
+
     func activeRuntimeConfigSnapshot() -> CaptureRuntimeConfig? {
         runtimeConfigQueue.sync {
             activeRuntimeConfig
