@@ -6,6 +6,7 @@ struct LiveOCRSessionStatusSnapshot: Equatable, Sendable {
         case off
         case connecting
         case live
+        case stopping
         case error
     }
 
@@ -69,6 +70,7 @@ final class LiveOCRSessionController: @unchecked Sendable {
 
     private var latestStatus = LiveOCRSessionStatusSnapshot.off
     private var activeSessionID: UUID?
+    private var stoppingSessionID: UUID?
     private var activeRuntimeConfig: CaptureRuntimeConfig?
     private var buyQuantityRatio = 0.5
     private var activeMessageSender: OCRAutomationTradingMessageSender?
@@ -118,6 +120,7 @@ final class LiveOCRSessionController: @unchecked Sendable {
         let sessionID = UUID()
         stateLock.lock()
         activeSessionID = sessionID
+        stoppingSessionID = nil
         stateLock.unlock()
 
         publishStatus(
@@ -139,11 +142,27 @@ final class LiveOCRSessionController: @unchecked Sendable {
 
     func stop() {
         stateLock.lock()
+        guard let sessionID = activeSessionID else {
+            stateLock.unlock()
+            return
+        }
         let messageSender = activeMessageSender
+        let currentStatus = latestStatus
         activeSessionID = nil
+        stoppingSessionID = sessionID
         stateLock.unlock()
         messageSender?.cancelPendingMessages(reason: "Live OCR stopped before pending trading actions completed.")
-        publishStatus(.off)
+        publishStatus(
+            makeStatus(
+                state: .stopping,
+                seedURLText: currentStatus.seedURLText,
+                fps: currentStatus.fps,
+                frameSize: currentStatus.frameSize,
+                firstFrameLatencySeconds: nil,
+                lastSubscribedSymbol: currentStatus.lastSubscribedSymbol,
+                messageOverride: "Stopping live OCR and draining pending trading actions..."
+            )
+        )
     }
 
     func currentStatusSnapshot() -> LiveOCRSessionStatusSnapshot {
@@ -225,11 +244,7 @@ final class LiveOCRSessionController: @unchecked Sendable {
                 print("[live-session] pending_trading_actions_did_not_flush_before_exit")
             }
 
-            stateLock.lock()
-            if activeSessionID == sessionID || activeSessionID == nil {
-                activeMessageSender = nil
-            }
-            stateLock.unlock()
+            finishSessionExit(sessionID: sessionID, messageSender: messageSender)
         }
 
         let pipeline = LowLatencyOCRFramePipeline(
@@ -670,6 +685,29 @@ final class LiveOCRSessionController: @unchecked Sendable {
         stateLock.unlock()
     }
 
+    private func finishSessionExit(sessionID: UUID, messageSender: OCRAutomationTradingMessageSender) {
+        let shouldPublishOff: Bool
+
+        stateLock.lock()
+        if activeMessageSender === messageSender {
+            activeMessageSender = nil
+        }
+        if stoppingSessionID == sessionID {
+            stoppingSessionID = nil
+            shouldPublishOff = activeSessionID == nil
+        } else if activeSessionID == sessionID {
+            activeSessionID = nil
+            shouldPublishOff = true
+        } else {
+            shouldPublishOff = false
+        }
+        stateLock.unlock()
+
+        if shouldPublishOff {
+            publishStatus(.off)
+        }
+    }
+
     private func runtimeConfigSnapshot() -> CaptureRuntimeConfig? {
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -722,6 +760,8 @@ final class LiveOCRSessionController: @unchecked Sendable {
             headline = "Live stream: Connecting"
         case .live:
             headline = "Live stream: On"
+        case .stopping:
+            headline = "Live stream: Stopping"
         case .error:
             headline = "Live stream: Error"
         }
@@ -775,6 +815,8 @@ final class LiveOCRSessionController: @unchecked Sendable {
                 parts.append("last symbol \(lastSubscribedSymbol)")
             }
             return parts.isEmpty ? "Live OCR is running." : parts.joined(separator: "  |  ")
+        case .stopping:
+            return "Stopping live OCR and draining pending trading actions..."
         case .error:
             return "The live OCR session stopped with an error."
         }

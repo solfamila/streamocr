@@ -834,13 +834,18 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
             liveStatusLabel.textColor = .systemOrange
         case .live:
             liveStatusLabel.textColor = .systemGreen
+        case .stopping:
+            liveStatusLabel.textColor = .systemOrange
         case .error:
             liveStatusLabel.textColor = .systemRed
         }
 
         liveMetricsLabel.stringValue = liveStatus.detail
         liveMetricsLabel.textColor = liveStatus.state == .error ? .systemRed : .secondaryLabelColor
-        liveStartStopButton.title = liveStatus.isRunning ? "Stop Live OCR" : "Start Live OCR"
+        liveStartStopButton.title = liveStatus.state == .stopping
+            ? "Stopping..."
+            : (liveStatus.isRunning ? "Stop Live OCR" : "Start Live OCR")
+        liveStartStopButton.isEnabled = liveStatus.state != .stopping
         liveStartStopButton.bezelColor = liveStatus.isRunning
             ? NSColor(calibratedRed: 0.70, green: 0.20, blue: 0.18, alpha: 1)
             : NSColor(calibratedRed: 0.13, green: 0.48, blue: 0.82, alpha: 1)

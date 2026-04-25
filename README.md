@@ -86,6 +86,10 @@ in the runtime, and OCR `BUY` uses the configured OCR buy ratio to size the
 order (`ocr shares * ratio`, rounded down, minimum 1 share). A live OCR `BUY`
 is only actually submitted when controller trading is armed. When disarmed, the
 signal is intentionally ignored instead of placing a delayed order later.
+Stopping live OCR moves the GUI through a stopping/draining state until pending
+OCR trading tasks finish or time out. Stop prevents new or not-yet-submitted OCR
+actions; it cannot cancel an order after the app has already crossed into
+`submitBuyAsync`.
 
 Both live and offline result JSON now include `buySignalTimings`, which lists
 each `buy_triggered` event with the media `presentationTimeSeconds` and the

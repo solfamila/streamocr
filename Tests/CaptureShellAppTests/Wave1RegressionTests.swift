@@ -1,4 +1,5 @@
 import CoreGraphics
+import CoreImage
 import CoreMedia
 import CoreVideo
 import Foundation
@@ -1747,6 +1748,10 @@ struct OCRFingerprintPolicyTests {
 }
 
 struct SymbolTemplateMetalMatcherTests {
+    private enum StopAfterEnoughRealCrops: Error {
+        case done
+    }
+
     @Test
     func metalSymbolDecoderMatchesCPUDecoderForSyntheticSymbols() throws {
         guard let matcher = SymbolTemplateMetalMatcher.make() else {
@@ -1803,6 +1808,106 @@ struct SymbolTemplateMetalMatcherTests {
 
         #expect(recognition.rawText == "PLRZ")
         #expect(recognition.confidence > 0.75)
+    }
+
+    @Test
+    func metalSymbolRecognizerMatchesCPUOnDistortedSymbolCrops() throws {
+        guard let matcher = SymbolTemplateMetalMatcher.make() else {
+            return
+        }
+        let templates = try #require(FontTemplateSet.make(targetHeight: 88, options: .symbolCell))
+        let base = try makeSymbolMask("PLRZ", templates: templates)
+        let shifted = embedMask(base, paddingX: 7, paddingY: 5, offsetX: 4, offsetY: 3)
+        let scaled = embedMask(
+            resizeMask(base, width: Int(Double(base.width) * 1.08), height: Int(Double(base.height) * 0.96)),
+            paddingX: 5,
+            paddingY: 7,
+            offsetX: 2,
+            offsetY: 4
+        )
+
+        let cases: [(String, CVPixelBuffer)] = [
+            ("shifted", try makePixelBuffer(from: shifted)),
+            ("scaled", try makePixelBuffer(from: scaled)),
+            (
+                "subthreshold-background-noise",
+                try makePixelBuffer(from: shifted, foregroundValue: 185, backgroundValue: 38, backgroundNoiseValue: 124)
+            ),
+            ("low-contrast", try makePixelBuffer(from: shifted, foregroundValue: 178, backgroundValue: 44))
+        ]
+        let cpuRecognizer = FontTemplateTextRecognizer(symbolMetalMatcher: nil)
+        let metalRecognizer = FontTemplateTextRecognizer(symbolMetalMatcher: matcher)
+
+        for (name, pixelBuffer) in cases {
+            let cpu = cpuRecognizer.recognizeText(in: pixelBuffer, region: .manualSymbolCell)
+            let metal = metalRecognizer.recognizeText(in: pixelBuffer, region: .manualSymbolCell)
+
+            #expect(cpu.rawText == "PLRZ", "CPU failed distorted symbol case \(name)")
+            #expect(metal.rawText == cpu.rawText, "Metal diverged from CPU for distorted symbol case \(name)")
+            #expect(abs(cpu.confidence - metal.confidence) < 0.15, "Metal confidence diverged for \(name)")
+        }
+    }
+
+    @Test
+    func metalSymbolRecognizerMatchesCPUOnRealPLRZVideoCropsWhenRequested() throws {
+        guard ProcessInfo.processInfo.environment["OCR_REAL_CROP_PARITY"] == "1" else {
+            return
+        }
+        let videoPath = ProcessInfo.processInfo.environment["OCR_REAL_CROP_VIDEO"]
+            ?? "/Users/foxy/Downloads/streamocr/pullback_first_2min_1080p.mp4"
+        let videoURL = URL(fileURLWithPath: videoPath)
+        #expect(FileManager.default.fileExists(atPath: videoURL.path), "Missing real PLRZ video fixture at \(videoURL.path)")
+        guard FileManager.default.fileExists(atPath: videoURL.path),
+              let matcher = SymbolTemplateMetalMatcher.make() else {
+            return
+        }
+
+        let configURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Examples/offline/runtime-config.plrz-positions.json")
+        let data = try Data(contentsOf: configURL)
+        let config = try JSONDecoder().decode(CaptureRuntimeConfig.self, from: data)
+        let preprocessor = OCRRegionPreprocessor(ciContext: CIContext(options: [.cacheIntermediates: false]))
+        let cpuRecognizer = FontTemplateTextRecognizer(symbolMetalMatcher: nil)
+        let metalRecognizer = FontTemplateTextRecognizer(symbolMetalMatcher: matcher)
+        var checkedCrops = 0
+
+        do {
+            _ = try LocalVideoFrameDecoder().decode(
+                videoURL: videoURL,
+                maximumFrameCount: 600,
+                allowsPartialDecode: true
+            ) { frame in
+                let adjusted = config.adjustedForFrameSize(width: frame.width, height: frame.height)
+                guard let roi = adjusted.manualSymbolCellROI,
+                      let crop = preprocessor.preprocess(
+                        sourcePixelBuffer: frame.pixelBuffer,
+                        roi: roi,
+                        region: .manualSymbolCell
+                      )
+                else {
+                    return
+                }
+
+                let cpu = cpuRecognizer.recognizeText(in: crop.pixelBuffer, region: .manualSymbolCell)
+                guard cpu.rawText == "PLRZ" || cpu.rawText == "PLPZ" else {
+                    return
+                }
+                let metal = metalRecognizer.recognizeText(in: crop.pixelBuffer, region: .manualSymbolCell)
+
+                #expect(metal.rawText == cpu.rawText, "Metal diverged from CPU on real PLRZ crop")
+                #expect(abs(cpu.confidence - metal.confidence) < 0.15, "Metal confidence diverged on real PLRZ crop")
+                checkedCrops += 1
+                if checkedCrops >= 12 {
+                    throw StopAfterEnoughRealCrops.done
+                }
+            }
+        } catch StopAfterEnoughRealCrops.done {
+        }
+
+        #expect(checkedCrops > 0, "No recognizable PLRZ/PLPZ symbol crops found in real video fixture.")
     }
 
     @Test
@@ -1880,7 +1985,52 @@ struct SymbolTemplateMetalMatcherTests {
         return BinaryMask(width: width, height: height, pixels: pixels)
     }
 
-    private func makePixelBuffer(from mask: BinaryMask) throws -> CVPixelBuffer {
+    private func embedMask(
+        _ mask: BinaryMask,
+        paddingX: Int,
+        paddingY: Int,
+        offsetX: Int,
+        offsetY: Int
+    ) -> BinaryMask {
+        let width = mask.width + paddingX * 2
+        let height = mask.height + paddingY * 2
+        var pixels = Array(repeating: UInt8(0), count: width * height)
+        for y in 0..<mask.height {
+            let targetY = paddingY + offsetY + y
+            guard targetY >= 0, targetY < height else {
+                continue
+            }
+            for x in 0..<mask.width where mask.pixels[y * mask.width + x] == 1 {
+                let targetX = paddingX + offsetX + x
+                guard targetX >= 0, targetX < width else {
+                    continue
+                }
+                pixels[targetY * width + targetX] = 1
+            }
+        }
+        return BinaryMask(width: width, height: height, pixels: pixels)
+    }
+
+    private func resizeMask(_ mask: BinaryMask, width: Int, height: Int) -> BinaryMask {
+        let width = max(1, width)
+        let height = max(1, height)
+        var pixels = Array(repeating: UInt8(0), count: width * height)
+        for y in 0..<height {
+            let sourceY = min(mask.height - 1, Int((Double(y) / Double(height)) * Double(mask.height)))
+            for x in 0..<width {
+                let sourceX = min(mask.width - 1, Int((Double(x) / Double(width)) * Double(mask.width)))
+                pixels[y * width + x] = mask.pixels[sourceY * mask.width + sourceX]
+            }
+        }
+        return BinaryMask(width: width, height: height, pixels: pixels)
+    }
+
+    private func makePixelBuffer(
+        from mask: BinaryMask,
+        foregroundValue: UInt8 = 255,
+        backgroundValue: UInt8 = 0,
+        backgroundNoiseValue: UInt8? = nil
+    ) throws -> CVPixelBuffer {
         var pixelBuffer: CVPixelBuffer?
         let attributes: [CFString: Any] = [
             kCVPixelBufferCGImageCompatibilityKey: true,
@@ -1906,7 +2056,15 @@ struct SymbolTemplateMetalMatcherTests {
         for y in 0..<mask.height {
             let row = pointer.advanced(by: y * bytesPerRow)
             for x in 0..<mask.width {
-                let value: UInt8 = mask.pixels[y * mask.width + x] == 1 ? 255 : 0
+                let isForeground = mask.pixels[y * mask.width + x] == 1
+                let isNoisePixel = (x + y * 3).isMultiple(of: 23)
+                let value: UInt8 = if isForeground {
+                    foregroundValue
+                } else if let backgroundNoiseValue, isNoisePixel {
+                    backgroundNoiseValue
+                } else {
+                    backgroundValue
+                }
                 row[x * 4] = value
                 row[x * 4 + 1] = value
                 row[x * 4 + 2] = value
