@@ -86,6 +86,15 @@ in the runtime, and OCR `BUY` uses the configured OCR buy ratio to size the
 order (`ocr shares * ratio`, rounded down, minimum 1 share). A live OCR `BUY`
 is only actually submitted when controller trading is armed. When disarmed, the
 signal is intentionally ignored instead of placing a delayed order later.
+After a submitted OCR `BUY`, the numeric position cell is tracked as an
+open-position high-water mark. Rising or flat OCR quantities are ignored; the
+first safe numeric decrease emits `sell_triggered` and routes a close-long
+`SELL` through the runtime. Ambiguous position reads such as unsafe `5`/`6`
+near-ties are rejected as `?`, so they do not size BUY orders, rearm BUY, or
+trigger SELL.
+SELL detection also requires a minimum numeric OCR confidence and ignores
+implausible dropped-digit decreases, such as a five-digit position briefly
+reading as a much smaller four-digit number.
 Stopping live OCR moves the GUI through a stopping/draining state until pending
 OCR trading tasks finish or time out. Stop prevents new or not-yet-submitted OCR
 actions; it cannot cancel an order after the app has already crossed into

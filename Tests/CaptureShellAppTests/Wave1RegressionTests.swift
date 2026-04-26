@@ -17,6 +17,15 @@ struct TradingMessageContractTests {
     }
 
     @Test
+    func sellMessageMatchesContract() {
+        let payload = TradingMessageContract.sellMessage(ocrQuantity: 25000, previousOCRQuantity: 30000)
+        #expect(payload == #"{"action":"SELL","ocrQuantity":25000,"previousOCRQuantity":30000}"#)
+
+        let parsed = try? TradingMessageContract.parseSellMessage(payload)
+        #expect(parsed == OCRSellMessage(ocrQuantity: 25000, previousOCRQuantity: 30000))
+    }
+
+    @Test
     func subscribeMessageTrimsAndUppercasesSymbol() {
         #expect(
             TradingMessageContract.subscribeMessage(symbol: "  msft\n") == #"{"subscribe":"MSFT"}"#
@@ -458,6 +467,37 @@ struct OCRNormalizationPolicyTests {
     func manualCellIntegerParserAcceptsSingleAmbiguousDigitInsideNumericToken() {
         #expect(ManualCellIntegerPolicy.parseInteger("16A74") == 16474)
     }
+
+    @Test
+    func manualCellIntegerParserRejectsAmbiguousSentinel() {
+        #expect(ManualCellIntegerPolicy.parseInteger("?") == nil)
+    }
+}
+
+struct FontTemplateMatcherSafetyTests {
+    @Test
+    func unsafeFiveSixNearTieIsRejectedForManualCellReads() {
+        let decoded = FontTemplateMatcher.Decoded(
+            characters: ["6"],
+            perGlyphConfidences: [0.82],
+            perGlyphRunnerUpCharacters: ["5"],
+            perGlyphConfidenceMargins: [0.01]
+        )
+
+        #expect(decoded.hasUnsafeConfusableGlyph(minimumMargin: 0.035))
+    }
+
+    @Test
+    func clearFiveSixWinnerIsAllowedForManualCellReads() {
+        let decoded = FontTemplateMatcher.Decoded(
+            characters: ["6"],
+            perGlyphConfidences: [0.82],
+            perGlyphRunnerUpCharacters: ["5"],
+            perGlyphConfidenceMargins: [0.08]
+        )
+
+        #expect(!decoded.hasUnsafeConfusableGlyph(minimumMargin: 0.035))
+    }
 }
 
 struct TradingTriggerStateMachineTests {
@@ -541,6 +581,145 @@ struct TradingTriggerStateMachineTests {
 
         let thirdBlank = stateMachine.evaluateManualCell(normalizedText: "")
         #expect(thirdBlank.isArmedAfter)
+    }
+
+    @Test
+    func manualCellAmbiguousReadDoesNotRearmCommittedBuy() {
+        let stateMachine = TradingTriggerStateMachine(
+            manualCellRearmConfirmationFrames: 3,
+            manualCellTriggerConfirmationFrames: 1
+        )
+
+        let firstTrigger = stateMachine.evaluateManualCell(normalizedText: "11")
+        #expect(firstTrigger.shouldTriggerBuy)
+        stateMachine.commitManualCellTriggerSuccess()
+
+        let firstAmbiguous = stateMachine.evaluateManualCell(normalizedText: "?")
+        #expect(!firstAmbiguous.isZeroOrEmpty)
+        #expect(!firstAmbiguous.isArmedAfter)
+
+        let secondAmbiguous = stateMachine.evaluateManualCell(normalizedText: "?")
+        #expect(!secondAmbiguous.isZeroOrEmpty)
+        #expect(!secondAmbiguous.isArmedAfter)
+
+        let thirdAmbiguous = stateMachine.evaluateManualCell(normalizedText: "?")
+        #expect(!thirdAmbiguous.isZeroOrEmpty)
+        #expect(!thirdAmbiguous.isArmedAfter)
+
+        let laterNonzero = stateMachine.evaluateManualCell(normalizedText: "22")
+        #expect(!laterNonzero.shouldTriggerBuy)
+        #expect(!laterNonzero.isArmedAfter)
+    }
+
+    @Test
+    func manualCellTriggersSellWhenOpenPositionStartsDecreasing() {
+        let stateMachine = TradingTriggerStateMachine(
+            manualCellRearmConfirmationFrames: 3,
+            manualCellTriggerConfirmationFrames: 1
+        )
+
+        let buy = stateMachine.evaluateManualCell(normalizedText: "10000")
+        #expect(buy.shouldTriggerBuy)
+        stateMachine.commitManualCellTriggerSuccess(openPositionIntegerValue: buy.integerValue)
+
+        let growth = stateMachine.evaluateManualCell(normalizedText: "29672")
+        #expect(!growth.shouldTriggerSell)
+        #expect(growth.openPositionPeakValue == 10000)
+
+        let firstDecrease = stateMachine.evaluateManualCell(normalizedText: "25950")
+        #expect(firstDecrease.shouldTriggerSell)
+        #expect(firstDecrease.openPositionPeakValue == 29672)
+
+        stateMachine.commitManualCellSellSuccess()
+        let lowerAgain = stateMachine.evaluateManualCell(normalizedText: "20000")
+        #expect(!lowerAgain.shouldTriggerSell)
+        #expect(!lowerAgain.shouldTriggerBuy)
+    }
+
+    @Test
+    func manualCellAmbiguousReadDoesNotTriggerSellFromOpenPosition() {
+        let stateMachine = TradingTriggerStateMachine(
+            manualCellRearmConfirmationFrames: 3,
+            manualCellTriggerConfirmationFrames: 1
+        )
+
+        let buy = stateMachine.evaluateManualCell(normalizedText: "10000")
+        #expect(buy.shouldTriggerBuy)
+        stateMachine.commitManualCellTriggerSuccess(openPositionIntegerValue: buy.integerValue)
+
+        let growth = stateMachine.evaluateManualCell(normalizedText: "29672")
+        #expect(!growth.shouldTriggerSell)
+
+        let ambiguous = stateMachine.evaluateManualCell(normalizedText: "?")
+        #expect(!ambiguous.shouldTriggerSell)
+        #expect(!ambiguous.isZeroOrEmpty)
+        #expect(!ambiguous.isArmedAfter)
+
+        let nextSafeGrowth = stateMachine.evaluateManualCell(normalizedText: "30000")
+        #expect(!nextSafeGrowth.shouldTriggerSell)
+
+        let firstSafeDecrease = stateMachine.evaluateManualCell(normalizedText: "29999")
+        #expect(firstSafeDecrease.shouldTriggerSell)
+        #expect(firstSafeDecrease.openPositionPeakValue == 30000)
+    }
+
+    @Test
+    func manualCellLowConfidenceDecreaseDoesNotTriggerSell() {
+        let stateMachine = TradingTriggerStateMachine(
+            manualCellRearmConfirmationFrames: 3,
+            manualCellTriggerConfirmationFrames: 1
+        )
+
+        let buy = stateMachine.evaluateManualCell(normalizedText: "10000", confidence: 0.9)
+        #expect(buy.shouldTriggerBuy)
+        stateMachine.commitManualCellTriggerSuccess(openPositionIntegerValue: buy.integerValue)
+
+        let growth = stateMachine.evaluateManualCell(normalizedText: "29672", confidence: 0.9)
+        #expect(!growth.shouldTriggerSell)
+
+        let lowConfidenceDecrease = stateMachine.evaluateManualCell(normalizedText: "28842", confidence: 0.4)
+        #expect(!lowConfidenceDecrease.shouldTriggerSell)
+
+        let safeDecrease = stateMachine.evaluateManualCell(normalizedText: "28842", confidence: 0.8)
+        #expect(safeDecrease.shouldTriggerSell)
+    }
+
+    @Test
+    func manualCellDroppedDigitDecreaseDoesNotTriggerSell() {
+        let stateMachine = TradingTriggerStateMachine(
+            manualCellRearmConfirmationFrames: 3,
+            manualCellTriggerConfirmationFrames: 1
+        )
+
+        let buy = stateMachine.evaluateManualCell(normalizedText: "10000", confidence: 0.9)
+        #expect(buy.shouldTriggerBuy)
+        stateMachine.commitManualCellTriggerSuccess(openPositionIntegerValue: buy.integerValue)
+
+        let growth = stateMachine.evaluateManualCell(normalizedText: "29672", confidence: 0.9)
+        #expect(!growth.shouldTriggerSell)
+
+        let droppedDigit = stateMachine.evaluateManualCell(normalizedText: "2947", confidence: 0.9)
+        #expect(!droppedDigit.shouldTriggerSell)
+
+        let safeDecrease = stateMachine.evaluateManualCell(normalizedText: "28842", confidence: 0.8)
+        #expect(safeDecrease.shouldTriggerSell)
+    }
+
+    @Test
+    func manualCellDirectDropToZeroTriggersSellBeforeRearm() {
+        let stateMachine = TradingTriggerStateMachine(
+            manualCellRearmConfirmationFrames: 3,
+            manualCellTriggerConfirmationFrames: 1
+        )
+
+        let buy = stateMachine.evaluateManualCell(normalizedText: "10000")
+        #expect(buy.shouldTriggerBuy)
+        stateMachine.commitManualCellTriggerSuccess(openPositionIntegerValue: buy.integerValue)
+
+        let zero = stateMachine.evaluateManualCell(normalizedText: "0")
+        #expect(zero.shouldTriggerSell)
+        #expect(zero.isZeroOrEmpty)
+        #expect(!zero.isArmedAfter)
     }
 
     @Test
@@ -848,6 +1027,121 @@ struct TriggerPipelineVerificationHarnessTests {
 
         sender.succeedNext()
         #expect(eventCollector.events.map(\.action) == ["buy_triggered", "buy_transport_failed", "buy_triggered", "buy_transport_succeeded"])
+    }
+
+    @Test
+    func sellTriggersWhenPositionDecreasesAfterCommittedBuy() {
+        let sender = ControlledTransportMessageSender()
+        let eventCollector = CapturingPipelineEventHandler()
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 3,
+            manualCellTriggerConfirmationFrames: 1,
+            messageSender: sender,
+            beep: {},
+            eventHandler: eventCollector.handle(_:)
+        )
+
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "10000", normalizedText: "10000", confidence: 0.9)
+        sender.succeedNext()
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "30000", normalizedText: "30000", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "25950", normalizedText: "25950", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "25950", normalizedText: "25950", confidence: 0.9)
+
+        #expect(
+            sender.messages == [
+                TradingMessageContract.buyMessage(ocrQuantity: 10000),
+                TradingMessageContract.sellMessage(ocrQuantity: 25950, previousOCRQuantity: 30000)
+            ]
+        )
+        #expect(
+            eventCollector.events.map(\.action) == [
+                "buy_triggered",
+                "buy_transport_succeeded",
+                "sell_triggered"
+            ]
+        )
+
+        sender.succeedNext()
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "20000", normalizedText: "20000", confidence: 0.9)
+        #expect(
+            eventCollector.events.map(\.action) == [
+                "buy_triggered",
+                "buy_transport_succeeded",
+                "sell_triggered",
+                "sell_transport_succeeded"
+            ]
+        )
+    }
+
+    @Test
+    func sellIgnoresDroppedDigitDecreaseAndWaitsForSafeDecrease() {
+        let sender = ControlledTransportMessageSender()
+        let eventCollector = CapturingPipelineEventHandler()
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 3,
+            manualCellTriggerConfirmationFrames: 1,
+            messageSender: sender,
+            beep: {},
+            eventHandler: eventCollector.handle(_:)
+        )
+
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "10000", normalizedText: "10000", confidence: 0.9)
+        sender.succeedNext()
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "29672", normalizedText: "29672", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "2947", normalizedText: "2947", confidence: 0.9)
+        #expect(sender.messages == [TradingMessageContract.buyMessage(ocrQuantity: 10000)])
+
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "28842", normalizedText: "28842", confidence: 0.8)
+        #expect(
+            sender.messages == [
+                TradingMessageContract.buyMessage(ocrQuantity: 10000),
+                TradingMessageContract.sellMessage(ocrQuantity: 28842, previousOCRQuantity: 29672)
+            ]
+        )
+        #expect(
+            eventCollector.events.map(\.action) == [
+                "buy_triggered",
+                "buy_transport_succeeded",
+                "sell_triggered"
+            ]
+        )
+    }
+
+    @Test
+    func sellTransportFailureLeavesSellRetryable() {
+        let sender = ControlledTransportMessageSender()
+        let eventCollector = CapturingPipelineEventHandler()
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 3,
+            manualCellTriggerConfirmationFrames: 1,
+            messageSender: sender,
+            beep: {},
+            eventHandler: eventCollector.handle(_:)
+        )
+
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "10000", normalizedText: "10000", confidence: 0.9)
+        sender.succeedNext()
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "30000", normalizedText: "30000", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "25950", normalizedText: "25950", confidence: 0.9)
+        sender.failNext()
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "25950", normalizedText: "25950", confidence: 0.9)
+
+        #expect(
+            sender.messages == [
+                TradingMessageContract.buyMessage(ocrQuantity: 10000),
+                TradingMessageContract.sellMessage(ocrQuantity: 25950, previousOCRQuantity: 30000),
+                TradingMessageContract.sellMessage(ocrQuantity: 25950, previousOCRQuantity: 30000)
+            ]
+        )
+        #expect(
+            eventCollector.events.map(\.action) == [
+                "buy_triggered",
+                "buy_transport_succeeded",
+                "sell_triggered",
+                "sell_transport_failed",
+                "sell_triggered"
+            ]
+        )
     }
 
     @Test

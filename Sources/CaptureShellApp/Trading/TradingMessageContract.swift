@@ -3,6 +3,7 @@ import Foundation
 enum TradingMessageContractError: Error, LocalizedError {
     case invalidSymbol(String)
     case invalidBuyPayload
+    case invalidSellPayload
 
     var errorDescription: String? {
         switch self {
@@ -10,6 +11,8 @@ enum TradingMessageContractError: Error, LocalizedError {
             "Refusing to build subscribe payload from invalid symbol input: \(symbol)"
         case .invalidBuyPayload:
             "Refusing to use an invalid OCR buy payload."
+        case .invalidSellPayload:
+            "Refusing to use an invalid OCR sell payload."
         }
     }
 }
@@ -28,12 +31,28 @@ struct OCRBuyMessage: Equatable, Sendable {
     let ocrQuantity: Int?
 }
 
+struct OCRSellMessage: Equatable, Sendable {
+    let ocrQuantity: Int?
+    let previousOCRQuantity: Int?
+}
+
 enum TradingMessageContract {
     static func buyMessage(ocrQuantity: Int?) -> String {
         guard let ocrQuantity else {
             return #"{"action":"BUY"}"#
         }
         return #"{"action":"BUY","ocrQuantity":\#(ocrQuantity)}"#
+    }
+
+    static func sellMessage(ocrQuantity: Int?, previousOCRQuantity: Int?) -> String {
+        var fields = [#""action":"SELL""#]
+        if let ocrQuantity {
+            fields.append(#""ocrQuantity":\#(ocrQuantity)"#)
+        }
+        if let previousOCRQuantity {
+            fields.append(#""previousOCRQuantity":\#(previousOCRQuantity)"#)
+        }
+        return "{\(fields.joined(separator: ","))}"
     }
 
     static func normalizeSymbol(_ symbol: String) -> String {
@@ -118,6 +137,45 @@ enum TradingMessageContract {
         }
 
         return OCRBuyMessage(ocrQuantity: ocrQuantity)
+    }
+
+    static func parseSellMessage(_ payload: String) throws -> OCRSellMessage {
+        guard let data = payload.data(using: .utf8) else {
+            throw TradingMessageContractError.invalidSellPayload
+        }
+
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw TradingMessageContractError.invalidSellPayload
+        }
+
+        guard object["action"] as? String == "SELL" else {
+            throw TradingMessageContractError.invalidSellPayload
+        }
+
+        return OCRSellMessage(
+            ocrQuantity: try optionalIntegerField("ocrQuantity", in: object),
+            previousOCRQuantity: try optionalIntegerField("previousOCRQuantity", in: object)
+        )
+    }
+
+    private static func optionalIntegerField(_ key: String, in object: [String: Any]) throws -> Int? {
+        guard let rawValue = object[key] else {
+            return nil
+        }
+
+        if let integerValue = rawValue as? Int {
+            return integerValue
+        }
+
+        if let integer64Value = rawValue as? Int64 {
+            return Int(integer64Value)
+        }
+
+        if let numberValue = rawValue as? NSNumber {
+            return numberValue.intValue
+        }
+
+        throw TradingMessageContractError.invalidSellPayload
     }
 
     private static func asciiUppercaseLetter(_ character: Character) -> Character? {

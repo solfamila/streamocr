@@ -102,12 +102,14 @@ enum ManualCellIntegerPolicy {
 struct ManualCellTriggerEvaluation {
     let normalizedText: String
     let integerValue: Int?
+    let openPositionPeakValue: Int?
     let isZeroOrEmpty: Bool
     let isDuplicate: Bool
     let isAwaitingConfirmation: Bool
     let confirmationProgress: Int
     let requiredConfirmationCount: Int
     let shouldTriggerBuy: Bool
+    let shouldTriggerSell: Bool
     let shouldBeep: Bool
     let wasArmed: Bool
     let isArmedAfter: Bool
@@ -127,12 +129,15 @@ struct ManualSymbolTriggerEvaluation {
 final class TradingTriggerStateMachine {
     private let manualCellRearmConfirmationFrames: Int
     private let manualCellTriggerConfirmationFrames: Int
+    private let manualCellSellMinimumConfidence: Double
     private let manualSymbolTriggerConfirmationFrames: Int
     private let manualSymbolChangedSymbolMinimumConfidence: Double
     private var manualCellIsArmed = true
     private var manualCellZeroLikeStreak = 0
     private var pendingManualCellIntegerValue: Int?
     private var pendingManualCellConfirmationCount = 0
+    private var manualCellOpenPositionPeakValue: Int?
+    private var manualCellSellWasTriggered = false
     private var lastManualCellText: String?
     private var lastCommittedManualSymbol: String?
     private var pendingManualSymbol: String?
@@ -142,11 +147,13 @@ final class TradingTriggerStateMachine {
     init(
         manualCellRearmConfirmationFrames: Int = 1,
         manualCellTriggerConfirmationFrames: Int = 1,
+        manualCellSellMinimumConfidence: Double = 0.70,
         manualSymbolTriggerConfirmationFrames: Int = 1,
         manualSymbolChangedSymbolMinimumConfidence: Double = 0.80
     ) {
         self.manualCellRearmConfirmationFrames = max(1, manualCellRearmConfirmationFrames)
         self.manualCellTriggerConfirmationFrames = max(1, manualCellTriggerConfirmationFrames)
+        self.manualCellSellMinimumConfidence = min(max(0, manualCellSellMinimumConfidence), 1)
         self.manualSymbolTriggerConfirmationFrames = max(1, manualSymbolTriggerConfirmationFrames)
         self.manualSymbolChangedSymbolMinimumConfidence = min(
             max(0, manualSymbolChangedSymbolMinimumConfidence),
@@ -159,6 +166,8 @@ final class TradingTriggerStateMachine {
         manualCellZeroLikeStreak = 0
         pendingManualCellIntegerValue = nil
         pendingManualCellConfirmationCount = 0
+        manualCellOpenPositionPeakValue = nil
+        manualCellSellWasTriggered = false
         lastManualCellText = nil
         lastCommittedManualSymbol = nil
         pendingManualSymbol = nil
@@ -173,11 +182,27 @@ final class TradingTriggerStateMachine {
         manualSymbolChangeIsArmed = true
     }
 
-    func evaluateManualCell(normalizedText: String) -> ManualCellTriggerEvaluation {
+    func evaluateManualCell(normalizedText: String, confidence: Double = 1.0) -> ManualCellTriggerEvaluation {
         let integerValue = ManualCellIntegerPolicy.parseInteger(normalizedText)
         let isZeroOrEmpty = normalizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || integerValue == 0
         let isDuplicate = normalizedText == lastManualCellText
         let wasArmed = manualCellIsArmed
+        let openPositionPeakBeforeUpdate = manualCellOpenPositionPeakValue
+        var shouldTriggerSell = false
+
+        if let integerValue, let openPositionPeakBeforeUpdate, !manualCellSellWasTriggered {
+            if integerValue > openPositionPeakBeforeUpdate {
+                manualCellOpenPositionPeakValue = integerValue
+            } else if integerValue < openPositionPeakBeforeUpdate,
+                      isSafeSellDecrease(
+                        currentValue: integerValue,
+                        peakValue: openPositionPeakBeforeUpdate,
+                        confidence: confidence
+                      ) {
+                shouldTriggerSell = true
+            }
+        }
+
         if isZeroOrEmpty {
             manualCellZeroLikeStreak += 1
         } else {
@@ -218,6 +243,8 @@ final class TradingTriggerStateMachine {
             if !wasArmed {
                 manualSymbolChangeIsArmed = true
             }
+            manualCellOpenPositionPeakValue = nil
+            manualCellSellWasTriggered = false
         }
 
         if !isDuplicate {
@@ -227,6 +254,7 @@ final class TradingTriggerStateMachine {
         return ManualCellTriggerEvaluation(
             normalizedText: normalizedText,
             integerValue: integerValue,
+            openPositionPeakValue: openPositionPeakBeforeUpdate,
             isZeroOrEmpty: isZeroOrEmpty,
             isDuplicate: isDuplicate,
             isAwaitingConfirmation:
@@ -234,10 +262,12 @@ final class TradingTriggerStateMachine {
                 integerValue != nil &&
                 !isZeroOrEmpty &&
                 !shouldTriggerBuy &&
+                !shouldTriggerSell &&
                 confirmationProgress > 0,
             confirmationProgress: confirmationProgress,
             requiredConfirmationCount: manualCellTriggerConfirmationFrames,
             shouldTriggerBuy: shouldTriggerBuy,
+            shouldTriggerSell: shouldTriggerSell,
             shouldBeep: !isDuplicate,
             wasArmed: wasArmed,
             isArmedAfter: manualCellIsArmed
@@ -295,10 +325,43 @@ final class TradingTriggerStateMachine {
         )
     }
 
-    func commitManualCellTriggerSuccess() {
+    func commitManualCellTriggerSuccess(openPositionIntegerValue: Int? = nil) {
         manualCellIsArmed = false
         pendingManualCellIntegerValue = nil
         pendingManualCellConfirmationCount = 0
+        if let openPositionIntegerValue, openPositionIntegerValue > 0 {
+            manualCellOpenPositionPeakValue = openPositionIntegerValue
+            manualCellSellWasTriggered = false
+        } else {
+            manualCellOpenPositionPeakValue = nil
+            manualCellSellWasTriggered = false
+        }
+    }
+
+    func commitManualCellSellSuccess() {
+        manualCellOpenPositionPeakValue = nil
+        manualCellSellWasTriggered = true
+    }
+
+    private func isSafeSellDecrease(currentValue: Int, peakValue: Int, confidence: Double) -> Bool {
+        guard confidence >= manualCellSellMinimumConfidence else {
+            return false
+        }
+
+        if currentValue == 0 {
+            return true
+        }
+
+        let currentDigitCount = digitCount(currentValue)
+        let peakDigitCount = digitCount(peakValue)
+        let looksLikeDroppedDigit =
+            currentDigitCount < peakDigitCount &&
+            Double(currentValue) < Double(peakValue) * 0.5
+        return !looksLikeDroppedDigit
+    }
+
+    private func digitCount(_ value: Int) -> Int {
+        String(abs(value)).count
     }
 
     func commitManualSymbolTriggerSuccess(symbol: String) {

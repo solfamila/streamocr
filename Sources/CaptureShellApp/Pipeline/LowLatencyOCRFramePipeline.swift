@@ -694,13 +694,17 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         shouldLogEvaluation: Bool
     ) {
         let triggerEvaluationStart = CFAbsoluteTimeGetCurrent()
-        let evaluation = triggerStateMachine.evaluateManualCell(normalizedText: recognition.normalizedText)
+        let evaluation = triggerStateMachine.evaluateManualCell(
+            normalizedText: recognition.normalizedText,
+            confidence: recognition.confidence
+        )
         triggerDispatcher.invalidatePendingBuyIfNeeded(evaluation: evaluation)
+        triggerDispatcher.invalidatePendingSellAfterManualCellRearm(evaluation)
         triggerDispatcher.invalidatePendingSubscribeAfterManualCellRearm(evaluation)
         let triggerEvaluationMilliseconds = elapsedMilliseconds(since: triggerEvaluationStart)
-        let buyDecisionStart = CFAbsoluteTimeGetCurrent()
-        let dispatchDecision = triggerDispatcher.buyDispatchDecision(for: evaluation)
-        let buyDecisionMilliseconds = elapsedMilliseconds(since: buyDecisionStart)
+        let decisionStart = CFAbsoluteTimeGetCurrent()
+        let dispatchDecision = triggerDispatcher.manualCellDispatchDecision(for: evaluation)
+        let decisionMilliseconds = elapsedMilliseconds(since: decisionStart)
 
         if dispatchDecision.shouldDispatchTrigger {
             let triggerEvent = OCRPipelineEvent(
@@ -718,13 +722,27 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
                 presentationTimeSeconds: timings?.presentationTimeSeconds
             )
             eventHandler?(triggerEvent)
-            triggerDispatcher.dispatchBuy(
-                triggerEvent: triggerEvent,
-                integerValue: evaluation.integerValue,
-                timings: timings,
-                triggerEvaluationMilliseconds: triggerEvaluationMilliseconds,
-                buyDecisionMilliseconds: buyDecisionMilliseconds
-            )
+            switch dispatchDecision.event {
+            case .some(.buy):
+                triggerDispatcher.dispatchBuy(
+                    triggerEvent: triggerEvent,
+                    integerValue: evaluation.integerValue,
+                    timings: timings,
+                    triggerEvaluationMilliseconds: triggerEvaluationMilliseconds,
+                    buyDecisionMilliseconds: decisionMilliseconds
+                )
+            case .some(.sell):
+                triggerDispatcher.dispatchSell(
+                    triggerEvent: triggerEvent,
+                    integerValue: evaluation.integerValue,
+                    openPositionPeakValue: evaluation.openPositionPeakValue,
+                    timings: timings,
+                    triggerEvaluationMilliseconds: triggerEvaluationMilliseconds,
+                    decisionMilliseconds: decisionMilliseconds
+                )
+            case .some(.subscribe), .none:
+                break
+            }
         }
 
         if dispatchDecision.shouldDispatchTrigger || evaluation.shouldBeep {
@@ -736,6 +754,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
                 "[trigger] frame=\(frameNumber) region=\(OCRRegionKind.manualCell.rawValue) action=\(dispatchDecision.action) " +
                     "raw_text=\"\(escapedForLog(recognition.rawText))\" normalized_text=\"\(escapedForLog(evaluation.normalizedText))\" " +
                     "confidence=\(format(recognition.confidence, precision: 3)) parsed_int=\(evaluation.integerValue.map(String.init) ?? "nil") " +
+                    "open_peak=\(evaluation.openPositionPeakValue.map(String.init) ?? "nil") " +
                     "confirmation=\(evaluation.confirmationProgress)/\(evaluation.requiredConfirmationCount) " +
                     "zero_or_empty=\(evaluation.isZeroOrEmpty) duplicate=\(evaluation.isDuplicate) " +
                     "armed_before=\(evaluation.wasArmed) armed_after=\(evaluation.isArmedAfter)"

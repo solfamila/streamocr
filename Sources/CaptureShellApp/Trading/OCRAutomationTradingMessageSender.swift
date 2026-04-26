@@ -6,7 +6,7 @@ struct OCRAutomationTradingConfiguration: Sendable {
     let controllerArmed: Bool
 }
 
-private enum BuyRejectionDisposition {
+private enum OCRActionRejectionDisposition {
     case intentionallyIgnored(String)
     case retryable(String)
 }
@@ -57,6 +57,8 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
                     switch event {
                     case "BUY":
                         result = .success(try await handleBuy(payload: payload, generation: generation))
+                    case "SELL":
+                        result = .success(try await handleSell(payload: payload, generation: generation))
                     case "SUBSCRIBE":
                         try throwIfCancelled(generation: generation)
                         result = .success(try await handleSubscribe(payload: payload, generation: generation))
@@ -110,6 +112,72 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         try throwIfCancelled(generation: generation)
         _ = try await manager.requestSubscriptionAsync(symbol: normalized, recalcQtyFromFirstAsk: false)
         await manager.appendMessageAsync("OCR subscribed to \(normalized)")
+        return .submitted
+    }
+
+    @MainActor
+    private func handleSell(payload: String, generation: Int) async throws -> TradingMessageSendOutcome {
+        let sellMessage = try TradingMessageContract.parseSellMessage(payload)
+        try throwIfCancelled(generation: generation)
+
+        let preSubmitDashboard = try await awaitSellAvailability(generation: generation)
+        print(armedSellAttemptLogLine(snapshot: preSubmitDashboard, sellMessage: sellMessage))
+
+        if let disposition = sellRejectionDisposition(snapshot: preSubmitDashboard) {
+            let reason = rejectionReason(for: disposition)
+            let rejectionLine = rejectedSellLogLine(
+                reason: reason,
+                snapshot: preSubmitDashboard,
+                sellMessage: sellMessage
+            )
+            print(rejectionLine)
+            await manager.appendMessageAsync("OCR sell rejected: \(reason)")
+            switch disposition {
+            case .intentionallyIgnored:
+                return .intentionallyIgnored(reason: reason)
+            case .retryable:
+                throw TradingMessageSendError.retryableRejection(reason: reason)
+            }
+        }
+
+        try throwIfCancelled(generation: generation)
+
+        do {
+            _ = try await manager.submitCloseAsync(
+                source: "OCR",
+                note: sellNote(sellMessage: sellMessage)
+            )
+        } catch {
+            let postFailureDashboard = manager.dashboard
+            if let disposition = classifiedSellRejection(error: error, snapshot: postFailureDashboard) {
+                let consumedReason = rejectionReason(for: disposition)
+                let rejectionLine = rejectedSellLogLine(
+                    reason: consumedReason,
+                    snapshot: postFailureDashboard,
+                    sellMessage: sellMessage
+                )
+                print(rejectionLine)
+                await manager.appendMessageAsync("OCR sell rejected: \(consumedReason)")
+                switch disposition {
+                case .intentionallyIgnored:
+                    return .intentionallyIgnored(reason: consumedReason)
+                case .retryable:
+                    throw TradingMessageSendError.retryableRejection(reason: consumedReason)
+                }
+            }
+
+            let failureLine = failedSellLogLine(
+                error: error,
+                snapshot: postFailureDashboard,
+                sellMessage: sellMessage
+            )
+            print(failureLine)
+            await manager.appendMessageAsync("OCR sell rejected: \(error.localizedDescription)")
+            throw error
+        }
+
+        print(submittedSellLogLine(snapshot: manager.dashboard, sellMessage: sellMessage))
+        await manager.appendMessageAsync(submittedSellMessage(sellMessage: sellMessage))
         return .submitted
     }
 
@@ -349,10 +417,78 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         )
     }
 
+    private func armedSellAttemptLogLine(
+        snapshot: TradingDashboardSnapshot,
+        sellMessage: OCRSellMessage
+    ) -> String {
+        "OCR sell signal armed: \(sellSignalSummary(sellMessage)); \(sellGateDiagnostic(snapshot: snapshot))"
+    }
+
+    private func submittedSellLogLine(
+        snapshot: TradingDashboardSnapshot,
+        sellMessage: OCRSellMessage
+    ) -> String {
+        "OCR sell signal submitted: \(sellSignalSummary(sellMessage)); \(sellGateDiagnostic(snapshot: snapshot))"
+    }
+
+    private func rejectedSellLogLine(
+        reason: String,
+        snapshot: TradingDashboardSnapshot,
+        sellMessage: OCRSellMessage
+    ) -> String {
+        "OCR sell signal rejected: \(sellSignalSummary(sellMessage)); reason=\(reason); \(sellGateDiagnostic(snapshot: snapshot))"
+    }
+
+    private func failedSellLogLine(
+        error: any Error,
+        snapshot: TradingDashboardSnapshot,
+        sellMessage: OCRSellMessage
+    ) -> String {
+        "OCR sell signal failed: \(sellSignalSummary(sellMessage)); error=\(error.localizedDescription); \(sellGateDiagnostic(snapshot: snapshot))"
+    }
+
+    private func submittedSellMessage(sellMessage: OCRSellMessage) -> String {
+        "OCR sell submitted: \(sellSignalSummary(sellMessage))"
+    }
+
+    private func sellSignalSummary(_ sellMessage: OCRSellMessage) -> String {
+        switch (sellMessage.previousOCRQuantity, sellMessage.ocrQuantity) {
+        case let (.some(previous), .some(current)):
+            "detected position decrease \(previous) -> \(current) shares"
+        case let (.some(previous), .none):
+            "detected position decrease from \(previous) shares"
+        case let (.none, .some(current)):
+            "detected position decrease to \(current) shares"
+        case (.none, .none):
+            "detected position decrease"
+        }
+    }
+
+    private func sellGateDiagnostic(snapshot: TradingDashboardSnapshot) -> String {
+        let status = snapshot.panel.status
+        let panel = snapshot.panel
+        let symbol = snapshot.inputs.subscribedSymbol.isEmpty ? snapshot.inputs.symbolInput : snapshot.inputs.subscribedSymbol
+        return String(
+            format: "symbol=%@ connected=%@ sessionReady=%@ subscribed=%@ freshQuote=%@ canTrade=%@ canClose=%@ controllerArmed=%@ killSwitch=%@ closeableShares=%.0f sellPrice=%.4f quoteAgeMs=%.0f",
+            symbol.isEmpty ? "<empty>" : symbol,
+            status.connected.description,
+            status.sessionReady.description,
+            snapshot.inputs.subscribed.description,
+            panel.symbol.hasFreshQuote.description,
+            panel.canTrade.description,
+            panel.canClosePosition.description,
+            status.controllerArmed.description,
+            status.tradingKillSwitch.description,
+            panel.symbol.availableLongToClose,
+            panel.sellPrice,
+            panel.symbol.quoteAgeMs
+        )
+    }
+
     private func classifiedBuyRejection(
         error: any Error,
         snapshot: TradingDashboardSnapshot
-    ) -> BuyRejectionDisposition? {
+    ) -> OCRActionRejectionDisposition? {
         if let sendError = error as? TradingMessageSendError {
             switch sendError {
             case let .retryableRejection(reason):
@@ -379,7 +515,37 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         return nil
     }
 
-    private func buyRejectionDisposition(snapshot: TradingDashboardSnapshot) -> BuyRejectionDisposition? {
+    private func classifiedSellRejection(
+        error: any Error,
+        snapshot: TradingDashboardSnapshot
+    ) -> OCRActionRejectionDisposition? {
+        if let sendError = error as? TradingMessageSendError {
+            switch sendError {
+            case let .retryableRejection(reason):
+                return .retryable(reason)
+            case let .cancelled(reason):
+                return .intentionallyIgnored(reason)
+            }
+        }
+
+        if case let TradingRuntimeManagerError.actionFailed(message) = error {
+            if message == "Close action is not currently available" {
+                return sellRejectionDisposition(snapshot: snapshot)
+            }
+
+            if isRuntimeSellGateError(message) {
+                return classifyKnownRuntimeSellGateMessage(message)
+            }
+        }
+
+        if !snapshot.panel.canClosePosition {
+            return sellRejectionDisposition(snapshot: snapshot)
+        }
+
+        return nil
+    }
+
+    private func buyRejectionDisposition(snapshot: TradingDashboardSnapshot) -> OCRActionRejectionDisposition? {
         let reason = specificBuyUnavailableReason(snapshot)
         switch reason {
         case "Kill switch is enabled.",
@@ -393,7 +559,11 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         }
     }
 
-    private func classifyKnownRuntimeBuyGateMessage(_ message: String) -> BuyRejectionDisposition {
+    private func sellRejectionDisposition(snapshot: TradingDashboardSnapshot) -> OCRActionRejectionDisposition? {
+        .retryable(specificSellUnavailableReason(snapshot))
+    }
+
+    private func classifyKnownRuntimeBuyGateMessage(_ message: String) -> OCRActionRejectionDisposition {
         if message == "Trading is halted by the kill switch" ||
             message.hasPrefix("Order notional $") ||
             message.hasPrefix("Projected open notional $")
@@ -404,7 +574,11 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         return .retryable(message)
     }
 
-    private func rejectionReason(for disposition: BuyRejectionDisposition) -> String {
+    private func classifyKnownRuntimeSellGateMessage(_ message: String) -> OCRActionRejectionDisposition {
+        .retryable(message)
+    }
+
+    private func rejectionReason(for disposition: OCRActionRejectionDisposition) -> String {
         switch disposition {
         case let .intentionallyIgnored(reason), let .retryable(reason):
             return reason
@@ -430,6 +604,21 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         return "Buy action is not currently available."
     }
 
+    private func specificSellUnavailableReason(_ snapshot: TradingDashboardSnapshot) -> String {
+        let status = snapshot.panel.status
+        let panel = snapshot.panel
+        if !status.connected { return "TWS is disconnected." }
+        if !status.sessionReady { return "TWS session is still initializing." }
+        if !snapshot.inputs.subscribed { return "Subscribe to a symbol first." }
+        if !panel.symbol.hasFreshQuote { return "Waiting for a fresh quote." }
+        if status.tradingKillSwitch { return "Kill switch is enabled." }
+        if !panel.canTrade { return "Trading is not currently available for the active symbol." }
+        if panel.symbol.availableLongToClose <= 0 { return "No long position is available to close." }
+        if panel.sellPrice <= 0 { return "Waiting for a sell price." }
+        if !panel.canClosePosition { return "Close is not currently available." }
+        return "Close action is not currently available."
+    }
+
     private func isRuntimeBuyGateError(_ message: String) -> Bool {
         let knownPrefixes = [
             "TWS session not ready",
@@ -439,6 +628,18 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
             "Quote is stale",
             "Order notional $",
             "Projected open notional $"
+        ]
+        return knownPrefixes.contains { message.hasPrefix($0) }
+    }
+
+    private func isRuntimeSellGateError(_ message: String) -> Bool {
+        let knownPrefixes = [
+            "TWS session not ready",
+            "Configured account is not present",
+            "Trading is halted by the kill switch",
+            "No quote has been received for the active symbol yet",
+            "Quote is stale",
+            "No long shares available to close"
         ]
         return knownPrefixes.contains { message.hasPrefix($0) }
     }
@@ -473,6 +674,32 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         return snapshot
     }
 
+    @MainActor
+    private func awaitSellAvailability(generation: Int) async throws -> TradingDashboardSnapshot {
+        manager.refreshDashboard()
+        var snapshot = manager.dashboard
+        if snapshot.panel.canClosePosition {
+            return snapshot
+        }
+
+        let deadline = Date().addingTimeInterval(buyAvailabilityTimeoutSeconds)
+        while Date() < deadline {
+            try throwIfCancelled(generation: generation)
+            try await Task.sleep(nanoseconds: buyAvailabilityPollIntervalNanoseconds)
+            manager.refreshDashboard()
+            snapshot = manager.dashboard
+            if snapshot.panel.canClosePosition {
+                return snapshot
+            }
+
+            if snapshot.panel.status.tradingKillSwitch {
+                return snapshot
+            }
+        }
+
+        return snapshot
+    }
+
     private func buyNote(ocrQuantity: Int?, ratio: Double, quantityInput: Int) -> String {
         if let ocrQuantity {
             return String(
@@ -484,6 +711,10 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         }
 
         return "OCR trigger submitted \(quantityInput) shares"
+    }
+
+    private func sellNote(sellMessage: OCRSellMessage) -> String {
+        "OCR trigger \(sellSignalSummary(sellMessage))"
     }
 
     private var pendingOperationCount: Int {

@@ -10,13 +10,17 @@ struct DisplayTarget: Equatable {
     let height: Int
 }
 
-final class DisplayCaptureController: NSObject {
+final class DisplayCaptureController: NSObject, @unchecked Sendable {
     private let permissionManager: ScreenRecordingPermissionManager
     private let timingLogger: FrameTimingLogger
     private let pipeline: any FramePipeline
     private let messageSender: (any TradingMessageSending)?
 
     private var stream: SCStream?
+    private let captureStateQueue = DispatchQueue(label: "capture-shell.capture-state")
+    private var activeCaptureGeneration = 0
+    private var activeStreamIdentity: ObjectIdentifier?
+    private var isStoppingCapture = false
     private var displayByID: [CGDirectDisplayID: SCDisplay] = [:]
     private var activeRuntimeConfig: CaptureRuntimeConfig?
     private let runtimeConfigQueue = DispatchQueue(label: "capture-shell.runtime-config", attributes: .concurrent)
@@ -116,6 +120,7 @@ final class DisplayCaptureController: NSObject {
             try await stream.startCapture()
 
             self.stream = stream
+            activateCaptureStream(stream)
 
             onCaptureStateChanged?(true)
             onStatus?("Capturing display \(displayID). \(runtimeConfigStatus(for: displayID))")
@@ -127,11 +132,18 @@ final class DisplayCaptureController: NSObject {
 
     @MainActor
     func stopCapture() async {
+        guard !isStoppingCapture else {
+            onStatus?("Capture is already stopping and draining pending OCR trading actions.")
+            return
+        }
+
         guard let stream else {
             onCaptureStateChanged?(false)
             return
         }
 
+        isStoppingCapture = true
+        let stoppedGeneration = deactivateCaptureStream(stream)
         messageSender?.cancelPendingMessages(reason: "Display capture stopped before pending OCR trading actions completed.")
         onStatus?("Stopping capture and draining pending OCR trading actions...")
 
@@ -144,8 +156,13 @@ final class DisplayCaptureController: NSObject {
         self.stream = nil
         pipeline.reset()
         let drained = await drainPendingMessages(timeout: 2)
+        guard stoppedGeneration.map(isInactiveCaptureGenerationCurrent(_:)) ?? true else {
+            isStoppingCapture = false
+            return
+        }
         onCaptureStateChanged?(false)
         onStatus?(drained ? "Capture stopped." : "Capture stopped. Pending OCR trading actions did not finish before timeout.")
+        isStoppingCapture = false
     }
 
 }
@@ -153,6 +170,9 @@ final class DisplayCaptureController: NSObject {
 extension DisplayCaptureController: SCStreamOutput {
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
         guard outputType == .screen else {
+            return
+        }
+        guard isActiveCaptureStream(stream) else {
             return
         }
 
@@ -167,17 +187,71 @@ extension DisplayCaptureController: SCStreamOutput {
 extension DisplayCaptureController: SCStreamDelegate {
     func stream(_ stream: SCStream, didStopWithError error: any Error) {
         let message = "Capture stopped with stream error: \(error.localizedDescription)"
-        if let activeStream = self.stream, activeStream !== stream {
+        guard let stoppedGeneration = deactivateCaptureStream(stream) else {
             return
         }
-        self.stream = nil
         messageSender?.cancelPendingMessages(reason: "Display capture stream stopped before pending OCR trading actions completed.")
-        pipeline.reset()
-        drainPendingMessagesAfterStop(message: message)
+        Task { @MainActor [weak self] in
+            await self?.finishStreamStoppedWithError(message: message, generation: stoppedGeneration)
+        }
     }
 }
 
 private extension DisplayCaptureController {
+    @discardableResult
+    func activateCaptureStream(_ stream: SCStream) -> Int {
+        captureStateQueue.sync {
+            activeCaptureGeneration += 1
+            activeStreamIdentity = ObjectIdentifier(stream)
+            return activeCaptureGeneration
+        }
+    }
+
+    func deactivateCaptureStream(_ stream: SCStream) -> Int? {
+        let streamIdentity = ObjectIdentifier(stream)
+        return captureStateQueue.sync {
+            guard activeStreamIdentity == streamIdentity else {
+                return nil
+            }
+            activeStreamIdentity = nil
+            return activeCaptureGeneration
+        }
+    }
+
+    func isActiveCaptureStream(_ stream: SCStream) -> Bool {
+        let streamIdentity = ObjectIdentifier(stream)
+        return captureStateQueue.sync {
+            activeStreamIdentity == streamIdentity
+        }
+    }
+
+    func isInactiveCaptureGenerationCurrent(_ generation: Int) -> Bool {
+        captureStateQueue.sync {
+            activeCaptureGeneration == generation && activeStreamIdentity == nil
+        }
+    }
+
+    @MainActor
+    func finishStreamStoppedWithError(message: String, generation: Int) async {
+        guard isInactiveCaptureGenerationCurrent(generation) else {
+            return
+        }
+
+        isStoppingCapture = true
+        self.stream = nil
+        pipeline.reset()
+        let drained = await drainPendingMessages(timeout: 2)
+        guard isInactiveCaptureGenerationCurrent(generation) else {
+            isStoppingCapture = false
+            return
+        }
+
+        onCaptureStateChanged?(false)
+        let suffix = drained ? "" : " Pending OCR trading actions did not finish before timeout."
+        onStatus?(message + suffix)
+        isStoppingCapture = false
+    }
+
     @MainActor
     func drainPendingMessages(timeout: TimeInterval) async -> Bool {
         guard let messageSender else {
@@ -187,13 +261,6 @@ private extension DisplayCaptureController {
         return await Task.detached(priority: .userInitiated) {
             messageSender.waitForPendingMessages(timeout: timeout)
         }.value
-    }
-
-    func drainPendingMessagesAfterStop(message: String) {
-        let drained = messageSender?.waitForPendingMessages(timeout: 2) ?? true
-        let suffix = drained ? "" : " Pending OCR trading actions did not finish before timeout."
-        onCaptureStateChanged?(false)
-        onStatus?(message + suffix)
     }
 
     func activeRuntimeConfigSnapshot() -> CaptureRuntimeConfig? {

@@ -14,7 +14,17 @@ struct TriggerStageTimings: Sendable {
 
 struct TriggerDispatchDecision {
     let action: String
-    let shouldDispatchTrigger: Bool
+    let event: TriggerDispatchEvent?
+
+    var shouldDispatchTrigger: Bool {
+        event != nil
+    }
+}
+
+enum TriggerDispatchEvent {
+    case buy
+    case sell
+    case subscribe
 }
 
 private struct PendingBuyTransport {
@@ -27,6 +37,20 @@ private struct PendingBuyTransport {
 
     func matches(integerValue: Int?) -> Bool {
         self.integerValue == integerValue
+    }
+}
+
+private struct PendingSellTransport {
+    let integerValue: Int?
+    let openPositionPeakValue: Int?
+    let triggerEvent: OCRPipelineEvent
+    let timings: TriggerStageTimings?
+    let triggerEvaluationMilliseconds: Double
+    let decisionMilliseconds: Double
+    var isStale = false
+
+    func matches(integerValue: Int?, openPositionPeakValue: Int?) -> Bool {
+        self.integerValue == integerValue && self.openPositionPeakValue == openPositionPeakValue
     }
 }
 
@@ -52,9 +76,20 @@ private struct RecentRetryableBuyRejection {
     }
 }
 
+private struct RecentRetryableSellRejection {
+    let integerValue: Int?
+    let openPositionPeakValue: Int?
+    let timestamp: CFAbsoluteTime
+
+    func matches(integerValue: Int?, openPositionPeakValue: Int?) -> Bool {
+        self.integerValue == integerValue && self.openPositionPeakValue == openPositionPeakValue
+    }
+}
+
 final class TriggerDispatcher: @unchecked Sendable {
     private static let latencySummarySampleCount = 10
     private static let retryableBuyCooldownSeconds: CFAbsoluteTime = 1.0
+    private static let retryableSellCooldownSeconds: CFAbsoluteTime = 1.0
 
     private let withPipelineState: (@escaping () -> Void) -> Void
     private let assertPipelineStateHeld: () -> Void
@@ -64,8 +99,10 @@ final class TriggerDispatcher: @unchecked Sendable {
     private let triggerStateMachine: TradingTriggerStateMachine
 
     private var pendingBuyTransport: PendingBuyTransport?
+    private var pendingSellTransport: PendingSellTransport?
     private var pendingSubscribeTransport: PendingSubscribeTransport?
     private var recentRetryableBuyRejection: RecentRetryableBuyRejection?
+    private var recentRetryableSellRejection: RecentRetryableSellRejection?
     private var timingSamplesByEvent: [String: [TriggerPathTimingSample]] = [:]
 
     init(
@@ -88,52 +125,84 @@ final class TriggerDispatcher: @unchecked Sendable {
     func reset() {
         assertPipelineStateHeld()
         pendingBuyTransport = nil
+        pendingSellTransport = nil
         pendingSubscribeTransport = nil
         recentRetryableBuyRejection = nil
+        recentRetryableSellRejection = nil
         timingSamplesByEvent.removeAll(keepingCapacity: true)
     }
 
-    func buyDispatchDecision(for evaluation: ManualCellTriggerEvaluation) -> TriggerDispatchDecision {
+    func manualCellDispatchDecision(for evaluation: ManualCellTriggerEvaluation) -> TriggerDispatchDecision {
         assertPipelineStateHeld()
+        if evaluation.shouldTriggerSell {
+            if let pendingSellTransport {
+                if pendingSellTransport.matches(
+                    integerValue: evaluation.integerValue,
+                    openPositionPeakValue: evaluation.openPositionPeakValue
+                ) {
+                    return TriggerDispatchDecision(
+                        action: "transport_pending_duplicate_suppressed",
+                        event: nil
+                    )
+                }
+                return TriggerDispatchDecision(
+                    action: "transport_pending_suppressed",
+                    event: nil
+                )
+            }
+
+            if shouldSuppressRetryableSellRejection(
+                integerValue: evaluation.integerValue,
+                openPositionPeakValue: evaluation.openPositionPeakValue
+            ) {
+                return TriggerDispatchDecision(
+                    action: "retryable_rejection_cooldown_suppressed",
+                    event: nil
+                )
+            }
+
+            return TriggerDispatchDecision(action: "sell_triggered", event: .sell)
+        }
+
         if evaluation.shouldTriggerBuy {
             if let pendingBuyTransport {
                 if pendingBuyTransport.matches(integerValue: evaluation.integerValue) {
                     return TriggerDispatchDecision(
                         action: "transport_pending_duplicate_suppressed",
-                        shouldDispatchTrigger: false
+                        event: nil
                     )
                 }
                 return TriggerDispatchDecision(
                     action: "transport_pending_suppressed",
-                    shouldDispatchTrigger: false
+                    event: nil
                 )
             }
 
             if shouldSuppressRetryableBuyRejection(for: evaluation.integerValue) {
                 return TriggerDispatchDecision(
                     action: "retryable_rejection_cooldown_suppressed",
-                    shouldDispatchTrigger: false
+                    event: nil
                 )
             }
 
-            return TriggerDispatchDecision(action: "buy_triggered", shouldDispatchTrigger: true)
+            return TriggerDispatchDecision(action: "buy_triggered", event: .buy)
         }
 
         if evaluation.isZeroOrEmpty {
-            return TriggerDispatchDecision(action: "armed", shouldDispatchTrigger: false)
+            return TriggerDispatchDecision(action: "armed", event: nil)
         }
 
         if evaluation.isAwaitingConfirmation {
-            return TriggerDispatchDecision(action: "confirmation_pending", shouldDispatchTrigger: false)
+            return TriggerDispatchDecision(action: "confirmation_pending", event: nil)
         }
 
         if evaluation.isDuplicate {
-            return TriggerDispatchDecision(action: "duplicate_suppressed", shouldDispatchTrigger: false)
+            return TriggerDispatchDecision(action: "duplicate_suppressed", event: nil)
         }
 
         return TriggerDispatchDecision(
             action: "already_triggered_waiting_for_rearm",
-            shouldDispatchTrigger: false
+            event: nil
         )
     }
 
@@ -144,31 +213,31 @@ final class TriggerDispatcher: @unchecked Sendable {
                 if pendingSubscribeTransport.matches(symbol: evaluation.normalizedSymbol) {
                     return TriggerDispatchDecision(
                         action: "transport_pending_duplicate_suppressed",
-                        shouldDispatchTrigger: false
+                        event: nil
                     )
                 }
                 return TriggerDispatchDecision(
                     action: "transport_pending_suppressed",
-                    shouldDispatchTrigger: false
+                    event: nil
                 )
             }
 
-            return TriggerDispatchDecision(action: "subscribe_triggered", shouldDispatchTrigger: true)
+            return TriggerDispatchDecision(action: "subscribe_triggered", event: .subscribe)
         }
 
         if evaluation.isDuplicate {
-            return TriggerDispatchDecision(action: "duplicate_suppressed", shouldDispatchTrigger: false)
+            return TriggerDispatchDecision(action: "duplicate_suppressed", event: nil)
         }
 
         if evaluation.isChangeLocked {
-            return TriggerDispatchDecision(action: "locked_waiting_for_rearm", shouldDispatchTrigger: false)
+            return TriggerDispatchDecision(action: "locked_waiting_for_rearm", event: nil)
         }
 
         if evaluation.isAwaitingConfirmation {
-            return TriggerDispatchDecision(action: "confirmation_pending", shouldDispatchTrigger: false)
+            return TriggerDispatchDecision(action: "confirmation_pending", event: nil)
         }
 
-        return TriggerDispatchDecision(action: "symbol_empty_no_subscribe", shouldDispatchTrigger: false)
+        return TriggerDispatchDecision(action: "symbol_empty_no_subscribe", event: nil)
     }
 
     func dispatchBuy(
@@ -190,6 +259,37 @@ final class TriggerDispatcher: @unchecked Sendable {
         messageSender.send(TradingMessageContract.buyMessage(ocrQuantity: integerValue), event: "BUY") { [weak self] result in
             self?.withPipelineState { [weak self] in
                 self?.handleBuyTransportResult(result)
+            }
+        }
+    }
+
+    func dispatchSell(
+        triggerEvent: OCRPipelineEvent,
+        integerValue: Int?,
+        openPositionPeakValue: Int?,
+        timings: TriggerStageTimings?,
+        triggerEvaluationMilliseconds: Double,
+        decisionMilliseconds: Double
+    ) {
+        assertPipelineStateHeld()
+        pendingSellTransport = PendingSellTransport(
+            integerValue: integerValue,
+            openPositionPeakValue: openPositionPeakValue,
+            triggerEvent: triggerEvent,
+            timings: timings,
+            triggerEvaluationMilliseconds: triggerEvaluationMilliseconds,
+            decisionMilliseconds: decisionMilliseconds
+        )
+
+        messageSender.send(
+            TradingMessageContract.sellMessage(
+                ocrQuantity: integerValue,
+                previousOCRQuantity: openPositionPeakValue
+            ),
+            event: "SELL"
+        ) { [weak self] result in
+            self?.withPipelineState { [weak self] in
+                self?.handleSellTransportResult(result)
             }
         }
     }
@@ -235,6 +335,20 @@ final class TriggerDispatcher: @unchecked Sendable {
         recentRetryableBuyRejection = nil
         pendingBuyTransport.isStale = true
         self.pendingBuyTransport = pendingBuyTransport
+    }
+
+    func invalidatePendingSellAfterManualCellRearm(_ manualCellEvaluation: ManualCellTriggerEvaluation) {
+        assertPipelineStateHeld()
+        guard var pendingSellTransport, !pendingSellTransport.isStale else {
+            return
+        }
+
+        guard !manualCellEvaluation.wasArmed, manualCellEvaluation.isArmedAfter else {
+            return
+        }
+
+        pendingSellTransport.isStale = true
+        self.pendingSellTransport = pendingSellTransport
     }
 
     func invalidatePendingSubscribeIfNeeded(evaluation: ManualSymbolTriggerEvaluation) {
@@ -305,12 +419,63 @@ final class TriggerDispatcher: @unchecked Sendable {
         case let .success(outcome):
             recentRetryableBuyRejection = nil
             if outcome.commitsTriggerState, !pendingBuyTransport.isStale {
-                triggerStateMachine.commitManualCellTriggerSuccess()
+                let openPositionIntegerValue = outcome == .submitted ? pendingBuyTransport.integerValue : nil
+                triggerStateMachine.commitManualCellTriggerSuccess(openPositionIntegerValue: openPositionIntegerValue)
             }
         case let .failure(error):
             if isRetryableBuyRejection(error) {
                 recentRetryableBuyRejection = RecentRetryableBuyRejection(
                     integerValue: pendingBuyTransport.integerValue,
+                    timestamp: CFAbsoluteTimeGetCurrent()
+                )
+            }
+        }
+    }
+
+    private func handleSellTransportResult(_ result: Result<TradingMessageSendOutcome, any Error>) {
+        assertPipelineStateHeld()
+        guard let pendingSellTransport else {
+            return
+        }
+        self.pendingSellTransport = nil
+
+        if messageSender.reportsTransportOutcomes {
+            let action = transportAction(
+                for: result,
+                success: "sell_transport_succeeded",
+                failure: "sell_transport_failed"
+            )
+            eventHandler?(transportOutcomeEvent(from: pendingSellTransport.triggerEvent, action: action))
+        }
+
+        if let timings = pendingSellTransport.timings {
+            let sample = timingSample(
+                timings: timings,
+                triggerEvaluationMilliseconds: pendingSellTransport.triggerEvaluationMilliseconds,
+                decisionMilliseconds: pendingSellTransport.decisionMilliseconds,
+                sendCompletionTimestamp: CFAbsoluteTimeGetCurrent(),
+                result: result
+            )
+            logLatency(
+                frameNumber: pendingSellTransport.triggerEvent.frameNumber,
+                eventName: "SELL",
+                decisionLabel: "sell_decision_ms",
+                sample: sample,
+                result: result
+            )
+        }
+
+        switch result {
+        case let .success(outcome):
+            recentRetryableSellRejection = nil
+            if outcome == .submitted, !pendingSellTransport.isStale {
+                triggerStateMachine.commitManualCellSellSuccess()
+            }
+        case let .failure(error):
+            if isRetryableSellRejection(error) {
+                recentRetryableSellRejection = RecentRetryableSellRejection(
+                    integerValue: pendingSellTransport.integerValue,
+                    openPositionPeakValue: pendingSellTransport.openPositionPeakValue,
                     timestamp: CFAbsoluteTimeGetCurrent()
                 )
             }
@@ -370,7 +535,30 @@ final class TriggerDispatcher: @unchecked Sendable {
         return (CFAbsoluteTimeGetCurrent() - recentRetryableBuyRejection.timestamp) < Self.retryableBuyCooldownSeconds
     }
 
+    private func shouldSuppressRetryableSellRejection(integerValue: Int?, openPositionPeakValue: Int?) -> Bool {
+        guard let recentRetryableSellRejection else {
+            return false
+        }
+
+        guard recentRetryableSellRejection.matches(
+            integerValue: integerValue,
+            openPositionPeakValue: openPositionPeakValue
+        ) else {
+            return false
+        }
+
+        return (CFAbsoluteTimeGetCurrent() - recentRetryableSellRejection.timestamp) < Self.retryableSellCooldownSeconds
+    }
+
     private func isRetryableBuyRejection(_ error: any Error) -> Bool {
+        if case .retryableRejection = error as? TradingMessageSendError {
+            return true
+        }
+
+        return false
+    }
+
+    private func isRetryableSellRejection(_ error: any Error) -> Bool {
         if case .retryableRejection = error as? TradingMessageSendError {
             return true
         }

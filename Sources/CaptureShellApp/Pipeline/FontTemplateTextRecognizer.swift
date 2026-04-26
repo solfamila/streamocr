@@ -62,6 +62,7 @@ final class FontTemplateTextRecognizer: OCRTextRecognizing, @unchecked Sendable 
         var minimumGlyphHeightRatioForNarrowSegment: Double
         var splitWideSegments: Bool
         var mergeGap: Int
+        var minimumConfusableGlyphMargin: Double
 
         static let numericCell = Options(
             preferredFontNames: appleSDGothicNeoFonts,
@@ -76,7 +77,11 @@ final class FontTemplateTextRecognizer: OCRTextRecognizing, @unchecked Sendable 
             // Digits are tightly spaced but always separated by ≥1 black column after
             // binarization; keeping mergeGap=0 prevents "4" + "7" from being glued into
             // a single wide segment.
-            mergeGap: 0
+            mergeGap: 0,
+            // Position sizing must fail closed on near-tie digits. In practice 5/6
+            // are the most dangerous pair because a single loop-stroke decision can
+            // change share size while the UI is actively repainting.
+            minimumConfusableGlyphMargin: FontTemplateMatcherConstants.jaccardTieThreshold
         )
 
         static let symbolCell = Options(
@@ -86,7 +91,8 @@ final class FontTemplateTextRecognizer: OCRTextRecognizing, @unchecked Sendable 
             minimumSegmentAreaRatio: 0.006,
             minimumGlyphHeightRatioForNarrowSegment: 0.58,
             splitWideSegments: false,
-            mergeGap: 0
+            mergeGap: 0,
+            minimumConfusableGlyphMargin: 0
         )
     }
 
@@ -141,6 +147,15 @@ final class FontTemplateTextRecognizer: OCRTextRecognizing, @unchecked Sendable 
         }
         guard !decoded.characters.isEmpty else {
             return OCRTextRecognition(rawText: "", confidence: 0)
+        }
+
+        if region == .manualCell, decoded.hasUnsafeConfusableGlyph(
+            minimumMargin: options.minimumConfusableGlyphMargin
+        ) {
+            // Fail closed without pretending the cell is empty. A blank read counts
+            // as a zero-like rearm in the trading state machine; an ambiguous read
+            // must instead be ignored until a safe numeric value appears.
+            return OCRTextRecognition(rawText: "?", confidence: 0)
         }
 
         // Confidence = worst per-glyph score (conservative).
@@ -612,6 +627,44 @@ enum FontTemplateMatcher {
     struct Decoded {
         let characters: [Character]
         let perGlyphConfidences: [Double]
+        let perGlyphRunnerUpCharacters: [Character?]
+        let perGlyphConfidenceMargins: [Double]
+
+        func hasUnsafeConfusableGlyph(minimumMargin: Double) -> Bool {
+            guard minimumMargin > 0 else {
+                return false
+            }
+
+            for index in characters.indices {
+                guard index < perGlyphRunnerUpCharacters.count,
+                      index < perGlyphConfidenceMargins.count
+                else {
+                    continue
+                }
+
+                guard isUnsafeConfusablePair(
+                    characters[index],
+                    perGlyphRunnerUpCharacters[index]
+                ) else {
+                    continue
+                }
+
+                if perGlyphConfidenceMargins[index] < minimumMargin {
+                    return true
+                }
+            }
+
+            return false
+        }
+
+        private func isUnsafeConfusablePair(_ character: Character, _ runnerUp: Character?) -> Bool {
+            switch (character, runnerUp) {
+            case ("5", "6"), ("6", "5"):
+                return true
+            default:
+                return false
+            }
+        }
     }
 
     static func decode(
@@ -621,13 +674,20 @@ enum FontTemplateMatcher {
     ) -> Decoded {
         let rawSegments = foregroundSegments(in: mask, mergeGap: options.mergeGap)
         guard !rawSegments.isEmpty else {
-            return Decoded(characters: [], perGlyphConfidences: [])
+            return Decoded(
+                characters: [],
+                perGlyphConfidences: [],
+                perGlyphRunnerUpCharacters: [],
+                perGlyphConfidenceMargins: []
+            )
         }
 
         let medianAdvance = templates.medianAdvanceWidth
         let medianGlyphHeight = templates.medianGlyphHeight
         var characters: [Character] = []
         var confidences: [Double] = []
+        var runnerUpCharacters: [Character?] = []
+        var confidenceMargins: [Double] = []
 
         // Walk every raw segment. Wide segments (area spanning multiple glyphs) are
         // pre-sliced into N equal-width sub-segments. Then each sub-segment is
@@ -656,6 +716,8 @@ enum FontTemplateMatcher {
                 ) {
                     characters.append(match.character)
                     confidences.append(match.confidence)
+                    runnerUpCharacters.append(match.runnerUpCharacter)
+                    confidenceMargins.append(match.confidenceMargin)
                 }
                 continue
             }
@@ -670,11 +732,18 @@ enum FontTemplateMatcher {
                 ) {
                     characters.append(match.character)
                     confidences.append(match.confidence)
+                    runnerUpCharacters.append(match.runnerUpCharacter)
+                    confidenceMargins.append(match.confidenceMargin)
                 }
             }
         }
 
-        return Decoded(characters: characters, perGlyphConfidences: confidences)
+        return Decoded(
+            characters: characters,
+            perGlyphConfidences: confidences,
+            perGlyphRunnerUpCharacters: runnerUpCharacters,
+            perGlyphConfidenceMargins: confidenceMargins
+        )
     }
 
     static func decodeSymbolWithMetal(
@@ -689,7 +758,12 @@ enum FontTemplateMatcher {
 
         let rawSegments = foregroundSegments(in: mask, mergeGap: options.mergeGap)
         guard !rawSegments.isEmpty else {
-            return Decoded(characters: [], perGlyphConfidences: [])
+            return Decoded(
+                characters: [],
+                perGlyphConfidences: [],
+                perGlyphRunnerUpCharacters: [],
+                perGlyphConfidenceMargins: []
+            )
         }
 
         let filteredSegments = rawSegments.filter { segment in
@@ -697,7 +771,12 @@ enum FontTemplateMatcher {
             return segmentArea >= options.minimumSegmentAreaRatio
         }
         guard !filteredSegments.isEmpty else {
-            return Decoded(characters: [], perGlyphConfidences: [])
+            return Decoded(
+                characters: [],
+                perGlyphConfidences: [],
+                perGlyphRunnerUpCharacters: [],
+                perGlyphConfidenceMargins: []
+            )
         }
 
         guard let matches = matcher.bestMatches(
@@ -721,7 +800,12 @@ enum FontTemplateMatcher {
             confidences.append(match.confidence)
         }
 
-        return Decoded(characters: characters, perGlyphConfidences: confidences)
+        return Decoded(
+            characters: characters,
+            perGlyphConfidences: confidences,
+            perGlyphRunnerUpCharacters: Array(repeating: nil, count: characters.count),
+            perGlyphConfidenceMargins: Array(repeating: .infinity, count: characters.count)
+        )
     }
 
     // MARK: Segmentation
@@ -837,10 +921,25 @@ enum FontTemplateMatcher {
         let character: Character
         let confidence: Double
         let precision: Double
+        let runnerUpCharacter: Character?
+        let runnerUpConfidence: Double?
+
+        var confidenceMargin: Double {
+            guard let runnerUpConfidence else {
+                return .infinity
+            }
+            return confidence - runnerUpConfidence
+        }
     }
 
     private struct MatchQuality {
         let jaccard: Double
+        let precision: Double
+    }
+
+    private struct CandidateMatch {
+        let character: Character
+        let confidence: Double
         let precision: Double
     }
 
@@ -879,7 +978,8 @@ enum FontTemplateMatcher {
         let widthRatios: [Double] = [0.90, 1.00, 1.10, 1.20]
         let heightRatios: [Double] = [0.95, 1.00, 1.05]
 
-        var best: Match?
+        var best: CandidateMatch?
+        var runnerUp: CandidateMatch?
 
         for (character, template) in pool {
             for wRatio in widthRatios {
@@ -915,24 +1015,67 @@ enum FontTemplateMatcher {
                                 width: w,
                                 height: h
                             )
-                            let candidate = Match(
+                            let candidate = CandidateMatch(
                                 character: character,
                                 confidence: quality.jaccard,
                                 precision: quality.precision
                             )
-                            if isBetter(candidate, than: best) {
-                                best = candidate
-                            }
+                            updateRankings(candidate: candidate, best: &best, runnerUp: &runnerUp)
                         }
                     }
                 }
             }
         }
 
-        return best
+        guard let best else {
+            return nil
+        }
+
+        return Match(
+            character: best.character,
+            confidence: best.confidence,
+            precision: best.precision,
+            runnerUpCharacter: runnerUp?.character,
+            runnerUpConfidence: runnerUp?.confidence
+        )
     }
 
-    private static func isBetter(_ candidate: Match, than current: Match?) -> Bool {
+    private static func updateRankings(
+        candidate: CandidateMatch,
+        best: inout CandidateMatch?,
+        runnerUp: inout CandidateMatch?
+    ) {
+        guard let currentBest = best else {
+            best = candidate
+            return
+        }
+
+        if candidate.character == currentBest.character {
+            if isBetter(candidate, than: currentBest) {
+                best = candidate
+            }
+            return
+        }
+
+        if isBetter(candidate, than: currentBest) {
+            runnerUp = currentBest
+            best = candidate
+            return
+        }
+
+        if let currentRunnerUp = runnerUp, candidate.character == currentRunnerUp.character {
+            if isBetter(candidate, than: currentRunnerUp) {
+                runnerUp = candidate
+            }
+            return
+        }
+
+        if isBetter(candidate, than: runnerUp) {
+            runnerUp = candidate
+        }
+    }
+
+    private static func isBetter(_ candidate: CandidateMatch, than current: CandidateMatch?) -> Bool {
         guard let current else {
             return true
         }
