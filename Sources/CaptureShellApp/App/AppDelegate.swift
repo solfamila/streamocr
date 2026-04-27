@@ -5,6 +5,7 @@ import Foundation
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let tradingRuntimeManager = TradingRuntimeManager()
     private let liveSessionController: LiveOCRSessionController
+    private let recordingSessionController = LiveRecordingSessionController()
     private lazy var tradingWindowController = TradingWindowController(
         manager: tradingRuntimeManager,
         onOpenSetup: { [weak self] in
@@ -15,6 +16,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         },
         onStopLiveStream: { [weak self] in
             self?.stopLiveStream()
+        },
+        onStartRecording: { [weak self] urlText in
+            self?.startRecording(urlText: urlText)
+        },
+        onStopRecording: { [weak self] in
+            self?.stopRecording()
         },
         onLiveStreamURLChanged: { [weak self] urlText in
             self?.liveStreamURLChanged(urlText)
@@ -112,6 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installAppMenu()
         bindTradingCallbacks()
         bindLiveSessionCallbacks()
+        bindRecordingSessionCallbacks()
 
         configPathLabel.stringValue = "Config file: \(runtimeConfigStore.configURL.path)"
         loadPersistedRuntimeConfigIfAvailable()
@@ -120,6 +128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         tradingRuntimeManager.refreshDashboard()
         tradingWindowController.updateOCRBuyRatio(ocrBuyRatio)
         tradingWindowController.updateLiveStatus(liveSessionController.currentStatusSnapshot())
+        tradingWindowController.updateRecordingStatus(recordingSessionController.currentStatusSnapshot())
         tradingWindowController.showWindowAndStart()
         applyStartupOverridesIfNeeded()
     }
@@ -129,6 +138,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await captureController.stopCapture()
         }
         liveSessionController.stop()
+        recordingSessionController.stop()
         Task {
             await tradingRuntimeManager.shutdownAsync()
         }
@@ -464,6 +474,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         liveSessionController.setBuyQuantityRatio(ocrBuyRatio)
     }
 
+    private func bindRecordingSessionCallbacks() {
+        recordingSessionController.onStatusChanged = { [weak self] status in
+            guard let self else {
+                return
+            }
+            tradingWindowController.updateRecordingStatus(status)
+        }
+    }
+
     @objc
     private func openTradingGUITapped() {
         syncTradingInputsToRuntime()
@@ -516,6 +535,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func stopLiveStream() {
         liveSessionController.stop()
+    }
+
+    private func startRecording(urlText: String) {
+        currentLiveStreamURLText = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            try recordingSessionController.start(
+                seedURLText: currentLiveStreamURLText,
+                loggingEnabled: isEnvironmentFlagEnabled("CAPTURESHELLAPP_LIVE_VERBOSE")
+            )
+        } catch {
+            tradingWindowController.updateRecordingStatus(
+                LiveRecordingStatusSnapshot(
+                    state: .error,
+                    isRecording: false,
+                    headline: "Recording: Error",
+                    detail: error.localizedDescription,
+                    outputPath: nil
+                )
+            )
+        }
+    }
+
+    private func stopRecording() {
+        recordingSessionController.stop()
     }
 
     private func applyStartupOverridesIfNeeded() {

@@ -81,6 +81,12 @@ There are three live OCR paths in the app:
 - Display capture window: routes ScreenCaptureKit OCR directly into the same
   in-process runtime
 
+The trading GUI also has a separate **Start Recording** / **Stop Recording**
+button under the live URL controls. It records the current live URL with the same
+native source recorder used by `--record-video`, independent of whether live OCR
+is running. GUI recordings are saved as timestamped MP4 files under
+`~/Movies/StreamOCR Recordings/`, with a sibling `*.metadata.json` file.
+
 In the trading GUI live-stream path, OCR `SUBSCRIBE` updates the active symbol
 in the runtime, and OCR `BUY` uses the configured OCR buy ratio to size the
 order (`ocr shares * ratio`, rounded down, minimum 1 share). A live OCR `BUY`
@@ -161,7 +167,11 @@ laundered into a plausible symbol.
 The pipeline still fingerprints each ROI so unchanged frames avoid repeated OCR
 work. If the numeric cell or sampled symbol cell is unchanged, the cached
 recognition is replayed into the trigger state machine so multi-frame
-confirmation still works without rerunning OCR.
+confirmation still works without rerunning OCR. Symbol OCR also forces a fresh
+read at least every 10 seconds, even when the symbol-cell fingerprint looks
+unchanged, so a stale ticker cannot persist indefinitely because of cache replay.
+Confirmed blank/zero position reads unlock symbol changes, while nonzero
+positions keep symbol changes locked.
 
 In live JSON results, `playbackURL` is the actual URL used by the active live
 decoder. With the direct decoder path, that is usually the resolved

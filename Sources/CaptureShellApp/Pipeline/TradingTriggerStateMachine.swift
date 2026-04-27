@@ -240,9 +240,7 @@ final class TradingTriggerStateMachine {
             manualCellIsArmed = true
             pendingManualCellIntegerValue = nil
             pendingManualCellConfirmationCount = 0
-            if !wasArmed {
-                manualSymbolChangeIsArmed = true
-            }
+            manualSymbolChangeIsArmed = true
             manualCellOpenPositionPeakValue = nil
             manualCellSellWasTriggered = false
         }

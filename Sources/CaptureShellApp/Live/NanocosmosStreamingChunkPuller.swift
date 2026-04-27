@@ -34,6 +34,7 @@ enum NanocosmosChunkCaptureFinishReason: String, Sendable {
     case responseCompleted = "response_completed"
     case playableProbe = "playable_probe"
     case captureWindow = "capture_window"
+    case manualStop = "manual_stop"
 }
 
 final class NanocosmosStreamingChunkPuller {
@@ -44,7 +45,8 @@ final class NanocosmosStreamingChunkPuller {
         captureWindowSeconds: TimeInterval,
         minimumPlayableProbeWindowSeconds: TimeInterval? = nil,
         playableProbeIntervalSeconds: TimeInterval = 0.05,
-        playableProbe: ((URL) -> Bool)? = nil
+        playableProbe: ((URL) -> Bool)? = nil,
+        shouldContinue: () -> Bool = { true }
     ) throws -> NanocosmosCapturedChunk {
         let fileManager = FileManager.default
         do {
@@ -81,6 +83,31 @@ final class NanocosmosStreamingChunkPuller {
         )
         var lastPlayableProbeByteCount = 0
 
+        func finishAfterPolicyCancellation(
+            reason: NanocosmosChunkCaptureFinishReason
+        ) throws -> NanocosmosCapturedChunk {
+            delegate.markCancelledByPolicy()
+            task.cancel()
+            _ = delegate.waitForCompletion(timeoutSeconds: 2)
+            let finalSnapshot = delegate.snapshot()
+            guard finalSnapshot.byteCount > 0 else {
+                throw NanocosmosStreamingChunkPullerError.emptyChunk(sourceURL)
+            }
+            let finishElapsedSeconds = Date().timeIntervalSince(start)
+            return NanocosmosCapturedChunk(
+                fileURL: destinationURL,
+                sourceURL: finalSnapshot.responseURL ?? sourceURL,
+                byteCount: finalSnapshot.byteCount,
+                elapsedSeconds: finishElapsedSeconds,
+                firstByteElapsedSeconds: finalSnapshot.firstByteElapsedSeconds,
+                activeCaptureSeconds: Self.activeCaptureSeconds(
+                    elapsedSeconds: finishElapsedSeconds,
+                    firstByteElapsedSeconds: finalSnapshot.firstByteElapsedSeconds
+                ),
+                finishReason: reason
+            )
+        }
+
         defer {
             task.cancel()
             session.invalidateAndCancel()
@@ -90,6 +117,10 @@ final class NanocosmosStreamingChunkPuller {
         while true {
             let snapshot = delegate.snapshot()
             let elapsedSeconds = Date().timeIntervalSince(start)
+
+            if !shouldContinue() {
+                return try finishAfterPolicyCancellation(reason: .manualStop)
+            }
 
             if snapshot.didComplete {
                 if let error = snapshot.error {
@@ -133,50 +164,13 @@ final class NanocosmosStreamingChunkPuller {
                 )
 
                 if delegate.markCancelledByPolicyIfPlayable({ playableProbe(destinationURL) }) {
-                    task.cancel()
-                    _ = delegate.waitForCompletion(timeoutSeconds: 2)
-                    let finalSnapshot = delegate.snapshot()
-                    guard finalSnapshot.byteCount > 0 else {
-                        throw NanocosmosStreamingChunkPullerError.emptyChunk(sourceURL)
-                    }
-                    let finishElapsedSeconds = Date().timeIntervalSince(start)
-                    return NanocosmosCapturedChunk(
-                        fileURL: destinationURL,
-                        sourceURL: finalSnapshot.responseURL ?? sourceURL,
-                        byteCount: finalSnapshot.byteCount,
-                        elapsedSeconds: finishElapsedSeconds,
-                        firstByteElapsedSeconds: finalSnapshot.firstByteElapsedSeconds,
-                        activeCaptureSeconds: Self.activeCaptureSeconds(
-                            elapsedSeconds: finishElapsedSeconds,
-                            firstByteElapsedSeconds: finalSnapshot.firstByteElapsedSeconds
-                        ),
-                        finishReason: .playableProbe
-                    )
+                    return try finishAfterPolicyCancellation(reason: .playableProbe)
                 }
             }
 
             if let firstByteElapsedSeconds = snapshot.firstByteElapsedSeconds,
                elapsedSeconds - firstByteElapsedSeconds >= captureWindowSeconds {
-                delegate.markCancelledByPolicy()
-                task.cancel()
-                _ = delegate.waitForCompletion(timeoutSeconds: 2)
-                let finalSnapshot = delegate.snapshot()
-                guard finalSnapshot.byteCount > 0 else {
-                    throw NanocosmosStreamingChunkPullerError.emptyChunk(sourceURL)
-                }
-                let finishElapsedSeconds = Date().timeIntervalSince(start)
-                return NanocosmosCapturedChunk(
-                    fileURL: destinationURL,
-                    sourceURL: finalSnapshot.responseURL ?? sourceURL,
-                    byteCount: finalSnapshot.byteCount,
-                    elapsedSeconds: finishElapsedSeconds,
-                    firstByteElapsedSeconds: finalSnapshot.firstByteElapsedSeconds,
-                    activeCaptureSeconds: Self.activeCaptureSeconds(
-                        elapsedSeconds: finishElapsedSeconds,
-                        firstByteElapsedSeconds: finalSnapshot.firstByteElapsedSeconds
-                    ),
-                    finishReason: .captureWindow
-                )
+                return try finishAfterPolicyCancellation(reason: .captureWindow)
             }
 
             Thread.sleep(forTimeInterval: 0.05)

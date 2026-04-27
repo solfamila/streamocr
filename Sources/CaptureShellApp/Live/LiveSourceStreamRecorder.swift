@@ -23,6 +23,7 @@ final class LiveSourceStreamRecorder: @unchecked Sendable {
     private let completionSemaphore = DispatchSemaphore(value: 0)
     private var result: Result<NanocosmosCapturedChunk, Error>?
     private var didStart = false
+    private var stopRequested = false
 
     init(outputURL: URL, loggingEnabled: Bool) {
         self.outputURL = outputURL
@@ -42,6 +43,7 @@ final class LiveSourceStreamRecorder: @unchecked Sendable {
         lock.lock()
         didStart = true
         result = nil
+        stopRequested = false
         lock.unlock()
 
         let captureWindowSeconds = max(0.05, runSeconds)
@@ -55,7 +57,16 @@ final class LiveSourceStreamRecorder: @unchecked Sendable {
                     sourceURL: sourceURL,
                     destinationURL: outputURL,
                     firstByteTimeoutSeconds: firstByteTimeoutSeconds,
-                    captureWindowSeconds: captureWindowSeconds
+                    captureWindowSeconds: captureWindowSeconds,
+                    shouldContinue: { [weak self] in
+                        guard let self else {
+                            return false
+                        }
+                        self.lock.lock()
+                        let shouldContinue = !self.stopRequested
+                        self.lock.unlock()
+                        return shouldContinue
+                    }
                 )
                 captureResult = .success(capturedChunk)
             } catch {
@@ -67,6 +78,12 @@ final class LiveSourceStreamRecorder: @unchecked Sendable {
             self.lock.unlock()
             self.completionSemaphore.signal()
         }
+    }
+
+    func stop() {
+        lock.lock()
+        stopRequested = true
+        lock.unlock()
     }
 
     func finish(timeout: TimeInterval) throws -> LiveRecordingSummary? {
@@ -88,6 +105,7 @@ final class LiveSourceStreamRecorder: @unchecked Sendable {
         let finalResult = result
         didStart = false
         result = nil
+        stopRequested = false
         lock.unlock()
 
         guard let finalResult else {

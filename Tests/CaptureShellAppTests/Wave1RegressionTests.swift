@@ -763,7 +763,7 @@ struct TradingTriggerStateMachineTests {
     }
 
     @Test
-    func manualSymbolLocksSymbolChangesUntilManualCellRearms() {
+    func manualSymbolUnlocksSymbolChangesWhenManualCellIsConfirmedZero() {
         let stateMachine = TradingTriggerStateMachine()
 
         let first = stateMachine.evaluateManualSymbol(normalizedText: "ms ft", confidence: 0.82)
@@ -776,19 +776,13 @@ struct TradingTriggerStateMachineTests {
         #expect(second.isDuplicate)
         #expect(second.normalizedSymbol == "MSFT")
 
-        let blankWhileAlreadyArmed = stateMachine.evaluateManualCell(normalizedText: "")
-        #expect(blankWhileAlreadyArmed.isArmedAfter)
-
         let third = stateMachine.evaluateManualSymbol(normalizedText: "aapl", confidence: 0.82)
         #expect(!third.shouldTriggerSubscribe)
         #expect(third.isChangeLocked)
         #expect(third.normalizedSymbol == "AAPL")
 
-        let buy = stateMachine.evaluateManualCell(normalizedText: "15")
-        #expect(buy.shouldTriggerBuy)
-        stateMachine.commitManualCellTriggerSuccess()
-        let rearmed = stateMachine.evaluateManualCell(normalizedText: "")
-        #expect(rearmed.isArmedAfter)
+        let blankWhileAlreadyArmed = stateMachine.evaluateManualCell(normalizedText: "")
+        #expect(blankWhileAlreadyArmed.isArmedAfter)
 
         let fourth = stateMachine.evaluateManualSymbol(normalizedText: "aapl", confidence: 0.82)
         #expect(fourth.shouldTriggerSubscribe)
@@ -1469,6 +1463,61 @@ struct TriggerPipelineVerificationHarnessTests {
         #expect(eventCollector.events.last?.frameNumber == 30)
     }
 
+    @Test
+    func manualSymbolForcesFreshOCRAfterTimeIntervalEvenWhenFingerprintIsUnchanged() {
+        let clock = TestClock(now: 0)
+        let sender = CapturingMessageSender()
+        let eventCollector = CapturingPipelineEventHandler()
+        let recognizer = RegionAwareCountingTextRecognizer(
+            results: [
+                .manualCell: OCRTextRecognition(rawText: "", confidence: 1.0),
+                .manualSymbolCell: OCRTextRecognition(rawText: "SKLZ", confidence: 0.9)
+            ]
+        )
+        let pipeline = LowLatencyOCRFramePipeline(
+            loggingEnabled: false,
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 2,
+            manualSymbolSamplingIntervalFrames: 10_000,
+            manualSymbolFreshOCRIntervalSeconds: 10,
+            manualSymbolTriggerConfirmationFrames: 1,
+            recognizer: recognizer,
+            symbolRecognizer: recognizer,
+            asyncSymbolRecognitionEnabled: false,
+            messageSender: sender,
+            beep: {},
+            eventHandler: eventCollector.handle(_:),
+            timeProvider: clock.current
+        )
+        let pixelBuffer = makeSolidPixelBuffer(width: 48, height: 48, fillValue: 0)
+        let runtimeConfig = CaptureRuntimeConfig(
+            displayID: 0,
+            displayWidth: 48,
+            displayHeight: 48,
+            baseROI: PixelRect(x: 0, y: 0, width: 48, height: 48),
+            manualCellROI: PixelRect(x: 0, y: 0, width: 48, height: 48),
+            symbolROI: PixelRect(x: 0, y: 0, width: 48, height: 48),
+            manualSymbolCellROI: PixelRect(x: 0, y: 0, width: 48, height: 48)
+        )
+
+        pipeline.process(VideoFrame(pixelBuffer: pixelBuffer), runtimeConfig: runtimeConfig)
+        #expect(recognizer.callCount(for: .manualSymbolCell) == 1)
+        #expect(sender.messages == [#"{"subscribe":"SKLZ"}"#])
+
+        recognizer.setResult(OCRTextRecognition(rawText: "GLND", confidence: 0.9), for: .manualSymbolCell)
+        clock.set(9.9)
+        pipeline.process(VideoFrame(pixelBuffer: pixelBuffer), runtimeConfig: runtimeConfig)
+        #expect(recognizer.callCount(for: .manualSymbolCell) == 1)
+
+        clock.set(10.1)
+        pipeline.process(VideoFrame(pixelBuffer: pixelBuffer), runtimeConfig: runtimeConfig)
+
+        #expect(recognizer.callCount(for: .manualSymbolCell) == 2)
+        #expect(sender.messages == [#"{"subscribe":"SKLZ"}"#, #"{"subscribe":"GLND"}"#])
+        #expect(eventCollector.events.map(\.action).contains("ocr_resampled"))
+        #expect(eventCollector.events.map(\.action).contains("subscribe_triggered"))
+    }
+
     private final class CapturingMessageSender: TradingMessageSending, @unchecked Sendable {
         private let lock = NSLock()
         private(set) var messages: [String] = []
@@ -1482,6 +1531,27 @@ struct TriggerPipelineVerificationHarnessTests {
             messages.append(payload)
             lock.unlock()
             completion(.success(.submitted))
+        }
+    }
+
+    private final class TestClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var now: CFAbsoluteTime
+
+        init(now: CFAbsoluteTime) {
+            self.now = now
+        }
+
+        func current() -> CFAbsoluteTime {
+            lock.lock()
+            defer { lock.unlock() }
+            return now
+        }
+
+        func set(_ now: CFAbsoluteTime) {
+            lock.lock()
+            self.now = now
+            lock.unlock()
         }
     }
 
@@ -1579,7 +1649,7 @@ struct TriggerPipelineVerificationHarnessTests {
 
     private final class RegionAwareCountingTextRecognizer: OCRTextRecognizing, @unchecked Sendable {
         private let lock = NSLock()
-        private let results: [OCRRegionKind: OCRTextRecognition]
+        private var results: [OCRRegionKind: OCRTextRecognition]
         private var calls: [OCRRegionKind: Int] = [:]
 
         init(results: [OCRRegionKind: OCRTextRecognition]) {
@@ -1590,6 +1660,12 @@ struct TriggerPipelineVerificationHarnessTests {
             lock.lock()
             defer { lock.unlock() }
             return calls[region, default: 0]
+        }
+
+        func setResult(_ result: OCRTextRecognition, for region: OCRRegionKind) {
+            lock.lock()
+            results[region] = result
+            lock.unlock()
         }
 
         func recognizeText(in pixelBuffer: CVPixelBuffer, region: OCRRegionKind) -> OCRTextRecognition {

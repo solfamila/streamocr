@@ -262,11 +262,14 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     private let onOpenSetup: () -> Void
     private let onStartLiveStream: (String) -> Void
     private let onStopLiveStream: () -> Void
+    private let onStartRecording: (String) -> Void
+    private let onStopRecording: () -> Void
     private let onLiveStreamURLChanged: (String) -> Void
     private let onOCRBuyRatioChanged: (Double) -> Void
 
     private var dashboard: TradingDashboardSnapshot
     private var liveStatus = LiveOCRSessionStatusSnapshot.off
+    private var recordingStatus = LiveRecordingStatusSnapshot.off
     private var refreshTimer: Timer?
     private var recoveryMaintenanceInFlight = false
     private var activelyEditedFields = Set<ObjectIdentifier>()
@@ -288,6 +291,7 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     private let pnlLabel = makeLegacyValueLabel()
     private let bookDepthLabel = makeLegacyValueLabel()
     private let liveMetricsLabel = makeLegacyLabel("Live OCR is off.", font: .systemFont(ofSize: 12, weight: .medium), color: .secondaryLabelColor)
+    private let recordingStatusDetailLabel = makeLegacyLabel("Recording is off.", font: .systemFont(ofSize: 12, weight: .medium), color: .secondaryLabelColor)
     private let pricePreviewLabel = makeLegacyLabel("Prices: buy --  |  sell --", font: .monospacedSystemFont(ofSize: 13, weight: .medium))
     private let safetyStatusLabel = makeLegacyLabel("Safety: quote waiting  |  controller disarmed  |  kill switch off", font: .systemFont(ofSize: 12, weight: .medium), color: .secondaryLabelColor)
     private let controllerHintLabel = makeLegacyLabel("Controller: Square buy  |  Circle close  |  Triangle cancel all  |  Cross toggle qty", font: .systemFont(ofSize: 12, weight: .medium), color: .secondaryLabelColor)
@@ -298,6 +302,7 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     private lazy var ocrRatioField = makeLegacyInputField("0.50", width: 80, target: self, action: #selector(ocrRatioFieldAction), delegate: self)
 
     private lazy var liveStartStopButton = makeLegacyButton("Start Live OCR", target: self, action: #selector(toggleLiveStream))
+    private lazy var recordStartStopButton = makeLegacyButton("Start Recording", target: self, action: #selector(toggleRecording))
     private lazy var subscribeButton = makeLegacyButton("Subscribe", target: self, action: #selector(subscribeAction))
     private lazy var buyButton = makeLegacyButton("Buy Limit", target: self, action: #selector(buyAction))
     private lazy var closeButton = makeLegacyButton("Close Long", target: self, action: #selector(closeAction))
@@ -323,6 +328,8 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
         onOpenSetup: @escaping () -> Void,
         onStartLiveStream: @escaping (String) -> Void,
         onStopLiveStream: @escaping () -> Void,
+        onStartRecording: @escaping (String) -> Void,
+        onStopRecording: @escaping () -> Void,
         onLiveStreamURLChanged: @escaping (String) -> Void,
         onOCRBuyRatioChanged: @escaping (Double) -> Void
     ) {
@@ -330,6 +337,8 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
         self.onOpenSetup = onOpenSetup
         self.onStartLiveStream = onStartLiveStream
         self.onStopLiveStream = onStopLiveStream
+        self.onStartRecording = onStartRecording
+        self.onStopRecording = onStopRecording
         self.onLiveStreamURLChanged = onLiveStreamURLChanged
         self.onOCRBuyRatioChanged = onOCRBuyRatioChanged
         self.dashboard = manager.dashboard
@@ -390,11 +399,16 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
         refreshLiveSection()
     }
 
+    func updateRecordingStatus(_ recordingStatus: LiveRecordingStatusSnapshot) {
+        self.recordingStatus = recordingStatus
+        refreshLiveSection()
+    }
+
     func updateOCRBuyRatio(_ ratio: Double) {
         guard !isEditingField(ocrRatioField) else {
             return
         }
-        ocrRatioField.stringValue = String(format: "%.2f", ratio)
+        ocrRatioField.stringValue = formattedOCRBuyRatio(ratio)
     }
 
     func setLiveURLText(_ urlText: String, force: Bool = false) {
@@ -423,6 +437,10 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
             syncInputsToRuntime()
         } else if field === liveURLField {
             onLiveStreamURLChanged(currentLiveStreamURLText)
+        } else if field === quantityField || field === bufferField || field === maxPositionField {
+            syncNumericInputsIfValid()
+        } else if field === ocrRatioField {
+            syncOCRBuyRatioIfValid()
         }
     }
 
@@ -603,6 +621,7 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
         ])
 
         liveStartStopButton.widthAnchor.constraint(equalToConstant: 150).isActive = true
+        recordStartStopButton.widthAnchor.constraint(equalToConstant: 150).isActive = true
         subscribeButton.widthAnchor.constraint(equalToConstant: 116).isActive = true
 
         let liveRow = makeLegacyRowStack([
@@ -616,6 +635,13 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
 
         leftStack.addArrangedSubview(liveMetricsLabel)
         liveMetricsLabel.widthAnchor.constraint(equalTo: leftStack.widthAnchor).isActive = true
+
+        let recordingRow = makeLegacyRowStack([
+            recordStartStopButton,
+            recordingStatusDetailLabel
+        ])
+        leftStack.addArrangedSubview(recordingRow)
+        recordingRow.widthAnchor.constraint(equalTo: leftStack.widthAnchor).isActive = true
 
         let symbolRow = makeLegacyRowStack([
             makeLegacyLabel("Symbol", font: .systemFont(ofSize: 13, weight: .semibold), color: .secondaryLabelColor),
@@ -746,7 +772,7 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     }
 
     private func refreshInterface() {
-        let deferNoncriticalUIUpdates = !activelyEditedFields.isEmpty
+        let deferNoncriticalUIUpdates = isEditingAnyInputField()
         updateInputFieldsFromState()
         refreshStatusLabels()
         refreshLiveSection()
@@ -847,6 +873,25 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
             : (liveStatus.isRunning ? "Stop Live OCR" : "Start Live OCR")
         liveStartStopButton.isEnabled = liveStatus.state != .stopping
         liveStartStopButton.bezelColor = liveStatus.isRunning
+            ? NSColor(calibratedRed: 0.70, green: 0.20, blue: 0.18, alpha: 1)
+            : NSColor(calibratedRed: 0.13, green: 0.48, blue: 0.82, alpha: 1)
+
+        recordingStatusDetailLabel.stringValue = recordingStatus.detail
+        switch recordingStatus.state {
+        case .off:
+            recordingStatusDetailLabel.textColor = .secondaryLabelColor
+        case .recording:
+            recordingStatusDetailLabel.textColor = .systemGreen
+        case .stopping:
+            recordingStatusDetailLabel.textColor = .systemOrange
+        case .error:
+            recordingStatusDetailLabel.textColor = .systemRed
+        }
+        recordStartStopButton.title = recordingStatus.state == .stopping
+            ? "Stopping..."
+            : (recordingStatus.isRecording ? "Stop Recording" : "Start Recording")
+        recordStartStopButton.isEnabled = recordingStatus.state != .stopping
+        recordStartStopButton.bezelColor = recordingStatus.isRecording
             ? NSColor(calibratedRed: 0.70, green: 0.20, blue: 0.18, alpha: 1)
             : NSColor(calibratedRed: 0.13, green: 0.48, blue: 0.82, alpha: 1)
 
@@ -990,7 +1035,7 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
             ocrRatioField.stringValue = sanitizedOCRBuyRatioString()
         }
         if !isEditingField(bufferField) {
-            bufferField.stringValue = String(format: "%.2f", dashboard.inputs.priceBuffer)
+            bufferField.stringValue = formattedPriceBuffer(dashboard.inputs.priceBuffer)
         }
         if !isEditingField(maxPositionField) {
             maxPositionField.stringValue = String(format: "%.0f", dashboard.inputs.maxPositionDollars)
@@ -1004,7 +1049,21 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     }
 
     private func isEditingField(_ field: NSTextField) -> Bool {
-        activelyEditedFields.contains(ObjectIdentifier(field))
+        activelyEditedFields.contains(ObjectIdentifier(field)) || field.currentEditor() != nil
+    }
+
+    private func isEditingAnyInputField() -> Bool {
+        if !activelyEditedFields.isEmpty {
+            return true
+        }
+        return [
+            quantityField,
+            bufferField,
+            maxPositionField,
+            ocrRatioField,
+            symbolField,
+            liveURLField
+        ].contains { $0.currentEditor() != nil }
     }
 
     private func sanitizedOCRBuyRatio() -> Double {
@@ -1013,7 +1072,28 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     }
 
     private func sanitizedOCRBuyRatioString() -> String {
-        String(format: "%.2f", sanitizedOCRBuyRatio())
+        formattedOCRBuyRatio(sanitizedOCRBuyRatio())
+    }
+
+    private func formattedOCRBuyRatio(_ ratio: Double) -> String {
+        let sanitizedRatio = ratio.isFinite && ratio > 0 ? ratio : 0.5
+        return formattedCompactDecimal(sanitizedRatio, fractionalDigits: 10)
+    }
+
+    private func formattedPriceBuffer(_ buffer: Double) -> String {
+        let sanitizedBuffer = buffer.isFinite && buffer >= 0 ? buffer : 0
+        return formattedCompactDecimal(sanitizedBuffer, fractionalDigits: 6)
+    }
+
+    private func formattedCompactDecimal(_ value: Double, fractionalDigits: Int) -> String {
+        var text = String(format: "%.\(fractionalDigits)f", value)
+        while text.contains("."), text.last == "0" {
+            text.removeLast()
+        }
+        if text.last == "." {
+            text.removeLast()
+        }
+        return text
     }
 
     private func localStateColor(_ order: TradingDashboardSnapshot.Order) -> NSColor {
@@ -1055,10 +1135,53 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
         }
     }
 
+    private func syncNumericInputsIfValid() {
+        guard positiveIntegerText(quantityField.stringValue) != nil else {
+            return
+        }
+        guard nonnegativeDecimalText(bufferField.stringValue) != nil else {
+            return
+        }
+        guard decimalText(maxPositionField.stringValue).map({ $0 >= 1000 }) == true else {
+            return
+        }
+        syncInputsToRuntime()
+    }
+
+    private func syncOCRBuyRatioIfValid() {
+        guard decimalText(ocrRatioField.stringValue).map({ $0 > 0 }) == true else {
+            return
+        }
+        onOCRBuyRatioChanged(sanitizedOCRBuyRatio())
+    }
+
+    private func positiveIntegerText(_ text: String) -> Int? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value = Int(trimmed), value > 0 else {
+            return nil
+        }
+        return value
+    }
+
+    private func nonnegativeDecimalText(_ text: String) -> Double? {
+        guard let value = decimalText(text), value >= 0 else {
+            return nil
+        }
+        return value
+    }
+
+    private func decimalText(_ text: String) -> Double? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let value = Double(trimmed), value.isFinite else {
+            return nil
+        }
+        return value
+    }
+
     @objc
     private func refreshTimerFired() {
         guard window?.isVisible == true else { return }
-        guard activelyEditedFields.isEmpty else { return }
+        guard !isEditingAnyInputField() else { return }
         manager.refreshDashboard()
     }
 
@@ -1076,7 +1199,7 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     @objc
     private func ocrRatioFieldAction() {
         let ratio = sanitizedOCRBuyRatio()
-        ocrRatioField.stringValue = String(format: "%.2f", ratio)
+        ocrRatioField.stringValue = formattedOCRBuyRatio(ratio)
         onOCRBuyRatioChanged(ratio)
     }
 
@@ -1097,6 +1220,25 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
         onLiveStreamURLChanged(urlText)
         onStartLiveStream(urlText)
         appendMessage("Starting live OCR stream")
+    }
+
+    @objc
+    private func toggleRecording() {
+        if recordingStatus.isRecording {
+            onStopRecording()
+            appendMessage("Stopping live stream recording")
+            return
+        }
+
+        let urlText = currentLiveStreamURLText
+        guard !urlText.isEmpty else {
+            appendMessage("Enter a live stream URL before starting recording")
+            return
+        }
+
+        onLiveStreamURLChanged(urlText)
+        onStartRecording(urlText)
+        appendMessage("Starting live stream recording")
     }
 
     @objc
