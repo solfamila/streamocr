@@ -170,8 +170,9 @@ recognition is replayed into the trigger state machine so multi-frame
 confirmation still works without rerunning OCR. Symbol OCR also forces a fresh
 read at least every 10 seconds, even when the symbol-cell fingerprint looks
 unchanged, so a stale ticker cannot persist indefinitely because of cache replay.
-Confirmed blank/zero position reads unlock symbol changes, while nonzero
-positions keep symbol changes locked.
+Confirmed high-confidence symbol changes can subscribe immediately; changed
+symbols below the confidence floor are suppressed instead of being treated as a
+new ticker.
 
 In live JSON results, `playbackURL` is the actual URL used by the active live
 decoder. With the direct decoder path, that is usually the resolved

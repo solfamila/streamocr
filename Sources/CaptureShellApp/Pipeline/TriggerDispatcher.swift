@@ -230,7 +230,7 @@ final class TriggerDispatcher: @unchecked Sendable {
         }
 
         if evaluation.isChangeLocked {
-            return TriggerDispatchDecision(action: "locked_waiting_for_rearm", event: nil)
+            return TriggerDispatchDecision(action: "changed_symbol_low_confidence_suppressed", event: nil)
         }
 
         if evaluation.isAwaitingConfirmation {

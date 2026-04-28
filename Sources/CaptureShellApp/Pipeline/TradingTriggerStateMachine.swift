@@ -142,7 +142,6 @@ final class TradingTriggerStateMachine {
     private var lastCommittedManualSymbol: String?
     private var pendingManualSymbol: String?
     private var pendingManualSymbolConfirmationCount = 0
-    private var manualSymbolChangeIsArmed = true
 
     init(
         manualCellRearmConfirmationFrames: Int = 1,
@@ -172,14 +171,12 @@ final class TradingTriggerStateMachine {
         lastCommittedManualSymbol = nil
         pendingManualSymbol = nil
         pendingManualSymbolConfirmationCount = 0
-        manualSymbolChangeIsArmed = true
     }
 
     func clearManualSymbolState() {
         lastCommittedManualSymbol = nil
         pendingManualSymbol = nil
         pendingManualSymbolConfirmationCount = 0
-        manualSymbolChangeIsArmed = true
     }
 
     func evaluateManualCell(normalizedText: String, confidence: Double = 1.0) -> ManualCellTriggerEvaluation {
@@ -240,7 +237,6 @@ final class TradingTriggerStateMachine {
             manualCellIsArmed = true
             pendingManualCellIntegerValue = nil
             pendingManualCellConfirmationCount = 0
-            manualSymbolChangeIsArmed = true
             manualCellOpenPositionPeakValue = nil
             manualCellSellWasTriggered = false
         }
@@ -285,7 +281,7 @@ final class TradingTriggerStateMachine {
             !normalizedSymbol.isEmpty &&
             !isDuplicate &&
             lastCommittedManualSymbol != nil &&
-            (!manualSymbolChangeIsArmed || isLowConfidenceChangedSymbol)
+            isLowConfidenceChangedSymbol
         var confirmationProgress = 0
 
         if normalizedSymbol.isEmpty || isDuplicate || isChangeLocked {
@@ -366,6 +362,5 @@ final class TradingTriggerStateMachine {
         lastCommittedManualSymbol = TradingMessageContract.normalizeSymbol(symbol)
         pendingManualSymbol = nil
         pendingManualSymbolConfirmationCount = 0
-        manualSymbolChangeIsArmed = false
     }
 }

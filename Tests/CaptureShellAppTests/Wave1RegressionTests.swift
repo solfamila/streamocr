@@ -1168,7 +1168,7 @@ struct TradingTriggerStateMachineTests {
     }
 
     @Test
-    func manualSymbolUnlocksSymbolChangesWhenManualCellIsConfirmedZero() {
+    func manualSymbolAllowsConfirmedChangedSymbolWithoutManualCellRearm() {
         let stateMachine = TradingTriggerStateMachine()
 
         let first = stateMachine.evaluateManualSymbol(normalizedText: "ms ft", confidence: 0.82)
@@ -1182,31 +1182,23 @@ struct TradingTriggerStateMachineTests {
         #expect(second.normalizedSymbol == "MSFT")
 
         let third = stateMachine.evaluateManualSymbol(normalizedText: "aapl", confidence: 0.82)
-        #expect(!third.shouldTriggerSubscribe)
-        #expect(third.isChangeLocked)
+        #expect(third.shouldTriggerSubscribe)
+        #expect(!third.isChangeLocked)
         #expect(third.normalizedSymbol == "AAPL")
 
-        let blankWhileAlreadyArmed = stateMachine.evaluateManualCell(normalizedText: "")
-        #expect(blankWhileAlreadyArmed.isArmedAfter)
-
+        stateMachine.commitManualSymbolTriggerSuccess(symbol: third.normalizedSymbol)
         let fourth = stateMachine.evaluateManualSymbol(normalizedText: "aapl", confidence: 0.82)
-        #expect(fourth.shouldTriggerSubscribe)
-        #expect(fourth.normalizedSymbol == "AAPL")
+        #expect(!fourth.shouldTriggerSubscribe)
+        #expect(fourth.isDuplicate)
     }
 
     @Test
-    func manualSymbolChangedSymbolRequiresHigherConfidenceAfterRearm() {
+    func manualSymbolChangedSymbolRequiresHigherConfidence() {
         let stateMachine = TradingTriggerStateMachine(manualSymbolTriggerConfirmationFrames: 1)
 
         let first = stateMachine.evaluateManualSymbol(normalizedText: "plrz", confidence: 0.82)
         #expect(first.shouldTriggerSubscribe)
         stateMachine.commitManualSymbolTriggerSuccess(symbol: first.normalizedSymbol)
-
-        let buy = stateMachine.evaluateManualCell(normalizedText: "15")
-        #expect(buy.shouldTriggerBuy)
-        stateMachine.commitManualCellTriggerSuccess()
-        let rearmed = stateMachine.evaluateManualCell(normalizedText: "")
-        #expect(rearmed.isArmedAfter)
 
         let lowConfidenceChange = stateMachine.evaluateManualSymbol(normalizedText: "plpz", confidence: 0.77)
         #expect(!lowConfidenceChange.shouldTriggerSubscribe)
@@ -1246,7 +1238,7 @@ struct TriggerPipelineVerificationHarnessTests {
     }
 
     @Test
-    func manualSymbolTransitionsEmitSubscribeOnlyAfterManualCellRearm() {
+    func manualSymbolTransitionsEmitSubscribeForConfirmedChangedSymbol() {
         let sender = CapturingMessageSender()
         let pipeline = LowLatencyOCRFramePipeline(
             manualCellRearmConfirmationFrames: 1,
@@ -1274,19 +1266,10 @@ struct TriggerPipelineVerificationHarnessTests {
             normalizedText: "AAPL",
             confidence: 0.8
         )
-        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "15", normalizedText: "15", confidence: 0.9)
-        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "", normalizedText: "", confidence: 0.9)
-        pipeline.processTriggerEventForTesting(
-            region: .manualSymbolCell,
-            rawText: "aapl",
-            normalizedText: "AAPL",
-            confidence: 0.8
-        )
 
         #expect(
             sender.messages == [
                 #"{"subscribe":"MSFT"}"#,
-                TradingMessageContract.buyMessage(ocrQuantity: 15),
                 #"{"subscribe":"AAPL"}"#
             ]
         )
@@ -1717,12 +1700,19 @@ struct TriggerPipelineVerificationHarnessTests {
             normalizedText: "AAPL",
             confidence: 0.9
         )
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "aapl",
+            normalizedText: "AAPL",
+            confidence: 0.9
+        )
 
-        #expect(sender.messages == [#"{"subscribe":"PLRZ"}"#])
+        #expect(sender.messages == [#"{"subscribe":"PLRZ"}"#, #"{"subscribe":"AAPL"}"#])
         #expect(
             eventCollector.events.map(\.action) == [
                 "subscribe_triggered",
-                "subscribe_transport_succeeded"
+                "subscribe_transport_succeeded",
+                "subscribe_triggered"
             ]
         )
     }
