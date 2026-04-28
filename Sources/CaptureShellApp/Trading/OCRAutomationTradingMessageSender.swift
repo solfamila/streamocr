@@ -119,8 +119,18 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
     private func handleSell(payload: String, generation: Int) async throws -> TradingMessageSendOutcome {
         let sellMessage = try TradingMessageContract.parseSellMessage(payload)
         try throwIfCancelled(generation: generation)
+        try throwIfActiveSymbolChanged(
+            expectedSymbol: sellMessage.symbol,
+            snapshot: manager.dashboard,
+            eventName: "SELL"
+        )
 
         let preSubmitDashboard = try await awaitSellAvailability(generation: generation)
+        try throwIfActiveSymbolChanged(
+            expectedSymbol: sellMessage.symbol,
+            snapshot: preSubmitDashboard,
+            eventName: "SELL"
+        )
         print(armedSellAttemptLogLine(snapshot: preSubmitDashboard, sellMessage: sellMessage))
 
         if let disposition = sellRejectionDisposition(snapshot: preSubmitDashboard) {
@@ -141,6 +151,11 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         }
 
         try throwIfCancelled(generation: generation)
+        try throwIfActiveSymbolChanged(
+            expectedSymbol: sellMessage.symbol,
+            snapshot: manager.dashboard,
+            eventName: "SELL"
+        )
 
         do {
             _ = try await manager.submitCloseAsync(
@@ -199,6 +214,11 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         try throwIfCancelled(generation: generation)
 
         let dashboard = manager.dashboard
+        try throwIfActiveSymbolChanged(
+            expectedSymbol: buyMessage.symbol,
+            snapshot: dashboard,
+            eventName: "BUY"
+        )
 
         manager.setUIInputs(
             symbolInput: dashboard.inputs.symbolInput,
@@ -211,6 +231,11 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         )
 
         let preSubmitDashboard = try await awaitBuyAvailability(quantityInput: quantityInput, generation: generation)
+        try throwIfActiveSymbolChanged(
+            expectedSymbol: buyMessage.symbol,
+            snapshot: preSubmitDashboard,
+            eventName: "BUY"
+        )
         print(armedBuyAttemptLogLine(
             snapshot: preSubmitDashboard,
             ocrQuantity: buyMessage.ocrQuantity,
@@ -238,6 +263,11 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         }
 
         try throwIfCancelled(generation: generation)
+        try throwIfActiveSymbolChanged(
+            expectedSymbol: buyMessage.symbol,
+            snapshot: manager.dashboard,
+            eventName: "BUY"
+        )
 
         do {
             _ = try await manager.submitBuyAsync(
@@ -733,6 +763,24 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
     private func throwIfCancelled(generation: Int) throws {
         if let cancellationReason = cancellationReasonSnapshot(for: generation) {
             throw TradingMessageSendError.cancelled(reason: cancellationReason)
+        }
+    }
+
+    private func throwIfActiveSymbolChanged(
+        expectedSymbol: String?,
+        snapshot: TradingDashboardSnapshot,
+        eventName: String
+    ) throws {
+        guard let expectedSymbol, !expectedSymbol.isEmpty else {
+            return
+        }
+
+        let activeSymbol = TradingMessageContract.normalizeSymbol(snapshot.inputs.subscribedSymbol)
+        guard activeSymbol == expectedSymbol else {
+            let displayedActiveSymbol = activeSymbol.isEmpty ? "<none>" : activeSymbol
+            throw TradingMessageSendError.cancelled(
+                reason: "OCR \(eventName) stale because active symbol changed from \(expectedSymbol) to \(displayedActiveSymbol)."
+            )
         }
     }
 

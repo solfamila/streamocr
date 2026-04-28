@@ -11,18 +11,25 @@ struct TradingMessageContractTests {
     func buyMessageMatchesContract() {
         #expect(TradingMessageContract.buyMessage(ocrQuantity: nil) == #"{"action":"BUY"}"#)
         #expect(TradingMessageContract.buyMessage(ocrQuantity: 10000) == #"{"action":"BUY","ocrQuantity":10000}"#)
+        #expect(TradingMessageContract.buyMessage(ocrQuantity: 10000, symbol: "PLRZ") == #"{"action":"BUY","symbol":"PLRZ","ocrQuantity":10000}"#)
 
         let parsed = try? TradingMessageContract.parseBuyMessage(#"{"action":"BUY","ocrQuantity":10000}"#)
-        #expect(parsed == OCRBuyMessage(ocrQuantity: 10000))
+        #expect(parsed == OCRBuyMessage(ocrQuantity: 10000, symbol: nil))
+        let parsedWithSymbol = try? TradingMessageContract.parseBuyMessage(#"{"action":"BUY","symbol":"PLRZ","ocrQuantity":10000}"#)
+        #expect(parsedWithSymbol == OCRBuyMessage(ocrQuantity: 10000, symbol: "PLRZ"))
     }
 
     @Test
     func sellMessageMatchesContract() {
         let payload = TradingMessageContract.sellMessage(ocrQuantity: 25000, previousOCRQuantity: 30000)
         #expect(payload == #"{"action":"SELL","ocrQuantity":25000,"previousOCRQuantity":30000}"#)
+        let symbolPayload = TradingMessageContract.sellMessage(ocrQuantity: 25000, previousOCRQuantity: 30000, symbol: "PLRZ")
+        #expect(symbolPayload == #"{"action":"SELL","symbol":"PLRZ","ocrQuantity":25000,"previousOCRQuantity":30000}"#)
 
         let parsed = try? TradingMessageContract.parseSellMessage(payload)
-        #expect(parsed == OCRSellMessage(ocrQuantity: 25000, previousOCRQuantity: 30000))
+        #expect(parsed == OCRSellMessage(ocrQuantity: 25000, previousOCRQuantity: 30000, symbol: nil))
+        let parsedWithSymbol = try? TradingMessageContract.parseSellMessage(symbolPayload)
+        #expect(parsedWithSymbol == OCRSellMessage(ocrQuantity: 25000, previousOCRQuantity: 30000, symbol: "PLRZ"))
     }
 
     @Test
@@ -1183,7 +1190,7 @@ struct TradingTriggerStateMachineTests {
 
         let third = stateMachine.evaluateManualSymbol(normalizedText: "aapl", confidence: 0.82)
         #expect(third.shouldTriggerSubscribe)
-        #expect(!third.isChangeLocked)
+        #expect(!third.isChangedSymbolSuppressed)
         #expect(third.normalizedSymbol == "AAPL")
 
         stateMachine.commitManualSymbolTriggerSuccess(symbol: third.normalizedSymbol)
@@ -1202,7 +1209,7 @@ struct TradingTriggerStateMachineTests {
 
         let lowConfidenceChange = stateMachine.evaluateManualSymbol(normalizedText: "plpz", confidence: 0.77)
         #expect(!lowConfidenceChange.shouldTriggerSubscribe)
-        #expect(lowConfidenceChange.isChangeLocked)
+        #expect(lowConfidenceChange.isChangedSymbolSuppressed)
 
         let highConfidenceChange = stateMachine.evaluateManualSymbol(normalizedText: "aapl", confidence: 0.80)
         #expect(highConfidenceChange.shouldTriggerSubscribe)
@@ -1713,6 +1720,185 @@ struct TriggerPipelineVerificationHarnessTests {
                 "subscribe_triggered",
                 "subscribe_transport_succeeded",
                 "subscribe_triggered"
+            ]
+        )
+    }
+
+    @Test
+    func committedSymbolChangeClearsManualCellPeakBeforeSellEvaluation() {
+        let sender = ControlledTransportMessageSender()
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1,
+            manualSymbolTriggerConfirmationFrames: 1,
+            messageSender: sender,
+            beep: {}
+        )
+
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "spy",
+            normalizedText: "SPY",
+            confidence: 0.9
+        )
+        sender.succeedNext(matchingPayload: #"{"subscribe":"SPY"}"#)
+        pipeline.processTriggerEventForTesting(
+            region: .manualCell,
+            rawText: "30000",
+            normalizedText: "30000",
+            confidence: 0.9
+        )
+        sender.succeedNext(matchingPayload: TradingMessageContract.buyMessage(ocrQuantity: 30000, symbol: "SPY"))
+
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "nexr",
+            normalizedText: "NEXR",
+            confidence: 0.9
+        )
+        sender.succeedNext(matchingPayload: #"{"subscribe":"NEXR"}"#)
+        pipeline.processTriggerEventForTesting(
+            region: .manualCell,
+            rawText: "25000",
+            normalizedText: "25000",
+            confidence: 0.9
+        )
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "", normalizedText: "", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(
+            region: .manualCell,
+            rawText: "10000",
+            normalizedText: "10000",
+            confidence: 0.9
+        )
+
+        #expect(
+            sender.messages == [
+                #"{"subscribe":"SPY"}"#,
+                TradingMessageContract.buyMessage(ocrQuantity: 30000, symbol: "SPY"),
+                #"{"subscribe":"NEXR"}"#,
+                TradingMessageContract.buyMessage(ocrQuantity: 10000, symbol: "NEXR")
+            ]
+        )
+    }
+
+    @Test
+    func pendingBuyIsStaledWhenDifferentSymbolSubscribeCommits() {
+        let sender = ControlledTransportMessageSender()
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1,
+            manualSymbolTriggerConfirmationFrames: 1,
+            messageSender: sender,
+            beep: {}
+        )
+
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "spy",
+            normalizedText: "SPY",
+            confidence: 0.9
+        )
+        sender.succeedNext(matchingPayload: #"{"subscribe":"SPY"}"#)
+        pipeline.processTriggerEventForTesting(
+            region: .manualCell,
+            rawText: "10000",
+            normalizedText: "10000",
+            confidence: 0.9
+        )
+
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "nexr",
+            normalizedText: "NEXR",
+            confidence: 0.9
+        )
+        sender.succeedNext(matchingPayload: #"{"subscribe":"NEXR"}"#)
+        sender.succeedNext(matchingPayload: TradingMessageContract.buyMessage(ocrQuantity: 10000, symbol: "SPY"))
+        pipeline.processTriggerEventForTesting(
+            region: .manualCell,
+            rawText: "9000",
+            normalizedText: "9000",
+            confidence: 0.9
+        )
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "", normalizedText: "", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(
+            region: .manualCell,
+            rawText: "5000",
+            normalizedText: "5000",
+            confidence: 0.9
+        )
+
+        #expect(
+            sender.messages == [
+                #"{"subscribe":"SPY"}"#,
+                TradingMessageContract.buyMessage(ocrQuantity: 10000, symbol: "SPY"),
+                #"{"subscribe":"NEXR"}"#,
+                TradingMessageContract.buyMessage(ocrQuantity: 5000, symbol: "NEXR")
+            ]
+        )
+    }
+
+    @Test
+    func pendingSellIsStaledWhenDifferentSymbolSubscribeCommits() {
+        let sender = ControlledTransportMessageSender()
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1,
+            manualSymbolTriggerConfirmationFrames: 1,
+            messageSender: sender,
+            beep: {}
+        )
+
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "spy",
+            normalizedText: "SPY",
+            confidence: 0.9
+        )
+        sender.succeedNext(matchingPayload: #"{"subscribe":"SPY"}"#)
+        pipeline.processTriggerEventForTesting(
+            region: .manualCell,
+            rawText: "30000",
+            normalizedText: "30000",
+            confidence: 0.9
+        )
+        sender.succeedNext(matchingPayload: TradingMessageContract.buyMessage(ocrQuantity: 30000, symbol: "SPY"))
+        pipeline.processTriggerEventForTesting(
+            region: .manualCell,
+            rawText: "25000",
+            normalizedText: "25000",
+            confidence: 0.9
+        )
+
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "nexr",
+            normalizedText: "NEXR",
+            confidence: 0.9
+        )
+        sender.succeedNext(matchingPayload: #"{"subscribe":"NEXR"}"#)
+        sender.succeedNext(
+            matchingPayload: TradingMessageContract.sellMessage(
+                ocrQuantity: 25000,
+                previousOCRQuantity: 30000,
+                symbol: "SPY"
+            )
+        )
+        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "", normalizedText: "", confidence: 0.9)
+        pipeline.processTriggerEventForTesting(
+            region: .manualCell,
+            rawText: "5000",
+            normalizedText: "5000",
+            confidence: 0.9
+        )
+
+        #expect(
+            sender.messages == [
+                #"{"subscribe":"SPY"}"#,
+                TradingMessageContract.buyMessage(ocrQuantity: 30000, symbol: "SPY"),
+                TradingMessageContract.sellMessage(ocrQuantity: 25000, previousOCRQuantity: 30000, symbol: "SPY"),
+                #"{"subscribe":"NEXR"}"#,
+                TradingMessageContract.buyMessage(ocrQuantity: 5000, symbol: "NEXR")
             ]
         )
     }

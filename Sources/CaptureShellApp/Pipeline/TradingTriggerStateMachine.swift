@@ -118,7 +118,7 @@ struct ManualCellTriggerEvaluation {
 struct ManualSymbolTriggerEvaluation {
     let normalizedSymbol: String
     let isDuplicate: Bool
-    let isChangeLocked: Bool
+    let isChangedSymbolSuppressed: Bool
     let isAwaitingConfirmation: Bool
     let confirmationProgress: Int
     let requiredConfirmationCount: Int
@@ -177,6 +177,10 @@ final class TradingTriggerStateMachine {
         lastCommittedManualSymbol = nil
         pendingManualSymbol = nil
         pendingManualSymbolConfirmationCount = 0
+    }
+
+    func currentManualSymbol() -> String? {
+        lastCommittedManualSymbol
     }
 
     func evaluateManualCell(normalizedText: String, confidence: Double = 1.0) -> ManualCellTriggerEvaluation {
@@ -277,14 +281,14 @@ final class TradingTriggerStateMachine {
             !normalizedSymbol.isEmpty &&
             !isDuplicate &&
             confidence < manualSymbolChangedSymbolMinimumConfidence
-        let isChangeLocked =
+        let isChangedSymbolSuppressed =
             !normalizedSymbol.isEmpty &&
             !isDuplicate &&
             lastCommittedManualSymbol != nil &&
             isLowConfidenceChangedSymbol
         var confirmationProgress = 0
 
-        if normalizedSymbol.isEmpty || isDuplicate || isChangeLocked {
+        if normalizedSymbol.isEmpty || isDuplicate || isChangedSymbolSuppressed {
             pendingManualSymbol = nil
             pendingManualSymbolConfirmationCount = 0
         } else if pendingManualSymbol == normalizedSymbol {
@@ -299,17 +303,17 @@ final class TradingTriggerStateMachine {
         let shouldTriggerSubscribe =
             !normalizedSymbol.isEmpty &&
             !isDuplicate &&
-            !isChangeLocked &&
+            !isChangedSymbolSuppressed &&
             confirmationProgress >= manualSymbolTriggerConfirmationFrames
 
         return ManualSymbolTriggerEvaluation(
             normalizedSymbol: normalizedSymbol,
             isDuplicate: isDuplicate,
-            isChangeLocked: isChangeLocked,
+            isChangedSymbolSuppressed: isChangedSymbolSuppressed,
             isAwaitingConfirmation:
                 !normalizedSymbol.isEmpty &&
                 !isDuplicate &&
-                !isChangeLocked &&
+                !isChangedSymbolSuppressed &&
                 !shouldTriggerSubscribe &&
                 confirmationProgress > 0,
             confirmationProgress: confirmationProgress,
@@ -337,6 +341,16 @@ final class TradingTriggerStateMachine {
         manualCellSellWasTriggered = true
     }
 
+    func clearManualCellTradingStateForSymbolChange() {
+        manualCellIsArmed = false
+        manualCellZeroLikeStreak = 0
+        pendingManualCellIntegerValue = nil
+        pendingManualCellConfirmationCount = 0
+        manualCellOpenPositionPeakValue = nil
+        manualCellSellWasTriggered = false
+        lastManualCellText = nil
+    }
+
     private func isSafeSellDecrease(currentValue: Int, peakValue: Int, confidence: Double) -> Bool {
         guard confidence >= manualCellSellMinimumConfidence else {
             return false
@@ -358,9 +372,15 @@ final class TradingTriggerStateMachine {
         String(abs(value)).count
     }
 
-    func commitManualSymbolTriggerSuccess(symbol: String) {
-        lastCommittedManualSymbol = TradingMessageContract.normalizeSymbol(symbol)
+    @discardableResult
+    func commitManualSymbolTriggerSuccess(symbol: String) -> Bool {
+        let normalizedSymbol = TradingMessageContract.normalizeSymbol(symbol)
+        let didChangeCommittedSymbol =
+            lastCommittedManualSymbol != nil &&
+            lastCommittedManualSymbol != normalizedSymbol
+        lastCommittedManualSymbol = normalizedSymbol
         pendingManualSymbol = nil
         pendingManualSymbolConfirmationCount = 0
+        return didChangeCommittedSymbol
     }
 }

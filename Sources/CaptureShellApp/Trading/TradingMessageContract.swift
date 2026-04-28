@@ -29,23 +29,32 @@ struct SymbolNormalizationAnalysis: Equatable, Sendable {
 
 struct OCRBuyMessage: Equatable, Sendable {
     let ocrQuantity: Int?
+    let symbol: String?
 }
 
 struct OCRSellMessage: Equatable, Sendable {
     let ocrQuantity: Int?
     let previousOCRQuantity: Int?
+    let symbol: String?
 }
 
 enum TradingMessageContract {
-    static func buyMessage(ocrQuantity: Int?) -> String {
-        guard let ocrQuantity else {
-            return #"{"action":"BUY"}"#
+    static func buyMessage(ocrQuantity: Int?, symbol: String? = nil) -> String {
+        var fields = [#""action":"BUY""#]
+        if let normalizedSymbol = normalizedPayloadSymbol(symbol) {
+            fields.append(#""symbol":"\#(normalizedSymbol)""#)
         }
-        return #"{"action":"BUY","ocrQuantity":\#(ocrQuantity)}"#
+        if let ocrQuantity {
+            fields.append(#""ocrQuantity":\#(ocrQuantity)"#)
+        }
+        return "{\(fields.joined(separator: ","))}"
     }
 
-    static func sellMessage(ocrQuantity: Int?, previousOCRQuantity: Int?) -> String {
+    static func sellMessage(ocrQuantity: Int?, previousOCRQuantity: Int?, symbol: String? = nil) -> String {
         var fields = [#""action":"SELL""#]
+        if let normalizedSymbol = normalizedPayloadSymbol(symbol) {
+            fields.append(#""symbol":"\#(normalizedSymbol)""#)
+        }
         if let ocrQuantity {
             fields.append(#""ocrQuantity":\#(ocrQuantity)"#)
         }
@@ -136,7 +145,10 @@ enum TradingMessageContract {
             ocrQuantity = nil
         }
 
-        return OCRBuyMessage(ocrQuantity: ocrQuantity)
+        return OCRBuyMessage(
+            ocrQuantity: ocrQuantity,
+            symbol: try optionalSymbolField(in: object, payloadError: .invalidBuyPayload)
+        )
     }
 
     static func parseSellMessage(_ payload: String) throws -> OCRSellMessage {
@@ -154,8 +166,35 @@ enum TradingMessageContract {
 
         return OCRSellMessage(
             ocrQuantity: try optionalIntegerField("ocrQuantity", in: object),
-            previousOCRQuantity: try optionalIntegerField("previousOCRQuantity", in: object)
+            previousOCRQuantity: try optionalIntegerField("previousOCRQuantity", in: object),
+            symbol: try optionalSymbolField(in: object, payloadError: .invalidSellPayload)
         )
+    }
+
+    private static func normalizedPayloadSymbol(_ symbol: String?) -> String? {
+        guard let symbol else {
+            return nil
+        }
+        return normalizedOCRSymbol(symbol)
+    }
+
+    private static func optionalSymbolField(
+        in object: [String: Any],
+        payloadError: TradingMessageContractError
+    ) throws -> String? {
+        guard let rawSymbol = object["symbol"] else {
+            return nil
+        }
+
+        guard let symbol = rawSymbol as? String else {
+            throw payloadError
+        }
+
+        guard let normalized = normalizedOCRSymbol(symbol), normalized == symbol else {
+            throw TradingMessageContractError.invalidSymbol(symbol)
+        }
+
+        return normalized
     }
 
     private static func optionalIntegerField(_ key: String, in object: [String: Any]) throws -> Int? {

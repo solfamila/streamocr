@@ -229,7 +229,7 @@ final class TriggerDispatcher: @unchecked Sendable {
             return TriggerDispatchDecision(action: "duplicate_suppressed", event: nil)
         }
 
-        if evaluation.isChangeLocked {
+        if evaluation.isChangedSymbolSuppressed {
             return TriggerDispatchDecision(action: "changed_symbol_low_confidence_suppressed", event: nil)
         }
 
@@ -256,7 +256,13 @@ final class TriggerDispatcher: @unchecked Sendable {
             buyDecisionMilliseconds: buyDecisionMilliseconds
         )
 
-        messageSender.send(TradingMessageContract.buyMessage(ocrQuantity: integerValue), event: "BUY") { [weak self] result in
+        messageSender.send(
+            TradingMessageContract.buyMessage(
+                ocrQuantity: integerValue,
+                symbol: triggerStateMachine.currentManualSymbol()
+            ),
+            event: "BUY"
+        ) { [weak self] result in
             self?.withPipelineState { [weak self] in
                 self?.handleBuyTransportResult(result)
             }
@@ -284,7 +290,8 @@ final class TriggerDispatcher: @unchecked Sendable {
         messageSender.send(
             TradingMessageContract.sellMessage(
                 ocrQuantity: integerValue,
-                previousOCRQuantity: openPositionPeakValue
+                previousOCRQuantity: openPositionPeakValue,
+                symbol: triggerStateMachine.currentManualSymbol()
             ),
             event: "SELL"
         ) { [weak self] result in
@@ -380,6 +387,23 @@ final class TriggerDispatcher: @unchecked Sendable {
 
         pendingSubscribeTransport.isStale = true
         self.pendingSubscribeTransport = pendingSubscribeTransport
+    }
+
+    func invalidatePendingManualCellTransportsAfterSymbolChange() {
+        assertPipelineStateHeld()
+
+        if var pendingBuyTransport, !pendingBuyTransport.isStale {
+            pendingBuyTransport.isStale = true
+            self.pendingBuyTransport = pendingBuyTransport
+        }
+
+        if var pendingSellTransport, !pendingSellTransport.isStale {
+            pendingSellTransport.isStale = true
+            self.pendingSellTransport = pendingSellTransport
+        }
+
+        recentRetryableBuyRejection = nil
+        recentRetryableSellRejection = nil
     }
 
     private func handleBuyTransportResult(_ result: Result<TradingMessageSendOutcome, any Error>) {
@@ -519,7 +543,13 @@ final class TriggerDispatcher: @unchecked Sendable {
            outcome.commitsTriggerState,
            !pendingSubscribeTransport.isStale
         {
-            triggerStateMachine.commitManualSymbolTriggerSuccess(symbol: pendingSubscribeTransport.symbol)
+            let didChangeCommittedSymbol = triggerStateMachine.commitManualSymbolTriggerSuccess(
+                symbol: pendingSubscribeTransport.symbol
+            )
+            if didChangeCommittedSymbol {
+                triggerStateMachine.clearManualCellTradingStateForSymbolChange()
+                invalidatePendingManualCellTransportsAfterSymbolChange()
+            }
         }
     }
 
