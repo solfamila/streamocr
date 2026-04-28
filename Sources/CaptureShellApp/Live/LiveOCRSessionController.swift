@@ -63,6 +63,7 @@ final class LiveOCRSessionController: @unchecked Sendable {
     var onStatusChanged: ((LiveOCRSessionStatusSnapshot) -> Void)?
 
     private let manager: TradingRuntimeManager
+    private let temporaryDirectoryProvider: @Sendable (UUID) -> URL
     private let chunkPuller = NanocosmosStreamingChunkPuller()
     private let decoder = LocalVideoFrameDecoder()
     private let stateLock = NSLock()
@@ -76,8 +77,15 @@ final class LiveOCRSessionController: @unchecked Sendable {
     private var activeMessageSender: OCRAutomationTradingMessageSender?
     private var pendingFrameSnapshotRequest: PendingFrameSnapshotRequest?
 
-    init(manager: TradingRuntimeManager) {
+    init(
+        manager: TradingRuntimeManager,
+        temporaryDirectoryProvider: @escaping @Sendable (UUID) -> URL = { sessionID in
+            FileManager.default.temporaryDirectory
+                .appendingPathComponent("CaptureShellApp-live-session-\(sessionID.uuidString)", isDirectory: true)
+        }
+    ) {
         self.manager = manager
+        self.temporaryDirectoryProvider = temporaryDirectoryProvider
     }
 
     func setRuntimeConfig(_ config: CaptureRuntimeConfig?) {
@@ -218,14 +226,14 @@ final class LiveOCRSessionController: @unchecked Sendable {
 
     private func runSession(sessionID: UUID, seedURL: URL, loggingEnabled: Bool) {
         let sessionStart = Date()
-        let temporaryDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("CaptureShellApp-live-session-\(sessionID.uuidString)", isDirectory: true)
+        let temporaryDirectory = temporaryDirectoryProvider(sessionID)
 
         do {
             try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
         } catch {
-            publishStatus(
-                makeStatus(
+            failSessionBeforeSender(
+                sessionID: sessionID,
+                status: makeStatus(
                     state: .error,
                     seedURLText: seedURL.absoluteString,
                     fps: nil,
@@ -702,6 +710,22 @@ final class LiveOCRSessionController: @unchecked Sendable {
             activeSessionID = nil
         }
         stateLock.unlock()
+    }
+
+    private func failSessionBeforeSender(
+        sessionID: UUID,
+        status: LiveOCRSessionStatusSnapshot
+    ) {
+        stateLock.lock()
+        if activeSessionID == sessionID {
+            activeSessionID = nil
+        }
+        if stoppingSessionID == sessionID {
+            stoppingSessionID = nil
+        }
+        stateLock.unlock()
+
+        publishStatus(status)
     }
 
     private func finishSessionExit(sessionID: UUID, messageSender: OCRAutomationTradingMessageSender) {

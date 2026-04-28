@@ -527,6 +527,49 @@ struct LiveRecordingSessionControllerTests {
     }
 
     @Test
+    func stopAndFinishSynchronouslyWaitsForStartingRecorderToFinalize() throws {
+        let fakeRecorder = FakeLiveSourceRecording(blockStartUntilReleased: true)
+        let outputURL = try makeTemporaryRecordingOutputURL()
+        defer {
+            try? FileManager.default.removeItem(at: outputURL.deletingLastPathComponent())
+        }
+        let controller = makeController(outputURL: outputURL, recorder: fakeRecorder)
+        let startFinished = DispatchSemaphore(value: 0)
+        let syncFinished = DispatchSemaphore(value: 0)
+        let firstStartError = CapturedErrorBox()
+        let statusBox = CapturedRecordingStatusBox()
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try controller.start(seedURLText: Self.supportedRecordingSeedURL.absoluteString)
+            } catch {
+                firstStartError.set(error)
+            }
+            startFinished.signal()
+        }
+
+        #expect(fakeRecorder.waitForStart(timeout: 2))
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let status = controller.stopAndFinishSynchronously(timeout: 2)
+            statusBox.set(status)
+            syncFinished.signal()
+        }
+
+        #expect(syncFinished.wait(timeout: .now() + 0.05) == .timedOut)
+        fakeRecorder.releaseStart()
+
+        #expect(startFinished.wait(timeout: .now() + 2) == .success)
+        #expect(syncFinished.wait(timeout: .now() + 2) == .success)
+        #expect(firstStartError.value == nil)
+        #expect(statusBox.value?.state == .off)
+        #expect(controller.currentStatusSnapshot().state == .off)
+        #expect(fakeRecorder.startCallCount == 1)
+        #expect(fakeRecorder.stopCallCount == 1)
+        #expect(fakeRecorder.finishCallCount == 1)
+    }
+
+    @Test
     func finishTimeoutKeepsControllerInStoppingUntilFinalizerCompletes() throws {
         let fakeRecorder = FakeLiveSourceRecording(blockFinishUntilReleased: true)
         let outputURL = try makeTemporaryRecordingOutputURL()
@@ -697,6 +740,68 @@ struct LiveRecordingSessionControllerTests {
             storedError = error
             lock.unlock()
         }
+    }
+
+    private final class CapturedRecordingStatusBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storedStatus: LiveRecordingStatusSnapshot?
+
+        var value: LiveRecordingStatusSnapshot? {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedStatus
+        }
+
+        func set(_ status: LiveRecordingStatusSnapshot) {
+            lock.lock()
+            storedStatus = status
+            lock.unlock()
+        }
+    }
+}
+
+struct LiveOCRSessionControllerTests {
+    @Test
+    func workspaceCreationFailureClearsActiveSession() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("streamocr-live-ocr-controller-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let nonDirectoryWorkspace = directory.appendingPathComponent("not-a-directory")
+        try Data("not a directory".utf8).write(to: nonDirectoryWorkspace)
+
+        let controller = LiveOCRSessionController(
+            manager: TradingRuntimeManager(),
+            temporaryDirectoryProvider: { _ in nonDirectoryWorkspace }
+        )
+
+        try controller.start(
+            seedURLText: "wss://bintu-play.nanocosmos.de/h5live/stream/stream.mp4?stream=wptPV-dvBBZ&url=rtmp%3A%2F%2Flocalhost%2Fplay"
+        )
+
+        #expect(waitUntil(timeout: 2) {
+            controller.currentStatusSnapshot().state == .error
+        })
+
+        let drainedStatus = controller.stopAndDrain(timeout: 0.05)
+        #expect(drainedStatus.state == .error)
+        #expect(controller.currentStatusSnapshot().state == .error)
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval,
+        predicate: () -> Bool
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !predicate() {
+            guard Date() < deadline else {
+                return false
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        return true
     }
 }
 

@@ -155,9 +155,9 @@ final class LiveRecordingSessionController: @unchecked Sendable {
             stateLock.unlock()
 
             if shouldFinishImmediately {
-                publishStatus(stoppingStatus(for: session))
-                session.recorder.stop()
                 if session.beginFinishing() {
+                    publishStatus(stoppingStatus(for: session))
+                    session.recorder.stop()
                     DispatchQueue.global(qos: .userInitiated).async { [weak self, session] in
                         _ = self?.finishStop(session: session, timeout: 20, shouldPublish: true)
                     }
@@ -228,11 +228,11 @@ final class LiveRecordingSessionController: @unchecked Sendable {
         guard let session = sessionToStop else {
             return
         }
-        publishStatus(stoppingStatus(for: session))
-        session.recorder.stop()
         guard session.beginFinishing() else {
             return
         }
+        publishStatus(stoppingStatus(for: session))
+        session.recorder.stop()
         DispatchQueue.global(qos: .userInitiated).async { [weak self, session] in
             _ = self?.finishStop(session: session, timeout: 20, shouldPublish: true)
         }
@@ -262,7 +262,7 @@ final class LiveRecordingSessionController: @unchecked Sendable {
             )
             stateLock.unlock()
             publishStatus(status)
-            return status
+            return waitForStartingSessionToStop(sessionID: sessionID, timeout: timeout)
         case .idle:
             let status = latestStatus
             stateLock.unlock()
@@ -271,20 +271,72 @@ final class LiveRecordingSessionController: @unchecked Sendable {
         stateLock.unlock()
 
         if let session = sessionToFinish {
-            publishStatus(stoppingStatus(for: session))
-            session.recorder.stop()
-            if session.beginFinishing() {
-                return finishStop(session: session, timeout: timeout, shouldPublish: true)
-            }
-            return waitForFinish(session: session, timeout: timeout)
+            return stopAndFinish(session: session, timeout: timeout)
         }
 
         if let session = sessionToWait {
-            session.recorder.stop()
-            return waitForFinish(session: session, timeout: timeout)
+            return stopAndFinish(session: session, timeout: timeout)
         }
 
         return currentStatusSnapshot()
+    }
+
+    private func waitForStartingSessionToStop(
+        sessionID: UUID,
+        timeout: TimeInterval
+    ) -> LiveRecordingStatusSnapshot {
+        let deadline = Date().addingTimeInterval(timeout)
+
+        while true {
+            stateLock.lock()
+            let state = controllerState
+            let currentStatus = latestStatus
+            stateLock.unlock()
+
+            switch state {
+            case .starting(let activeSessionID, _) where activeSessionID == sessionID:
+                let remainingSeconds = deadline.timeIntervalSinceNow
+                guard remainingSeconds > 0 else {
+                    let status = LiveRecordingStatusSnapshot(
+                        state: .stopping,
+                        isRecording: false,
+                        headline: "Recording: Stopping",
+                        detail: "Still waiting for recording startup to finish after \(timeout)s.",
+                        outputPath: currentStatus.outputPath
+                    )
+                    publishStatus(status)
+                    return status
+                }
+                Thread.sleep(forTimeInterval: min(0.01, remainingSeconds))
+
+            case .recording(let session) where session.id == sessionID:
+                stateLock.lock()
+                if case .recording(let activeSession) = controllerState,
+                   activeSession.id == sessionID {
+                    controllerState = .stopping(activeSession)
+                }
+                stateLock.unlock()
+                return stopAndFinish(session: session, timeout: max(0.01, deadline.timeIntervalSinceNow))
+
+            case .stopping(let session) where session.id == sessionID:
+                return stopAndFinish(session: session, timeout: max(0.01, deadline.timeIntervalSinceNow))
+
+            default:
+                return currentStatus
+            }
+        }
+    }
+
+    private func stopAndFinish(
+        session: LiveManualRecordingSession,
+        timeout: TimeInterval
+    ) -> LiveRecordingStatusSnapshot {
+        if session.beginFinishing() {
+            publishStatus(stoppingStatus(for: session))
+            session.recorder.stop()
+            return finishStop(session: session, timeout: timeout, shouldPublish: true)
+        }
+        return waitForFinish(session: session, timeout: timeout)
     }
 
     @discardableResult
