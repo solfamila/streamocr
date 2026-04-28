@@ -138,7 +138,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await captureController.stopCapture()
         }
         liveSessionController.stop()
-        recordingSessionController.stop()
+        recordingSessionController.stopAndFinishSynchronously(timeout: 20)
         Task {
             await tradingRuntimeManager.shutdownAsync()
         }
@@ -545,15 +545,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 loggingEnabled: isEnvironmentFlagEnabled("CAPTURESHELLAPP_LIVE_VERBOSE")
             )
         } catch {
-            tradingWindowController.updateRecordingStatus(
-                LiveRecordingStatusSnapshot(
-                    state: .error,
-                    isRecording: false,
-                    headline: "Recording: Error",
-                    detail: error.localizedDescription,
-                    outputPath: nil
-                )
-            )
+            _ = error
         }
     }
 

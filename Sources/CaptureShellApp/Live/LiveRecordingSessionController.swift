@@ -48,12 +48,39 @@ struct LiveManualRecordingMetadata: Codable, Equatable, Sendable {
     let recording: LiveRecordingSummary
 }
 
+protocol LiveSourceRecording: AnyObject, Sendable {
+    func start(sourceURL: URL, runSeconds: Double) throws
+    func stop()
+    func finish(timeout: TimeInterval) throws -> LiveRecordingSummary?
+}
+
+extension LiveSourceStreamRecorder: LiveSourceRecording {}
+
 final class LiveRecordingSessionController: @unchecked Sendable {
     var onStatusChanged: ((LiveRecordingStatusSnapshot) -> Void)?
 
+    private let sourceURLResolver: @Sendable (URL) -> URL
+    private let outputURLProvider: @Sendable () throws -> URL
+    private let recorderFactory: @Sendable (URL, Bool) -> any LiveSourceRecording
     private let stateLock = NSLock()
-    private var activeSession: LiveManualRecordingSession?
+    private var controllerState: RecordingControllerState = .idle
     private var latestStatus = LiveRecordingStatusSnapshot.off
+
+    init(
+        sourceURLResolver: @escaping @Sendable (URL) -> URL = {
+            LiveMediaCaptureCoordinator.preferredRecordingSourceURL(seedURL: $0)
+        },
+        outputURLProvider: @escaping @Sendable () throws -> URL = {
+            try LiveRecordingSessionController.makeRecordingOutputURL()
+        },
+        recorderFactory: @escaping @Sendable (URL, Bool) -> any LiveSourceRecording = { outputURL, loggingEnabled in
+            LiveSourceStreamRecorder(outputURL: outputURL, loggingEnabled: loggingEnabled)
+        }
+    ) {
+        self.sourceURLResolver = sourceURLResolver
+        self.outputURLProvider = outputURLProvider
+        self.recorderFactory = recorderFactory
+    }
 
     func currentStatusSnapshot() -> LiveRecordingStatusSnapshot {
         stateLock.lock()
@@ -65,81 +92,184 @@ final class LiveRecordingSessionController: @unchecked Sendable {
     func start(seedURLText: String, loggingEnabled: Bool = false) throws {
         let trimmed = seedURLText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let seedURL = URL(string: trimmed), !trimmed.isEmpty else {
-            throw LiveRecordingSessionControllerError.invalidSeedURL(seedURLText)
+            let error = LiveRecordingSessionControllerError.invalidSeedURL(seedURLText)
+            publishError(error, outputPath: nil)
+            throw error
         }
 
+        let sessionID = UUID()
         stateLock.lock()
-        let isAlreadyRecording = activeSession != nil
+        let canStart: Bool
+        if case .idle = controllerState {
+            controllerState = .starting(sessionID)
+            canStart = true
+        } else {
+            canStart = false
+        }
         stateLock.unlock()
-        guard !isAlreadyRecording else {
+        guard canStart else {
             throw LiveRecordingSessionControllerError.alreadyRecording
         }
 
-        let sourceURL = LiveMediaCaptureCoordinator.preferredRecordingSourceURL(seedURL: seedURL)
-        guard NanocosmosStreamingChunkPuller.supports(sourceURL: sourceURL) else {
-            throw LiveRecordingSessionControllerError.unsupportedSource(sourceURL)
-        }
+        do {
+            let sourceURL = sourceURLResolver(seedURL)
+            guard NanocosmosStreamingChunkPuller.supports(sourceURL: sourceURL) else {
+                throw LiveRecordingSessionControllerError.unsupportedSource(sourceURL)
+            }
 
-        let outputURL = try Self.makeRecordingOutputURL()
-        let recorder = LiveSourceStreamRecorder(outputURL: outputURL, loggingEnabled: loggingEnabled)
-        let startedAt = Date()
-        try recorder.start(
-            sourceURL: sourceURL,
-            runSeconds: 24 * 60 * 60
-        )
-
-        let session = LiveManualRecordingSession(
-            id: UUID(),
-            seedURL: seedURL,
-            sourceURL: sourceURL,
-            outputURL: outputURL,
-            recorder: recorder,
-            startedAt: startedAt
-        )
-
-        stateLock.lock()
-        activeSession = session
-        stateLock.unlock()
-
-        publishStatus(
-            LiveRecordingStatusSnapshot(
-                state: .recording,
-                isRecording: true,
-                headline: "Recording: On",
-                detail: "Saving source MP4 to \(outputURL.path)",
-                outputPath: outputURL.path
+            let outputURL = try outputURLProvider()
+            let recorder = recorderFactory(outputURL, loggingEnabled)
+            let startedAt = Date()
+            try recorder.start(
+                sourceURL: sourceURL,
+                runSeconds: 24 * 60 * 60
             )
-        )
+
+            let session = LiveManualRecordingSession(
+                id: sessionID,
+                seedURL: seedURL,
+                sourceURL: sourceURL,
+                outputURL: outputURL,
+                recorder: recorder,
+                startedAt: startedAt
+            )
+
+            stateLock.lock()
+            let isStillStarting: Bool
+            if case let .starting(activeSessionID) = controllerState,
+               activeSessionID == sessionID {
+                controllerState = .recording(session)
+                isStillStarting = true
+            } else {
+                isStillStarting = false
+            }
+            stateLock.unlock()
+
+            guard isStillStarting else {
+                session.recorder.stop()
+                session.beginFinishing()
+                _ = finishStop(session: session, timeout: 2, shouldPublish: false)
+                return
+            }
+
+            publishStatus(
+                LiveRecordingStatusSnapshot(
+                    state: .recording,
+                    isRecording: true,
+                    headline: "Recording: On",
+                    detail: "Saving source MP4 to \(outputURL.path)",
+                    outputPath: outputURL.path
+                )
+            )
+        } catch {
+            stateLock.lock()
+            if case let .starting(activeSessionID) = controllerState,
+               activeSessionID == sessionID {
+                controllerState = .idle
+            }
+            stateLock.unlock()
+
+            publishError(error, outputPath: nil)
+            throw error
+        }
     }
 
     func stop() {
         stateLock.lock()
-        guard let session = activeSession else {
+        let sessionToStop: LiveManualRecordingSession?
+        switch controllerState {
+        case .recording(let session):
+            controllerState = .stopping(session)
+            sessionToStop = session
+        case .stopping(let session):
+            sessionToStop = nil
+            let status = stoppingStatus(for: session)
+            stateLock.unlock()
+            publishStatus(status)
+            return
+        case .starting:
+            sessionToStop = nil
+            let status = LiveRecordingStatusSnapshot(
+                state: .stopping,
+                isRecording: false,
+                headline: "Recording: Stopping",
+                detail: "Waiting for the recording session to finish starting...",
+                outputPath: nil
+            )
+            stateLock.unlock()
+            publishStatus(status)
+            return
+        case .idle:
+            sessionToStop = nil
             stateLock.unlock()
             publishStatus(.off)
             return
         }
         stateLock.unlock()
 
-        publishStatus(
-            LiveRecordingStatusSnapshot(
-                state: .stopping,
-                isRecording: false,
-                headline: "Recording: Stopping",
-                detail: "Finalizing \(session.outputURL.lastPathComponent)...",
-                outputPath: session.outputURL.path
-            )
-        )
-
+        guard let session = sessionToStop else {
+            return
+        }
+        publishStatus(stoppingStatus(for: session))
         session.recorder.stop()
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.finishStop(session: session)
+        guard session.beginFinishing() else {
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, session] in
+            _ = self?.finishStop(session: session, timeout: 20, shouldPublish: true)
         }
     }
 
-    private func finishStop(session: LiveManualRecordingSession) {
+    @discardableResult
+    func stopAndFinishSynchronously(timeout: TimeInterval = 20) -> LiveRecordingStatusSnapshot {
+        stateLock.lock()
+        let sessionToFinish: LiveManualRecordingSession?
+        let sessionToWait: LiveManualRecordingSession?
+        switch controllerState {
+        case .recording(let session):
+            controllerState = .stopping(session)
+            sessionToFinish = session
+            sessionToWait = nil
+        case .stopping(let session):
+            sessionToFinish = nil
+            sessionToWait = session
+        case .starting:
+            let status = latestStatus
+            stateLock.unlock()
+            return status
+        case .idle:
+            let status = latestStatus
+            stateLock.unlock()
+            return status
+        }
+        stateLock.unlock()
+
+        if let session = sessionToFinish {
+            publishStatus(stoppingStatus(for: session))
+            session.recorder.stop()
+            if session.beginFinishing() {
+                return finishStop(session: session, timeout: timeout, shouldPublish: true)
+            }
+            return waitForFinish(session: session, timeout: timeout)
+        }
+
+        if let session = sessionToWait {
+            session.recorder.stop()
+            return waitForFinish(session: session, timeout: timeout)
+        }
+
+        return currentStatusSnapshot()
+    }
+
+    @discardableResult
+    private func finishStop(
+        session: LiveManualRecordingSession,
+        timeout: TimeInterval,
+        shouldPublish: Bool
+    ) -> LiveRecordingStatusSnapshot {
+        let status: LiveRecordingStatusSnapshot
         do {
-            guard let summary = try session.recorder.finish(timeout: 20) else {
+            guard let summary = try session.recorder.finish(timeout: timeout) else {
                 throw LiveSourceStreamRecorderError.recordingFailed("missing_recording_file")
             }
 
@@ -149,38 +279,54 @@ final class LiveRecordingSessionController: @unchecked Sendable {
                 finishedAt: Date()
             )
 
-            stateLock.lock()
-            if activeSession?.id == session.id {
-                activeSession = nil
-            }
-            stateLock.unlock()
-
-            publishStatus(
-                LiveRecordingStatusSnapshot(
-                    state: .off,
-                    isRecording: false,
-                    headline: "Recording: Off",
-                    detail: "Saved \(summary.outputPath)",
-                    outputPath: summary.outputPath
-                )
+            status = LiveRecordingStatusSnapshot(
+                state: .off,
+                isRecording: false,
+                headline: "Recording: Off",
+                detail: "Saved \(summary.outputPath)",
+                outputPath: summary.outputPath
             )
         } catch {
-            stateLock.lock()
-            if activeSession?.id == session.id {
-                activeSession = nil
-            }
-            stateLock.unlock()
-
-            publishStatus(
-                LiveRecordingStatusSnapshot(
-                    state: .error,
-                    isRecording: false,
-                    headline: "Recording: Error",
-                    detail: error.localizedDescription,
-                    outputPath: session.outputURL.path
-                )
+            status = LiveRecordingStatusSnapshot(
+                state: .error,
+                isRecording: false,
+                headline: "Recording: Error",
+                detail: error.localizedDescription,
+                outputPath: session.outputURL.path
             )
         }
+
+        stateLock.lock()
+        if case .stopping(let activeSession) = controllerState,
+           activeSession.id == session.id {
+            controllerState = .idle
+        }
+        stateLock.unlock()
+
+        session.completeFinish(status)
+        if shouldPublish {
+            publishStatus(status)
+        }
+        return status
+    }
+
+    private func waitForFinish(
+        session: LiveManualRecordingSession,
+        timeout: TimeInterval
+    ) -> LiveRecordingStatusSnapshot {
+        if let status = session.waitForFinish(timeout: timeout) {
+            return status
+        }
+
+        let status = LiveRecordingStatusSnapshot(
+            state: .error,
+            isRecording: false,
+            headline: "Recording: Error",
+            detail: LiveSourceStreamRecorderError.recordingTimedOut(session.outputURL.path).localizedDescription,
+            outputPath: session.outputURL.path
+        )
+        publishStatus(status)
+        return status
     }
 
     private func publishStatus(_ status: LiveRecordingStatusSnapshot) {
@@ -193,15 +339,41 @@ final class LiveRecordingSessionController: @unchecked Sendable {
         }
     }
 
-    private static func makeRecordingOutputURL() throws -> URL {
-        let directory = recordingsDirectory()
+    private func publishError(_ error: Error, outputPath: String?) {
+        publishStatus(
+            LiveRecordingStatusSnapshot(
+                state: .error,
+                isRecording: false,
+                headline: "Recording: Error",
+                detail: error.localizedDescription,
+                outputPath: outputPath
+            )
+        )
+    }
+
+    private func stoppingStatus(for session: LiveManualRecordingSession) -> LiveRecordingStatusSnapshot {
+        LiveRecordingStatusSnapshot(
+            state: .stopping,
+            isRecording: false,
+            headline: "Recording: Stopping",
+            detail: "Finalizing \(session.outputURL.lastPathComponent)...",
+            outputPath: session.outputURL.path
+        )
+    }
+
+    static func makeRecordingOutputURL(
+        directory: URL = recordingsDirectory(),
+        date: Date = Date(),
+        uniqueID: UUID = UUID()
+    ) throws -> URL {
         try FileManager.default.createDirectory(
             at: directory,
             withIntermediateDirectories: true
         )
 
-        let timestamp = recordingTimestampFormatter.string(from: Date())
-        return directory.appendingPathComponent("live-recording-\(timestamp).mp4")
+        let timestamp = recordingTimestampFormatter.string(from: date)
+        let suffix = String(uniqueID.uuidString.prefix(8)).lowercased()
+        return directory.appendingPathComponent("live-recording-\(timestamp)-\(suffix).mp4")
     }
 
     private static func recordingsDirectory() -> URL {
@@ -245,11 +417,72 @@ final class LiveRecordingSessionController: @unchecked Sendable {
     }
 }
 
-private struct LiveManualRecordingSession {
+private enum RecordingControllerState {
+    case idle
+    case starting(UUID)
+    case recording(LiveManualRecordingSession)
+    case stopping(LiveManualRecordingSession)
+}
+
+private final class LiveManualRecordingSession: @unchecked Sendable {
     let id: UUID
     let seedURL: URL
     let sourceURL: URL
     let outputURL: URL
-    let recorder: LiveSourceStreamRecorder
+    let recorder: any LiveSourceRecording
     let startedAt: Date
+
+    private let finishCondition = NSCondition()
+    private var isFinishing = false
+    private var finishStatus: LiveRecordingStatusSnapshot?
+
+    init(
+        id: UUID,
+        seedURL: URL,
+        sourceURL: URL,
+        outputURL: URL,
+        recorder: any LiveSourceRecording,
+        startedAt: Date
+    ) {
+        self.id = id
+        self.seedURL = seedURL
+        self.sourceURL = sourceURL
+        self.outputURL = outputURL
+        self.recorder = recorder
+        self.startedAt = startedAt
+    }
+
+    @discardableResult
+    func beginFinishing() -> Bool {
+        finishCondition.lock()
+        defer { finishCondition.unlock() }
+
+        guard !isFinishing else {
+            return false
+        }
+
+        isFinishing = true
+        return true
+    }
+
+    func completeFinish(_ status: LiveRecordingStatusSnapshot) {
+        finishCondition.lock()
+        finishStatus = status
+        finishCondition.broadcast()
+        finishCondition.unlock()
+    }
+
+    func waitForFinish(timeout: TimeInterval) -> LiveRecordingStatusSnapshot? {
+        let deadline = Date().addingTimeInterval(timeout)
+        finishCondition.lock()
+        defer { finishCondition.unlock() }
+
+        while finishStatus == nil {
+            guard finishCondition.wait(until: deadline) else {
+                break
+            }
+        }
+
+        return finishStatus
+    }
 }

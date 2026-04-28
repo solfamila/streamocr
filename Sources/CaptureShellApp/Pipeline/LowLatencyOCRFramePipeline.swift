@@ -316,7 +316,8 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             )
 
             if runtimeConfig.manualSymbolCellROI != nil {
-                let symbolSamplingDecision = manualSymbolSamplingDecision(now: frameIngressTimestamp)
+                let symbolFreshnessTimestamp = frame.presentationTimeSeconds ?? frameIngressTimestamp
+                let symbolSamplingDecision = manualSymbolSamplingDecision(now: symbolFreshnessTimestamp)
                 if symbolSamplingDecision.shouldProcess {
                     let didStartFreshOCR = processRegion(
                         .manualSymbolCell,
@@ -327,7 +328,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
                         forceFreshOCR: symbolSamplingDecision.forceFreshOCR
                     )
                     if didStartFreshOCR {
-                        lastManualSymbolFreshOCRTimestamp = frameIngressTimestamp
+                        lastManualSymbolFreshOCRTimestamp = symbolFreshnessTimestamp
                     }
                 }
             }

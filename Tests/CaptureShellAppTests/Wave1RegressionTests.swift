@@ -398,6 +398,224 @@ struct LiveMediaCaptureCoordinatorTests {
             ) == 234
         )
     }
+
+    @Test
+    func recordingOutputURLIncludesUniqueSuffixToAvoidSameSecondCollisions() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("streamocr-recording-url-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let date = Date(timeIntervalSince1970: 1_800_000_000)
+        let firstURL = try LiveRecordingSessionController.makeRecordingOutputURL(
+            directory: directory,
+            date: date,
+            uniqueID: try #require(UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
+        )
+        let secondURL = try LiveRecordingSessionController.makeRecordingOutputURL(
+            directory: directory,
+            date: date,
+            uniqueID: try #require(UUID(uuidString: "11111111-1111-1111-1111-111111111111"))
+        )
+
+        #expect(firstURL.deletingLastPathComponent() == directory)
+        #expect(secondURL.deletingLastPathComponent() == directory)
+        #expect(firstURL.lastPathComponent != secondURL.lastPathComponent)
+        #expect(firstURL.lastPathComponent.hasPrefix("live-recording-"))
+        #expect(firstURL.lastPathComponent.hasSuffix("-00000000.mp4"))
+        #expect(secondURL.lastPathComponent.hasSuffix("-11111111.mp4"))
+    }
+}
+
+struct LiveRecordingSessionControllerTests {
+    @Test
+    func concurrentStartIsRejectedWhileFirstStartIsReserved() throws {
+        let fakeRecorder = FakeLiveSourceRecording(blockStartUntilReleased: true)
+        let outputURL = try makeTemporaryRecordingOutputURL()
+        defer {
+            try? FileManager.default.removeItem(at: outputURL.deletingLastPathComponent())
+        }
+        let controller = makeController(outputURL: outputURL, recorder: fakeRecorder)
+        let startFinished = DispatchSemaphore(value: 0)
+        let errorLock = NSLock()
+        var firstStartError: Error?
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try controller.start(seedURLText: Self.supportedRecordingSeedURL.absoluteString)
+            } catch {
+                errorLock.lock()
+                firstStartError = error
+                errorLock.unlock()
+            }
+            startFinished.signal()
+        }
+
+        #expect(fakeRecorder.waitForStart(timeout: 2))
+
+        do {
+            try controller.start(seedURLText: Self.supportedRecordingSeedURL.absoluteString)
+            #expect(Bool(false))
+        } catch LiveRecordingSessionControllerError.alreadyRecording {
+        } catch {
+            #expect(Bool(false))
+        }
+
+        fakeRecorder.releaseStart()
+        #expect(startFinished.wait(timeout: .now() + 2) == .success)
+        errorLock.lock()
+        let capturedError = firstStartError
+        errorLock.unlock()
+        #expect(capturedError == nil)
+        #expect(fakeRecorder.startCallCount == 1)
+
+        _ = controller.stopAndFinishSynchronously(timeout: 2)
+    }
+
+    @Test
+    func doubleStopOnlyFinalizesRecorderOnce() throws {
+        let fakeRecorder = FakeLiveSourceRecording(blockFinishUntilReleased: true)
+        let outputURL = try makeTemporaryRecordingOutputURL()
+        defer {
+            try? FileManager.default.removeItem(at: outputURL.deletingLastPathComponent())
+        }
+        let controller = makeController(outputURL: outputURL, recorder: fakeRecorder)
+
+        try controller.start(seedURLText: Self.supportedRecordingSeedURL.absoluteString)
+        controller.stop()
+        #expect(fakeRecorder.waitForFinish(timeout: 2))
+
+        controller.stop()
+        #expect(fakeRecorder.finishCallCount == 1)
+
+        fakeRecorder.releaseFinish()
+        #expect(waitUntil(timeout: 2) {
+            controller.currentStatusSnapshot().state == .off
+        })
+        #expect(fakeRecorder.finishCallCount == 1)
+    }
+
+    private static let supportedRecordingSeedURL = URL(
+        string: "https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?stream=wptPV-dvBBZ&url=rtmp%3A%2F%2Flocalhost%2Fplay"
+    )!
+
+    private func makeController(
+        outputURL: URL,
+        recorder: FakeLiveSourceRecording
+    ) -> LiveRecordingSessionController {
+        LiveRecordingSessionController(
+            sourceURLResolver: { _ in Self.supportedRecordingSeedURL },
+            outputURLProvider: { outputURL },
+            recorderFactory: { _, _ in recorder }
+        )
+    }
+
+    private func makeTemporaryRecordingOutputURL() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("streamocr-recording-controller-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory.appendingPathComponent("recording.mp4")
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval,
+        predicate: () -> Bool
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !predicate() {
+            guard Date() < deadline else {
+                return false
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        return true
+    }
+
+    private final class FakeLiveSourceRecording: LiveSourceRecording, @unchecked Sendable {
+        private let lock = NSLock()
+        private let startEntered = DispatchSemaphore(value: 0)
+        private let finishEntered = DispatchSemaphore(value: 0)
+        private let startGate: DispatchSemaphore?
+        private let finishGate: DispatchSemaphore?
+
+        private var _startCallCount = 0
+        private var _stopCallCount = 0
+        private var _finishCallCount = 0
+
+        init(
+            blockStartUntilReleased: Bool = false,
+            blockFinishUntilReleased: Bool = false
+        ) {
+            startGate = blockStartUntilReleased ? DispatchSemaphore(value: 0) : nil
+            finishGate = blockFinishUntilReleased ? DispatchSemaphore(value: 0) : nil
+        }
+
+        var startCallCount: Int {
+            locked { _startCallCount }
+        }
+
+        var finishCallCount: Int {
+            locked { _finishCallCount }
+        }
+
+        func start(sourceURL _: URL, runSeconds _: Double) throws {
+            lock.lock()
+            _startCallCount += 1
+            lock.unlock()
+
+            startEntered.signal()
+            startGate?.wait()
+        }
+
+        func stop() {
+            lock.lock()
+            _stopCallCount += 1
+            lock.unlock()
+        }
+
+        func finish(timeout _: TimeInterval) throws -> LiveRecordingSummary? {
+            lock.lock()
+            _finishCallCount += 1
+            lock.unlock()
+
+            finishEntered.signal()
+            finishGate?.wait()
+            return LiveRecordingSummary(
+                outputPath: "/tmp/streamocr-fake-recording.mp4",
+                frameCount: 1,
+                droppedFrameCount: 0,
+                width: 1,
+                height: 1,
+                firstPresentationTimeSeconds: 0,
+                lastPresentationTimeSeconds: 0,
+                durationSeconds: 0,
+                fileSizeBytes: 1
+            )
+        }
+
+        func waitForStart(timeout: TimeInterval) -> Bool {
+            startEntered.wait(timeout: .now() + timeout) == .success
+        }
+
+        func waitForFinish(timeout: TimeInterval) -> Bool {
+            finishEntered.wait(timeout: .now() + timeout) == .success
+        }
+
+        func releaseStart() {
+            startGate?.signal()
+        }
+
+        func releaseFinish() {
+            finishGate?.signal()
+        }
+
+        private func locked<Value>(_ body: () -> Value) -> Value {
+            lock.lock()
+            defer { lock.unlock() }
+            return body()
+        }
+    }
 }
 
 struct NanocosmosStreamingChunkPullerTests {
@@ -1464,7 +1682,7 @@ struct TriggerPipelineVerificationHarnessTests {
     }
 
     @Test
-    func manualSymbolForcesFreshOCRAfterTimeIntervalEvenWhenFingerprintIsUnchanged() {
+    func manualSymbolForcesFreshOCRAfterMediaTimeIntervalEvenWhenFingerprintIsUnchanged() {
         let clock = TestClock(now: 0)
         let sender = CapturingMessageSender()
         let eventCollector = CapturingPipelineEventHandler()
@@ -1500,17 +1718,35 @@ struct TriggerPipelineVerificationHarnessTests {
             manualSymbolCellROI: PixelRect(x: 0, y: 0, width: 48, height: 48)
         )
 
-        pipeline.process(VideoFrame(pixelBuffer: pixelBuffer), runtimeConfig: runtimeConfig)
+        pipeline.process(
+            VideoFrame(
+                pixelBuffer: pixelBuffer,
+                presentationTimeStamp: CMTime(seconds: 0, preferredTimescale: 600)
+            ),
+            runtimeConfig: runtimeConfig
+        )
         #expect(recognizer.callCount(for: .manualSymbolCell) == 1)
         #expect(sender.messages == [#"{"subscribe":"SKLZ"}"#])
 
         recognizer.setResult(OCRTextRecognition(rawText: "GLND", confidence: 0.9), for: .manualSymbolCell)
-        clock.set(9.9)
-        pipeline.process(VideoFrame(pixelBuffer: pixelBuffer), runtimeConfig: runtimeConfig)
+        clock.set(0)
+        pipeline.process(
+            VideoFrame(
+                pixelBuffer: pixelBuffer,
+                presentationTimeStamp: CMTime(seconds: 9.9, preferredTimescale: 600)
+            ),
+            runtimeConfig: runtimeConfig
+        )
         #expect(recognizer.callCount(for: .manualSymbolCell) == 1)
 
-        clock.set(10.1)
-        pipeline.process(VideoFrame(pixelBuffer: pixelBuffer), runtimeConfig: runtimeConfig)
+        clock.set(0)
+        pipeline.process(
+            VideoFrame(
+                pixelBuffer: pixelBuffer,
+                presentationTimeStamp: CMTime(seconds: 10.1, preferredTimescale: 600)
+            ),
+            runtimeConfig: runtimeConfig
+        )
 
         #expect(recognizer.callCount(for: .manualSymbolCell) == 2)
         #expect(sender.messages == [#"{"subscribe":"SKLZ"}"#, #"{"subscribe":"GLND"}"#])
