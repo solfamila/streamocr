@@ -438,16 +438,13 @@ struct LiveRecordingSessionControllerTests {
         }
         let controller = makeController(outputURL: outputURL, recorder: fakeRecorder)
         let startFinished = DispatchSemaphore(value: 0)
-        let errorLock = NSLock()
-        var firstStartError: Error?
+        let firstStartError = CapturedErrorBox()
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 try controller.start(seedURLText: Self.supportedRecordingSeedURL.absoluteString)
             } catch {
-                errorLock.lock()
-                firstStartError = error
-                errorLock.unlock()
+                firstStartError.set(error)
             }
             startFinished.signal()
         }
@@ -464,10 +461,7 @@ struct LiveRecordingSessionControllerTests {
 
         fakeRecorder.releaseStart()
         #expect(startFinished.wait(timeout: .now() + 2) == .success)
-        errorLock.lock()
-        let capturedError = firstStartError
-        errorLock.unlock()
-        #expect(capturedError == nil)
+        #expect(firstStartError.value == nil)
         #expect(fakeRecorder.startCallCount == 1)
 
         _ = controller.stopAndFinishSynchronously(timeout: 2)
@@ -494,6 +488,73 @@ struct LiveRecordingSessionControllerTests {
             controller.currentStatusSnapshot().state == .off
         })
         #expect(fakeRecorder.finishCallCount == 1)
+    }
+
+    @Test
+    func stopDuringStartingStopsAndFinalizesInsteadOfRecording() throws {
+        let fakeRecorder = FakeLiveSourceRecording(blockStartUntilReleased: true)
+        let outputURL = try makeTemporaryRecordingOutputURL()
+        defer {
+            try? FileManager.default.removeItem(at: outputURL.deletingLastPathComponent())
+        }
+        let controller = makeController(outputURL: outputURL, recorder: fakeRecorder)
+        let startFinished = DispatchSemaphore(value: 0)
+        let firstStartError = CapturedErrorBox()
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try controller.start(seedURLText: Self.supportedRecordingSeedURL.absoluteString)
+            } catch {
+                firstStartError.set(error)
+            }
+            startFinished.signal()
+        }
+
+        #expect(fakeRecorder.waitForStart(timeout: 2))
+        controller.stop()
+        #expect(controller.currentStatusSnapshot().state == .stopping)
+
+        fakeRecorder.releaseStart()
+
+        #expect(startFinished.wait(timeout: .now() + 2) == .success)
+        #expect(waitUntil(timeout: 2) {
+            controller.currentStatusSnapshot().state == .off
+        })
+        #expect(firstStartError.value == nil)
+        #expect(fakeRecorder.startCallCount == 1)
+        #expect(fakeRecorder.stopCallCount == 1)
+        #expect(fakeRecorder.finishCallCount == 1)
+    }
+
+    @Test
+    func finishTimeoutKeepsControllerInStoppingUntilFinalizerCompletes() throws {
+        let fakeRecorder = FakeLiveSourceRecording(blockFinishUntilReleased: true)
+        let outputURL = try makeTemporaryRecordingOutputURL()
+        defer {
+            try? FileManager.default.removeItem(at: outputURL.deletingLastPathComponent())
+        }
+        let controller = makeController(outputURL: outputURL, recorder: fakeRecorder)
+
+        try controller.start(seedURLText: Self.supportedRecordingSeedURL.absoluteString)
+        controller.stop()
+        #expect(fakeRecorder.waitForFinish(timeout: 2))
+
+        let timedOutStatus = controller.stopAndFinishSynchronously(timeout: 0.01)
+        #expect(timedOutStatus.state == .stopping)
+        #expect(controller.currentStatusSnapshot().state == .stopping)
+
+        do {
+            try controller.start(seedURLText: Self.supportedRecordingSeedURL.absoluteString)
+            #expect(Bool(false))
+        } catch LiveRecordingSessionControllerError.alreadyRecording {
+        } catch {
+            #expect(Bool(false))
+        }
+
+        fakeRecorder.releaseFinish()
+        #expect(waitUntil(timeout: 2) {
+            controller.currentStatusSnapshot().state == .off
+        })
     }
 
     private static let supportedRecordingSeedURL = URL(
@@ -559,6 +620,10 @@ struct LiveRecordingSessionControllerTests {
             locked { _finishCallCount }
         }
 
+        var stopCallCount: Int {
+            locked { _stopCallCount }
+        }
+
         func start(sourceURL _: URL, runSeconds _: Double) throws {
             lock.lock()
             _startCallCount += 1
@@ -614,6 +679,23 @@ struct LiveRecordingSessionControllerTests {
             lock.lock()
             defer { lock.unlock() }
             return body()
+        }
+    }
+
+    private final class CapturedErrorBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storedError: Error?
+
+        var value: Error? {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedError
+        }
+
+        func set(_ error: Error) {
+            lock.lock()
+            storedError = error
+            lock.unlock()
         }
     }
 }
@@ -1752,6 +1834,63 @@ struct TriggerPipelineVerificationHarnessTests {
         #expect(sender.messages == [#"{"subscribe":"SKLZ"}"#, #"{"subscribe":"GLND"}"#])
         #expect(eventCollector.events.map(\.action).contains("ocr_resampled"))
         #expect(eventCollector.events.map(\.action).contains("subscribe_triggered"))
+    }
+
+    @Test
+    func manualSymbolForcesFreshOCRWhenPresentationTimeMovesBackward() {
+        let clock = TestClock(now: 0)
+        let sender = CapturingMessageSender()
+        let recognizer = RegionAwareCountingTextRecognizer(
+            results: [
+                .manualCell: OCRTextRecognition(rawText: "", confidence: 1.0),
+                .manualSymbolCell: OCRTextRecognition(rawText: "SKLZ", confidence: 0.9)
+            ]
+        )
+        let pipeline = LowLatencyOCRFramePipeline(
+            loggingEnabled: false,
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 2,
+            manualSymbolSamplingIntervalFrames: 10_000,
+            manualSymbolFreshOCRIntervalSeconds: 10,
+            manualSymbolTriggerConfirmationFrames: 1,
+            recognizer: recognizer,
+            symbolRecognizer: recognizer,
+            asyncSymbolRecognitionEnabled: false,
+            messageSender: sender,
+            beep: {},
+            timeProvider: clock.current
+        )
+        let pixelBuffer = makeSolidPixelBuffer(width: 48, height: 48, fillValue: 0)
+        let runtimeConfig = CaptureRuntimeConfig(
+            displayID: 0,
+            displayWidth: 48,
+            displayHeight: 48,
+            baseROI: PixelRect(x: 0, y: 0, width: 48, height: 48),
+            manualCellROI: PixelRect(x: 0, y: 0, width: 48, height: 48),
+            symbolROI: PixelRect(x: 0, y: 0, width: 48, height: 48),
+            manualSymbolCellROI: PixelRect(x: 0, y: 0, width: 48, height: 48)
+        )
+
+        pipeline.process(
+            VideoFrame(
+                pixelBuffer: pixelBuffer,
+                presentationTimeStamp: CMTime(seconds: 20, preferredTimescale: 600)
+            ),
+            runtimeConfig: runtimeConfig
+        )
+        #expect(recognizer.callCount(for: .manualSymbolCell) == 1)
+
+        recognizer.setResult(OCRTextRecognition(rawText: "GLND", confidence: 0.9), for: .manualSymbolCell)
+        pipeline.process(
+            VideoFrame(
+                pixelBuffer: pixelBuffer,
+                presentationTimeStamp: CMTime(seconds: 5, preferredTimescale: 600)
+            ),
+            runtimeConfig: runtimeConfig
+        )
+
+        #expect(recognizer.callCount(for: .manualSymbolCell) == 2)
+        #expect(sender.messages == [#"{"subscribe":"SKLZ"}"#, #"{"subscribe":"GLND"}"#])
     }
 
     private final class CapturingMessageSender: TradingMessageSending, @unchecked Sendable {

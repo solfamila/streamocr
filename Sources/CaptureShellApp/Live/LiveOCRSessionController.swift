@@ -165,6 +165,25 @@ final class LiveOCRSessionController: @unchecked Sendable {
         )
     }
 
+    @discardableResult
+    func stopAndDrain(timeout: TimeInterval = 2) -> LiveOCRSessionStatusSnapshot {
+        stop()
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            stateLock.lock()
+            let status = latestStatus
+            let didDrain = activeSessionID == nil && stoppingSessionID == nil
+            stateLock.unlock()
+
+            if didDrain || Date() >= deadline {
+                return status
+            }
+
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+    }
+
     func currentStatusSnapshot() -> LiveOCRSessionStatusSnapshot {
         stateLock.lock()
         defer { stateLock.unlock() }

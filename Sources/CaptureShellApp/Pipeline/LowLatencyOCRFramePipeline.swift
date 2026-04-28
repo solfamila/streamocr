@@ -339,7 +339,8 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         let shouldProcessByFrameCadence = matchesCadence(count: frameCount, cadence: manualSymbolSamplingIntervalFrames)
         let shouldForceFreshOCR: Bool
         if let lastManualSymbolFreshOCRTimestamp {
-            shouldForceFreshOCR = now - lastManualSymbolFreshOCRTimestamp >= manualSymbolFreshOCRIntervalSeconds
+            let elapsedSeconds = now - lastManualSymbolFreshOCRTimestamp
+            shouldForceFreshOCR = elapsedSeconds < 0 || elapsedSeconds >= manualSymbolFreshOCRIntervalSeconds
         } else {
             shouldForceFreshOCR = true
         }

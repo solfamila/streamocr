@@ -101,7 +101,7 @@ final class LiveRecordingSessionController: @unchecked Sendable {
         stateLock.lock()
         let canStart: Bool
         if case .idle = controllerState {
-            controllerState = .starting(sessionID)
+            controllerState = .starting(sessionID, stopRequested: false)
             canStart = true
         } else {
             canStart = false
@@ -135,20 +135,37 @@ final class LiveRecordingSessionController: @unchecked Sendable {
             )
 
             stateLock.lock()
-            let isStillStarting: Bool
-            if case let .starting(activeSessionID) = controllerState,
+            let shouldPublishRecording: Bool
+            let shouldFinishImmediately: Bool
+            if case let .starting(activeSessionID, stopRequested) = controllerState,
                activeSessionID == sessionID {
-                controllerState = .recording(session)
-                isStillStarting = true
+                if stopRequested {
+                    controllerState = .stopping(session)
+                    shouldPublishRecording = false
+                    shouldFinishImmediately = true
+                } else {
+                    controllerState = .recording(session)
+                    shouldPublishRecording = true
+                    shouldFinishImmediately = false
+                }
             } else {
-                isStillStarting = false
+                shouldPublishRecording = false
+                shouldFinishImmediately = true
             }
             stateLock.unlock()
 
-            guard isStillStarting else {
+            if shouldFinishImmediately {
+                publishStatus(stoppingStatus(for: session))
                 session.recorder.stop()
-                session.beginFinishing()
-                _ = finishStop(session: session, timeout: 2, shouldPublish: false)
+                if session.beginFinishing() {
+                    DispatchQueue.global(qos: .userInitiated).async { [weak self, session] in
+                        _ = self?.finishStop(session: session, timeout: 20, shouldPublish: true)
+                    }
+                }
+                return
+            }
+
+            guard shouldPublishRecording else {
                 return
             }
 
@@ -163,7 +180,7 @@ final class LiveRecordingSessionController: @unchecked Sendable {
             )
         } catch {
             stateLock.lock()
-            if case let .starting(activeSessionID) = controllerState,
+            if case let .starting(activeSessionID, _) = controllerState,
                activeSessionID == sessionID {
                 controllerState = .idle
             }
@@ -187,7 +204,8 @@ final class LiveRecordingSessionController: @unchecked Sendable {
             stateLock.unlock()
             publishStatus(status)
             return
-        case .starting:
+        case .starting(let sessionID, _):
+            controllerState = .starting(sessionID, stopRequested: true)
             sessionToStop = nil
             let status = LiveRecordingStatusSnapshot(
                 state: .stopping,
@@ -233,9 +251,17 @@ final class LiveRecordingSessionController: @unchecked Sendable {
         case .stopping(let session):
             sessionToFinish = nil
             sessionToWait = session
-        case .starting:
-            let status = latestStatus
+        case .starting(let sessionID, _):
+            controllerState = .starting(sessionID, stopRequested: true)
+            let status = LiveRecordingStatusSnapshot(
+                state: .stopping,
+                isRecording: false,
+                headline: "Recording: Stopping",
+                detail: "Waiting for the recording session to finish starting...",
+                outputPath: latestStatus.outputPath
+            )
             stateLock.unlock()
+            publishStatus(status)
             return status
         case .idle:
             let status = latestStatus
@@ -319,10 +345,10 @@ final class LiveRecordingSessionController: @unchecked Sendable {
         }
 
         let status = LiveRecordingStatusSnapshot(
-            state: .error,
+            state: .stopping,
             isRecording: false,
-            headline: "Recording: Error",
-            detail: LiveSourceStreamRecorderError.recordingTimedOut(session.outputURL.path).localizedDescription,
+            headline: "Recording: Stopping",
+            detail: "Still finalizing \(session.outputURL.lastPathComponent) after \(timeout)s.",
             outputPath: session.outputURL.path
         )
         publishStatus(status)
@@ -419,7 +445,7 @@ final class LiveRecordingSessionController: @unchecked Sendable {
 
 private enum RecordingControllerState {
     case idle
-    case starting(UUID)
+    case starting(UUID, stopRequested: Bool)
     case recording(LiveManualRecordingSession)
     case stopping(LiveManualRecordingSession)
 }

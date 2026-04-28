@@ -109,6 +109,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var currentLiveStreamURLText = ""
     private var ocrBuyRatio = 0.5
     private let startupEnvironment = ProcessInfo.processInfo.environment
+    private var isTerminationShutdownInProgress = false
+    private var didCompleteTerminationShutdown = false
 
     override init() {
         liveSessionController = LiveOCRSessionController(manager: tradingRuntimeManager)
@@ -133,15 +135,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyStartupOverridesIfNeeded()
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        Task {
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if didCompleteTerminationShutdown {
+            return .terminateNow
+        }
+
+        guard !isTerminationShutdownInProgress else {
+            return .terminateLater
+        }
+
+        isTerminationShutdownInProgress = true
+        Task { [weak self] in
+            guard let self else {
+                NSApp.reply(toApplicationShouldTerminate: true)
+                return
+            }
+
             await captureController.stopCapture()
-        }
-        liveSessionController.stop()
-        recordingSessionController.stopAndFinishSynchronously(timeout: 20)
-        Task {
+            _ = liveSessionController.stopAndDrain(timeout: 3)
+            _ = recordingSessionController.stopAndFinishSynchronously(timeout: 20)
             await tradingRuntimeManager.shutdownAsync()
+
+            didCompleteTerminationShutdown = true
+            isTerminationShutdownInProgress = false
+            NSApp.reply(toApplicationShouldTerminate: true)
         }
+        return .terminateLater
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        guard !didCompleteTerminationShutdown else {
+            return
+        }
+
+        _ = liveSessionController.stopAndDrain(timeout: 2)
+        _ = recordingSessionController.stopAndFinishSynchronously(timeout: 20)
     }
 
     @objc
