@@ -78,7 +78,8 @@ There are three live OCR paths in the app:
 - CLI `--live-analyze`: dry-run analysis / JSON / optional recording only
 - Trading GUI live stream: routes OCR observations through the central
   `OCRTradingCoordinator`, then executes typed `BUY` / `SELL` / `SUBSCRIBE`
-  commands directly against the in-process `TradingRuntimeManager`
+  commands directly against the in-process `TradingRuntimeManager`; real GUI
+  trading also emits terminal transport outcome trigger events
 - Display capture window: routes ScreenCaptureKit OCR through the same
   coordinator/executor path
 
@@ -161,6 +162,19 @@ tight or loose depending on which fields they specify.
 The live GUI and display-capture trading path uses typed OCR trading commands
 internally. JSON remains the CLI/result/fixture format and a compatibility
 boundary for the older legacy trigger dispatcher path.
+The central `OCRTradingCoordinator` owns symbol/manual/session state and returns
+explicit effects: commands to start and command IDs to cancel. Retryable
+BUY/SELL rejections are cooled down in that reducer for one second, so an
+unchanged OCR frame cannot hammer the runtime while the broker/gateway is still
+recovering. When the symbol state becomes uncertain, pending manual BUY/SELL
+commands are cancelled before they can keep walking toward submission. If the
+symbol changes again while a `SUBSCRIBE` command is still pending, that stale
+subscribe command is cancelled too, so a late completion cannot commit the app
+to a symbol that is no longer on-screen.
+The low-latency pipeline assembles synchronous symbol/manual OCR into one
+`OCRTradingFrameObservation` per frame. Asynchronous symbol OCR still emits a
+pending symbol observation first, then a recognized-symbol update when the
+background OCR result returns.
 
 ## OCR Design
 

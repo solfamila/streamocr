@@ -278,12 +278,7 @@ final class LiveStreamAnalyzer {
         captureCoordinator: LiveMediaCaptureCoordinator?,
         metadataURL: URL?
     ) throws -> LiveStreamAnalysisResult {
-        var frameCount = 0
-        var frameSize = "unknown"
-        var firstFrameLatencySeconds: Double?
-        var activeDecodeSeconds: Double?
-        var adjustedConfigByFrameSize: [String: CaptureRuntimeConfig] = [:]
-        let frameProcessingLock = NSLock()
+        let frameState = LockedBox(LiveStreamDecodedFrameState())
 
         try captureCoordinator?.ensureRecordingStarted(
             seedURL: seedURL,
@@ -296,23 +291,18 @@ final class LiveStreamAnalyzer {
             runSeconds: max(0.1, runDeadline.timeIntervalSinceNow),
             loggingEnabled: loggingEnabled
         ) { frame in
-            frameProcessingLock.lock()
-            defer { frameProcessingLock.unlock() }
-
-            try self.processDecodedFrame(
-                frame,
-                runtimeConfig: runtimeConfig,
-                pipeline: pipeline,
-                captureCoordinator: captureCoordinator,
-                analysisStart: analysisStart,
-                loggingEnabled: loggingEnabled,
-                frameCount: &frameCount,
-                frameSize: &frameSize,
-                firstFrameLatencySeconds: &firstFrameLatencySeconds,
-                activeDecodeSeconds: &activeDecodeSeconds,
-                adjustedConfigByFrameSize: &adjustedConfigByFrameSize
-            )
+            try frameState.withValue { state in
+                try state.processDecodedFrame(
+                    frame,
+                    runtimeConfig: runtimeConfig,
+                    pipeline: pipeline,
+                    analysisStart: analysisStart,
+                    loggingEnabled: loggingEnabled
+                )
+            }
         }
+
+        let snapshot = frameState.snapshot()
 
         if loggingEnabled {
             print(
@@ -324,7 +314,7 @@ final class LiveStreamAnalyzer {
             )
         }
 
-        guard frameCount > 0 else {
+        guard snapshot.frameCount > 0 else {
             throw LiveStreamAnalyzerError.noFramesDecoded(webSocketURL)
         }
 
@@ -336,10 +326,10 @@ final class LiveStreamAnalyzer {
             metadataURL: metadataURL,
             runSeconds: runSeconds,
             analysisStart: analysisStart,
-            firstFrameLatencySeconds: firstFrameLatencySeconds,
-            activeDecodeSeconds: activeDecodeSeconds,
-            frameCount: frameCount,
-            frameSize: frameSize,
+            firstFrameLatencySeconds: snapshot.firstFrameLatencySeconds,
+            activeDecodeSeconds: snapshot.activeDecodeSeconds,
+            frameCount: snapshot.frameCount,
+            frameSize: snapshot.frameSize,
             eventCollector: eventCollector,
             tradingRuntime: tradingRuntime,
             captureCoordinator: captureCoordinator,
@@ -807,4 +797,54 @@ final class LiveStreamAnalyzer {
 private struct DecodeSessionResult {
     let decodedFrameCount: Int
     let playbackURL: URL
+}
+
+private struct LiveStreamDecodedFrameState {
+    var frameCount = 0
+    var frameSize = "unknown"
+    var firstFrameLatencySeconds: Double?
+    var activeDecodeSeconds: Double?
+    private var adjustedConfigByFrameSize: [String: CaptureRuntimeConfig] = [:]
+
+    mutating func processDecodedFrame(
+        _ frame: VideoFrame,
+        runtimeConfig: CaptureRuntimeConfig?,
+        pipeline: LowLatencyOCRFramePipeline,
+        analysisStart: Date,
+        loggingEnabled: Bool
+    ) throws {
+        if firstFrameLatencySeconds == nil {
+            firstFrameLatencySeconds = Date().timeIntervalSince(analysisStart)
+        }
+        frameCount += 1
+        if let presentationTimeSeconds = frame.presentationTimeSeconds {
+            activeDecodeSeconds = max(activeDecodeSeconds ?? 0, presentationTimeSeconds)
+        }
+        frameSize = frame.sizeSummary
+        let adjustedRuntimeConfig = adjustedConfig(
+            for: frame,
+            runtimeConfig: runtimeConfig,
+            loggingEnabled: loggingEnabled
+        )
+        pipeline.process(frame, runtimeConfig: adjustedRuntimeConfig)
+    }
+
+    private mutating func adjustedConfig(
+        for frame: VideoFrame,
+        runtimeConfig: CaptureRuntimeConfig?,
+        loggingEnabled: Bool
+    ) -> CaptureRuntimeConfig? {
+        runtimeConfig.map { config in
+            let cacheKey = frame.sizeSummary
+            if let cached = adjustedConfigByFrameSize[cacheKey] {
+                return cached
+            }
+            let adjusted = config.adjustedForFrameSize(width: frame.width, height: frame.height)
+            adjustedConfigByFrameSize[cacheKey] = adjusted
+            if loggingEnabled {
+                print("[live] adjusted_runtime_config frame_size=\(cacheKey) \(adjusted.runtimeSummary)")
+            }
+            return adjusted
+        }
+    }
 }

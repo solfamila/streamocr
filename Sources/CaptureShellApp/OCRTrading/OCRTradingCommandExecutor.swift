@@ -54,6 +54,7 @@ enum OCRTradingCommandEncoder {
 protocol OCRTradingCommandExecuting: Sendable {
     func beginCommandSession()
     func execute(_ command: OCRTradingCommand) async -> OCRTradingCommandResult
+    func cancelPendingCommand(id: OCRTradingCommandID, reason: String)
     @discardableResult
     func waitForPendingCommands(timeout: TimeInterval) -> Bool
     func cancelPendingCommands(reason: String)
@@ -66,6 +67,8 @@ extension OCRTradingCommandExecuting {
     func waitForPendingCommands(timeout _: TimeInterval) -> Bool {
         true
     }
+
+    func cancelPendingCommand(id _: OCRTradingCommandID, reason _: String) {}
 
     func cancelPendingCommands(reason _: String) {}
 }

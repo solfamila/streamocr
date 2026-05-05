@@ -19,6 +19,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
     private var pendingOperations = 0
     private var pendingOperationsByGeneration: [Int: Int] = [:]
     private var cancellationReasonsByGeneration: [Int: String] = [:]
+    private var cancellationReasonsByCommandID: [OCRTradingCommandID: String] = [:]
 
     private let buyAvailabilityPollIntervalNanoseconds: UInt64 = 100_000_000
     private let buyAvailabilityTimeoutSeconds: TimeInterval = 2.0
@@ -46,32 +47,38 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
     }
 
     func execute(_ command: OCRTradingCommand) async -> OCRTradingCommandResult {
-        let generation = beginPendingOperation()
+        let generation = beginPendingOperation(commandID: command.id)
         defer {
-            finishPendingOperation(generation: generation)
+            finishPendingOperation(generation: generation, commandID: command.id)
         }
 
         do {
-            if let cancellationReason = cancellationReasonSnapshot(for: generation) {
+            if let cancellationReason = cancellationReasonSnapshot(for: generation, commandID: command.id) {
                 throw TradingMessageSendError.cancelled(reason: cancellationReason)
             }
 
             let outcome: TradingMessageSendOutcome
             switch command.kind {
             case .subscribe:
-                outcome = try await handleSubscribe(symbol: command.symbol, generation: generation)
+                outcome = try await handleSubscribe(
+                    symbol: command.symbol,
+                    generation: generation,
+                    commandID: command.id
+                )
             case let .buy(ocrQuantity, _):
                 outcome = try await handleBuy(
                     ocrQuantity: ocrQuantity,
                     symbol: command.symbol,
-                    generation: generation
+                    generation: generation,
+                    commandID: command.id
                 )
             case let .sell(previousOCRQuantity, currentOCRQuantity):
                 outcome = try await handleSell(
                     previousOCRQuantity: previousOCRQuantity,
                     currentOCRQuantity: currentOCRQuantity,
                     symbol: command.symbol,
-                    generation: generation
+                    generation: generation,
+                    commandID: command.id
                 )
             }
 
@@ -88,6 +95,12 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
 
     func cancelPendingCommands(reason: String) {
         cancelPendingMessages(reason: reason)
+    }
+
+    func cancelPendingCommand(id: OCRTradingCommandID, reason: String) {
+        lock.lock()
+        cancellationReasonsByCommandID[id] = reason
+        lock.unlock()
     }
 
     func send(
@@ -174,12 +187,16 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
     }
 
     @MainActor
-    private func handleSubscribe(symbol: String, generation: Int) async throws -> TradingMessageSendOutcome {
+    private func handleSubscribe(
+        symbol: String,
+        generation: Int,
+        commandID: OCRTradingCommandID? = nil
+    ) async throws -> TradingMessageSendOutcome {
         guard let normalized = TradingMessageContract.normalizedOCRSymbol(symbol), normalized == symbol else {
             throw TradingRuntimeManagerError.actionFailed("Invalid subscribe symbol in OCR command.")
         }
 
-        try throwIfCancelled(generation: generation)
+        try throwIfCancelled(generation: generation, commandID: commandID)
         _ = try await manager.requestSubscriptionAsync(symbol: normalized, recalcQtyFromFirstAsk: false)
         await manager.appendMessageAsync("OCR subscribed to \(normalized)")
         return .submitted
@@ -190,21 +207,22 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
         previousOCRQuantity: Int?,
         currentOCRQuantity: Int?,
         symbol: String?,
-        generation: Int
+        generation: Int,
+        commandID: OCRTradingCommandID? = nil
     ) async throws -> TradingMessageSendOutcome {
         let sellMessage = OCRSellMessage(
             ocrQuantity: currentOCRQuantity,
             previousOCRQuantity: previousOCRQuantity,
             symbol: symbol
         )
-        try throwIfCancelled(generation: generation)
+        try throwIfCancelled(generation: generation, commandID: commandID)
         try throwIfActiveSymbolChanged(
             expectedSymbol: sellMessage.symbol,
             snapshot: manager.dashboard,
             eventName: "SELL"
         )
 
-        let preSubmitDashboard = try await awaitSellAvailability(generation: generation)
+        let preSubmitDashboard = try await awaitSellAvailability(generation: generation, commandID: commandID)
         try throwIfActiveSymbolChanged(
             expectedSymbol: sellMessage.symbol,
             snapshot: preSubmitDashboard,
@@ -229,7 +247,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
             }
         }
 
-        try throwIfCancelled(generation: generation)
+        try throwIfCancelled(generation: generation, commandID: commandID)
         try throwIfActiveSymbolChanged(
             expectedSymbol: sellMessage.symbol,
             snapshot: manager.dashboard,
@@ -289,7 +307,8 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
     private func handleBuy(
         ocrQuantity: Int?,
         symbol: String?,
-        generation: Int
+        generation: Int,
+        commandID: OCRTradingCommandID? = nil
     ) async throws -> TradingMessageSendOutcome {
         let configuration = configurationProvider()
         let quantityInput = resolvedBuyQuantity(
@@ -303,7 +322,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
             return .intentionallyIgnored(reason: "Controller trading is not armed.")
         }
 
-        try throwIfCancelled(generation: generation)
+        try throwIfCancelled(generation: generation, commandID: commandID)
 
         let dashboard = manager.dashboard
         try throwIfActiveSymbolChanged(
@@ -314,7 +333,11 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
 
         manager.setQuantityInput(quantityInput)
 
-        let preSubmitDashboard = try await awaitBuyAvailability(quantityInput: quantityInput, generation: generation)
+        let preSubmitDashboard = try await awaitBuyAvailability(
+            quantityInput: quantityInput,
+            generation: generation,
+            commandID: commandID
+        )
         try throwIfActiveSymbolChanged(
             expectedSymbol: symbol,
             snapshot: preSubmitDashboard,
@@ -346,7 +369,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
             }
         }
 
-        try throwIfCancelled(generation: generation)
+        try throwIfCancelled(generation: generation, commandID: commandID)
         try throwIfActiveSymbolChanged(
             expectedSymbol: symbol,
             snapshot: manager.dashboard,
@@ -781,7 +804,11 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
     }
 
     @MainActor
-    private func awaitBuyAvailability(quantityInput: Int, generation: Int) async throws -> TradingDashboardSnapshot {
+    private func awaitBuyAvailability(
+        quantityInput: Int,
+        generation: Int,
+        commandID: OCRTradingCommandID? = nil
+    ) async throws -> TradingDashboardSnapshot {
         manager.refreshDashboard()
         var snapshot = manager.dashboard
         if snapshot.panel.canBuy {
@@ -790,7 +817,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
 
         let deadline = Date().addingTimeInterval(buyAvailabilityTimeoutSeconds)
         while Date() < deadline {
-            try throwIfCancelled(generation: generation)
+            try throwIfCancelled(generation: generation, commandID: commandID)
             try await Task.sleep(nanoseconds: buyAvailabilityPollIntervalNanoseconds)
             manager.refreshDashboard()
             snapshot = manager.dashboard
@@ -811,7 +838,10 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
     }
 
     @MainActor
-    private func awaitSellAvailability(generation: Int) async throws -> TradingDashboardSnapshot {
+    private func awaitSellAvailability(
+        generation: Int,
+        commandID: OCRTradingCommandID? = nil
+    ) async throws -> TradingDashboardSnapshot {
         manager.refreshDashboard()
         var snapshot = manager.dashboard
         if snapshot.panel.canClosePosition {
@@ -820,7 +850,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
 
         let deadline = Date().addingTimeInterval(buyAvailabilityTimeoutSeconds)
         while Date() < deadline {
-            try throwIfCancelled(generation: generation)
+            try throwIfCancelled(generation: generation, commandID: commandID)
             try await Task.sleep(nanoseconds: buyAvailabilityPollIntervalNanoseconds)
             manager.refreshDashboard()
             snapshot = manager.dashboard
@@ -859,15 +889,24 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
         return pendingOperations
     }
 
-    private func cancellationReasonSnapshot(for generation: Int) -> String? {
+    private func cancellationReasonSnapshot(
+        for generation: Int,
+        commandID: OCRTradingCommandID? = nil
+    ) -> String? {
         lock.lock()
         defer { lock.unlock() }
+        if let commandID, let reason = cancellationReasonsByCommandID[commandID] {
+            return reason
+        }
         return cancellationReasonsByGeneration[generation]
     }
 
     @MainActor
-    private func throwIfCancelled(generation: Int) throws {
-        if let cancellationReason = cancellationReasonSnapshot(for: generation) {
+    private func throwIfCancelled(
+        generation: Int,
+        commandID: OCRTradingCommandID? = nil
+    ) throws {
+        if let cancellationReason = cancellationReasonSnapshot(for: generation, commandID: commandID) {
             throw TradingMessageSendError.cancelled(reason: cancellationReason)
         }
     }
@@ -890,7 +929,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
         }
     }
 
-    private func beginPendingOperation() -> Int {
+    private func beginPendingOperation(commandID _: OCRTradingCommandID? = nil) -> Int {
         lock.lock()
         let generation = currentGeneration
         pendingOperations += 1
@@ -899,7 +938,10 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
         return generation
     }
 
-    private func finishPendingOperation(generation: Int) {
+    private func finishPendingOperation(
+        generation: Int,
+        commandID: OCRTradingCommandID? = nil
+    ) {
         lock.lock()
         #if DEBUG
         precondition(pendingOperations > 0, "finishPendingOperation called with no pending operations")
@@ -914,6 +956,9 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
             } else {
                 pendingOperationsByGeneration[generation] = nil
             }
+        }
+        if let commandID {
+            cancellationReasonsByCommandID[commandID] = nil
         }
         cleanupCompletedCancelledGenerationsLocked()
         lock.unlock()

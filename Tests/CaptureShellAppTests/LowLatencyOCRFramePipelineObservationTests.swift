@@ -54,7 +54,7 @@ struct LowLatencyOCRFramePipelineObservationTests {
 
         #expect(recognizer.callCount(for: .manualSymbolCell) == 2)
         #expect(sender.messages == [#"{"subscribe":"SKLZ"}"#, #"{"subscribe":"GLND"}"#])
-        #expect(observations.symbolStates(forFrame: 2).contains(.changedFingerprintPendingOCR))
+        #expect(observations.symbolStates(forFrame: 2) == [.recognized])
         #expect(observations.recognizedSymbols(forFrame: 2) == ["GLND"])
     }
 
@@ -247,6 +247,10 @@ struct LowLatencyOCRFramePipelineObservationTests {
 
         #expect(legacySender.messages.isEmpty)
         #expect(observations.recognizedSymbols(forFrame: 1) == ["PLRZ"])
+        #expect(observations.fullObservations(forFrame: 1).contains { observation in
+            observation.symbol?.recognitionState == .recognized &&
+                observation.manualCell?.recognition.normalizedText == "10000"
+        })
     }
 
     @Test
@@ -340,6 +344,12 @@ struct LowLatencyOCRFramePipelineObservationTests {
                 }
                 return observation.symbol?.recognition?.normalizedText
             }
+        }
+
+        func fullObservations(forFrame frameNumber: Int) -> [OCRTradingFrameObservation] {
+            lock.lock()
+            defer { lock.unlock() }
+            return observations.filter { $0.frameNumber == frameNumber }
         }
     }
 

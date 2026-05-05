@@ -124,7 +124,6 @@ struct OCRTradingManualPositionState: Equatable, Sendable {
 enum OCRTradingRetryKind: Equatable, Hashable, Sendable {
     case buy
     case sell
-    case subscribe
 }
 
 struct OCRTradingRetryKey: Equatable, Hashable, Sendable {

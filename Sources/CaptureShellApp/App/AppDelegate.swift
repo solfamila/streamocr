@@ -41,7 +41,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     )
     private lazy var displayOCRTradingRuntime = OCRTradingCoordinatorRuntime(
         coordinator: .liveTradingDefaults(),
-        executor: displayCaptureMessageSender
+        executor: displayCaptureMessageSender,
+        eventHandler: { [weak self] event in
+            Task { @MainActor [weak self] in
+                self?.handleDisplayOCRTradingEvent(event)
+            }
+        },
+        emitsTransportOutcomes: true
     )
     private lazy var captureController: DisplayCaptureController = {
         let runtime = displayOCRTradingRuntime
@@ -657,6 +663,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             buyQuantityRatio: ocrBuyRatio,
             controllerArmed: tradingRuntimeManager.dashboard.panel.status.controllerArmed
         )
+    }
+
+    private func handleDisplayOCRTradingEvent(_ event: OCRPipelineEvent) {
+        guard event.kind == .trigger else {
+            return
+        }
+
+        let message = displayOCRTradingMessage(for: event)
+        Task { [weak tradingRuntimeManager] in
+            await tradingRuntimeManager?.appendMessageAsync(message)
+        }
+    }
+
+    private func displayOCRTradingMessage(for event: OCRPipelineEvent) -> String {
+        var parts = ["Display OCR", event.action]
+        if let symbol = event.symbol, !symbol.isEmpty {
+            parts.append(symbol)
+        }
+        if let parsedInteger = event.parsedInteger {
+            parts.append("qty \(parsedInteger)")
+        }
+        parts.append("frame \(event.frameNumber)")
+        if let presentationTimeSeconds = event.presentationTimeSeconds {
+            parts.append(String(format: "t %.3fs", presentationTimeSeconds))
+        }
+        return parts.joined(separator: " ")
     }
 
     private func loadPersistedRuntimeConfigIfAvailable() {

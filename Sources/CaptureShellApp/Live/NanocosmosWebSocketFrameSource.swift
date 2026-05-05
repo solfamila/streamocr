@@ -38,8 +38,8 @@ final class NanocosmosWebSocketFrameSource {
         runSeconds: TimeInterval,
         maximumFrames: Int? = nil,
         loggingEnabled: Bool = false,
-        shouldContinue: @escaping () -> Bool = { true },
-        onFrame: @escaping (VideoFrame) throws -> Void
+        shouldContinue: @escaping @Sendable () -> Bool = { true },
+        onFrame: @escaping @Sendable (VideoFrame) throws -> Void
     ) throws -> NanocosmosWebSocketDecodeSummary {
         guard Self.supports(webSocketURL: webSocketURL) else {
             throw NanocosmosWebSocketFrameSourceError.invalidWebSocketURL(webSocketURL)
@@ -90,7 +90,7 @@ final class NanocosmosWebSocketFrameSource {
             done.signal()
         }
 
-        func receiveNext() {
+        @Sendable func receiveNext() {
             task.receive { result in
                 if state.isFinished {
                     return

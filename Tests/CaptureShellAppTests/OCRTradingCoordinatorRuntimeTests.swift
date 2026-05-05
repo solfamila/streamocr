@@ -95,6 +95,84 @@ struct OCRTradingCoordinatorRuntimeTests {
     }
 
     @Test
+    func runtimeCancelsPendingSubscribeWhenSymbolChangesBeforeCompletion() {
+        let executor = RuntimeControllableExecutor()
+        let events = RuntimeEventCapture()
+        let runtime = OCRTradingCoordinatorRuntime(
+            coordinator: OCRTradingCoordinator(manualSymbolTriggerConfirmationFrames: 1),
+            executor: executor,
+            eventHandler: events.handle(_:)
+        )
+
+        runtime.beginSession(1)
+        runtime.handle(OCRTradingFrameObservation(
+            frameNumber: 1,
+            symbol: symbol("SPY", fingerprint: 10)
+        ))
+        waitUntil { executor.pendingCommands.count == 1 }
+        executor.completeNext(.submitted)
+        waitUntil { runtime.stateSnapshot.symbol.stableSymbol == "SPY" }
+
+        runtime.handle(OCRTradingFrameObservation(
+            frameNumber: 2,
+            symbol: symbol("NEXR", fingerprint: 20)
+        ))
+        waitUntil { executor.pendingCommands.count == 2 }
+        let nexrSubscribeID = executor.pendingCommands[1].id
+
+        runtime.handle(OCRTradingFrameObservation(
+            frameNumber: 3,
+            symbol: symbol("WAI", fingerprint: 30)
+        ))
+
+        waitUntil {
+            executor.cancelledCommandIDs.contains(nexrSubscribeID) &&
+                executor.pendingCommands.count == 3
+        }
+        #expect(executor.pendingCommands.map(\.symbol) == ["SPY", "NEXR", "WAI"])
+        #expect(executor.pendingCommands.last?.kind == .subscribe)
+        #expect(runtime.stateSnapshot.terminalResults[nexrSubscribeID] == .cancelled(reason: "Symbol changed before subscribe completed."))
+        #expect(events.events.map(\.symbol) == ["SPY", "NEXR", "WAI"])
+    }
+
+    @Test
+    func runtimeCancelsPendingManualCommandWhenSymbolBecomesUncertain() {
+        let executor = RuntimeControllableExecutor()
+        let runtime = OCRTradingCoordinatorRuntime(
+            coordinator: OCRTradingCoordinator(manualSymbolTriggerConfirmationFrames: 1),
+            executor: executor
+        )
+
+        runtime.beginSession(1)
+        runtime.handle(OCRTradingFrameObservation(
+            frameNumber: 1,
+            symbol: symbol("SPY", fingerprint: 10)
+        ))
+        waitUntil { executor.pendingCommands.count == 1 }
+        executor.completeNext(.submitted)
+        waitUntil { runtime.stateSnapshot.symbol.stableSymbol == "SPY" }
+
+        runtime.handle(OCRTradingFrameObservation(
+            frameNumber: 2,
+            manualCell: manualCell("10000")
+        ))
+        waitUntil { executor.pendingCommands.count == 2 }
+        let buyID = executor.pendingCommands[1].id
+
+        runtime.handle(OCRTradingFrameObservation(
+            frameNumber: 3,
+            symbol: OCRTradingSymbolObservation(
+                fingerprint: 20,
+                recognitionState: .changedFingerprintPendingOCR
+            )
+        ))
+
+        waitUntil { executor.cancelledCommandIDs.contains(buyID) }
+        waitUntil { runtime.waitForPendingCommands(timeout: 0) }
+        #expect(runtime.stateSnapshot.terminalResults[buyID] == .cancelled(reason: "Symbol became uncertain."))
+    }
+
+    @Test
     func runtimeCanEmitTransportOutcomeEvents() {
         let executor = RuntimeControllableExecutor()
         let events = RuntimeEventCapture()
@@ -186,7 +264,7 @@ struct OCRTradingCoordinatorRuntimeTests {
         waitUntil { runtime.waitForPendingCommands(timeout: 0) }
 
         #expect(runtime.stateSnapshot.symbol.stableSymbol == nil)
-        #expect(runtime.stateSnapshot.terminalResults[1] == .staleIgnored(reason: "Command is no longer pending."))
+        #expect(runtime.stateSnapshot.terminalResults[1] == .cancelled(reason: "test stop"))
     }
 
     private func symbol(
@@ -266,15 +344,22 @@ struct OCRTradingCoordinatorRuntimeTests {
 
     private final class RuntimeControllableExecutor: OCRTradingCommandExecuting, @unchecked Sendable {
         private let lock = NSLock()
-        private var continuations: [CheckedContinuation<OCRTradingCommandResult, Never>] = []
+        private var continuationsByCommandID: [OCRTradingCommandID: CheckedContinuation<OCRTradingCommandResult, Never>] = [:]
+        private var cancellationReasonsByCommandID: [OCRTradingCommandID: String] = [:]
         private(set) var pendingCommands: [OCRTradingCommand] = []
+        private(set) var cancelledCommandIDs: [OCRTradingCommandID] = []
         var resultOnCancel: OCRTradingCommandResult?
 
         func execute(_ command: OCRTradingCommand) async -> OCRTradingCommandResult {
             await withCheckedContinuation { continuation in
                 lock.lock()
+                if let reason = cancellationReasonsByCommandID[command.id] {
+                    lock.unlock()
+                    continuation.resume(returning: .cancelled(reason: reason))
+                    return
+                }
                 pendingCommands.append(command)
-                continuations.append(continuation)
+                continuationsByCommandID[command.id] = continuation
                 lock.unlock()
             }
         }
@@ -282,16 +367,29 @@ struct OCRTradingCoordinatorRuntimeTests {
         func completeNext(_ result: OCRTradingCommandResult) {
             let continuation: CheckedContinuation<OCRTradingCommandResult, Never>?
             lock.lock()
-            continuation = continuations.isEmpty ? nil : continuations.removeFirst()
+            let id = pendingCommands
+                .map(\.id)
+                .first { continuationsByCommandID[$0] != nil }
+            continuation = id.flatMap { continuationsByCommandID.removeValue(forKey: $0) }
             lock.unlock()
             continuation?.resume(returning: result)
+        }
+
+        func cancelPendingCommand(id: OCRTradingCommandID, reason: String) {
+            let continuation: CheckedContinuation<OCRTradingCommandResult, Never>?
+            lock.lock()
+            cancellationReasonsByCommandID[id] = reason
+            cancelledCommandIDs.append(id)
+            continuation = continuationsByCommandID.removeValue(forKey: id)
+            lock.unlock()
+            continuation?.resume(returning: .cancelled(reason: reason))
         }
 
         func cancelPendingCommands(reason _: String) {
             let continuationsToResume: [CheckedContinuation<OCRTradingCommandResult, Never>]
             lock.lock()
-            continuationsToResume = continuations
-            continuations.removeAll()
+            continuationsToResume = Array(continuationsByCommandID.values)
+            continuationsByCommandID.removeAll()
             lock.unlock()
             guard let resultOnCancel else {
                 return

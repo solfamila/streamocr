@@ -29,19 +29,17 @@ final class OCRTradingCoordinatorRuntime: @unchecked Sendable {
 
     func beginSession(_ generation: OCRTradingSessionGeneration) {
         executor.beginCommandSession()
-        let commands = reduce(.sessionStarted(generation))
-        dispatch(commands, observation: nil)
+        apply(reduce(.sessionStarted(generation)), observation: nil)
     }
 
     func handle(_ observation: OCRTradingFrameObservation) {
-        let commands = reduce(.frame(observation))
-        dispatch(commands, observation: observation)
+        apply(reduce(.frame(observation)), observation: observation)
     }
 
     func stop(reason: String) {
-        let commands = reduce(.sessionStopping(reason: reason))
+        let effects = reduce(.sessionStopping(reason: reason))
         executor.cancelPendingCommands(reason: reason)
-        dispatch(commands, observation: nil)
+        apply(effects, observation: nil)
     }
 
     @discardableResult
@@ -57,17 +55,21 @@ final class OCRTradingCoordinatorRuntime: @unchecked Sendable {
         return isIdle() && executor.waitForPendingCommands(timeout: 0)
     }
 
-    private func reduce(_ event: OCRTradingEvent) -> [OCRTradingCommand] {
+    private func reduce(_ event: OCRTradingEvent) -> OCRTradingEffects {
         lock.lock()
         defer { lock.unlock() }
         return coordinator.reduce(event)
     }
 
-    private func dispatch(
-        _ commands: [OCRTradingCommand],
+    private func apply(
+        _ effects: OCRTradingEffects,
         observation: OCRTradingFrameObservation?
     ) {
-        for command in commands {
+        for commandID in effects.commandIDsToCancel {
+            executor.cancelPendingCommand(id: commandID, reason: cancellationReason(for: commandID))
+        }
+
+        for command in effects.commandsToStart {
             let triggerEvent = makeTriggerEvent(command: command, observation: observation)
             lock.lock()
             triggerEventsByCommandID[command.id] = triggerEvent
@@ -91,8 +93,9 @@ final class OCRTradingCoordinatorRuntime: @unchecked Sendable {
     ) {
         let triggerEvent: OCRPipelineEvent?
         let shouldEmitTransportOutcome: Bool
+        let effects: OCRTradingEffects
         lock.lock()
-        _ = coordinator.reduce(.commandCompleted(commandID, result))
+        effects = coordinator.reduce(.commandCompleted(commandID, result))
         triggerEvent = triggerEventsByCommandID.removeValue(forKey: commandID)
         shouldEmitTransportOutcome = emitsTransportOutcomes && triggerEvent != nil
         if !shouldEmitTransportOutcome {
@@ -100,14 +103,14 @@ final class OCRTradingCoordinatorRuntime: @unchecked Sendable {
         }
         lock.unlock()
 
-        guard shouldEmitTransportOutcome, let triggerEvent else {
-            return
+        if shouldEmitTransportOutcome, let triggerEvent {
+            eventHandler?(transportOutcomeEvent(from: triggerEvent, result: result))
+            lock.lock()
+            finishInFlightCommandLocked()
+            lock.unlock()
         }
 
-        eventHandler?(transportOutcomeEvent(from: triggerEvent, result: result))
-        lock.lock()
-        finishInFlightCommandLocked()
-        lock.unlock()
+        apply(effects, observation: nil)
     }
 
     private func makeTriggerEvent(
@@ -217,5 +220,9 @@ final class OCRTradingCoordinatorRuntime: @unchecked Sendable {
 
     private func finishInFlightCommandLocked() {
         inFlightCommandCount = max(0, inFlightCommandCount - 1)
+    }
+
+    private func cancellationReason(for commandID: OCRTradingCommandID) -> String {
+        stateSnapshot.terminalResults[commandID]?.resultDescription ?? "OCR trading command was cancelled."
     }
 }

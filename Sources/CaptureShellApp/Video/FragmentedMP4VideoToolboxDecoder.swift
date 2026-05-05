@@ -12,7 +12,7 @@ struct FragmentedMP4DecodeSummary: Sendable {
 final class FragmentedMP4VideoToolboxDecoder: @unchecked Sendable {
     private let boxParser = FragmentedMP4BoxStreamParser()
     private let nominalFrameRate: Double?
-    private let onFrame: (VideoFrame) -> Void
+    private let onFrame: @Sendable (VideoFrame) -> Void
     private let start = Date()
     private let stateLock = NSLock()
     private let appendLock = NSLock()
@@ -25,7 +25,7 @@ final class FragmentedMP4VideoToolboxDecoder: @unchecked Sendable {
     private var firstFrameElapsedSeconds: Double?
     private var firstMediaElapsedSeconds: Double?
 
-    init(nominalFrameRate: Double? = nil, onFrame: @escaping (VideoFrame) -> Void) {
+    init(nominalFrameRate: Double? = nil, onFrame: @escaping @Sendable (VideoFrame) -> Void) {
         self.nominalFrameRate = nominalFrameRate
         self.onFrame = onFrame
     }

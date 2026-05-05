@@ -12,14 +12,16 @@ enum LiveWebSocketDecodeProbeCommand {
                 throw LiveWebSocketDecodeProbeCommandError.invalidSeedURL(request.seedURL)
             }
 
-            var firstFrameSize: String?
+            let firstFrameSize = LockedBox<String?>(nil)
             let summary = try NanocosmosWebSocketFrameSource().decode(
                 webSocketURL: webSocketURL,
                 runSeconds: request.runSeconds,
                 maximumFrames: request.maximumFrames,
                 loggingEnabled: request.verbose
             ) { frame in
-                firstFrameSize = firstFrameSize ?? frame.sizeSummary
+                firstFrameSize.withValue { value in
+                    value = value ?? frame.sizeSummary
+                }
             }
 
             let result = LiveWebSocketDecodeProbeResult(
@@ -30,7 +32,7 @@ enum LiveWebSocketDecodeProbeCommand {
                 binaryMessageCount: summary.binaryMessageCount,
                 binaryByteCount: summary.binaryByteCount,
                 decodedFrameCount: summary.decodedFrameCount,
-                firstFrameSize: firstFrameSize,
+                firstFrameSize: firstFrameSize.snapshot(),
                 firstBinaryElapsedSeconds: summary.firstBinaryElapsedSeconds,
                 firstMediaElapsedSeconds: summary.firstMediaElapsedSeconds,
                 firstFrameElapsedSeconds: summary.firstFrameElapsedSeconds

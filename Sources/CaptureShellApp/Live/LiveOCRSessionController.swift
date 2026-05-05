@@ -280,7 +280,8 @@ final class LiveOCRSessionController: @unchecked Sendable {
             executor: messageSender,
             eventHandler: { [weak self] event in
                 self?.handlePipelineEvent(event, sessionID: sessionID)
-            }
+            },
+            emitsTransportOutcomes: true
         )
         stateLock.lock()
         if activeSessionID == sessionID {
@@ -586,25 +587,23 @@ final class LiveOCRSessionController: @unchecked Sendable {
         lastSubscribedSymbol: inout String?,
         loggingEnabled: Bool
     ) throws {
-        var localTotalFrameCount = totalFrameCount
-        var localTotalActiveDecodeSeconds = totalActiveDecodeSeconds
-        var localFirstFrameLatencySeconds = firstFrameLatencySeconds
-        var localFrameSize = frameSize
-        var localLastSubscribedSymbol = lastSubscribedSymbol
-        var firstPresentationTimeSeconds: Double?
-        var firstOCRWallTimestamp: CFAbsoluteTime?
-        var lastPresentationTimeSeconds: Double?
-        var lastStatusPublish = Date.distantPast
-        var skippedStaleOCRFrameCount = 0
-        var lastSkippedStaleOCRLogCount = 0
-        let frameStateLock = NSLock()
+        let frameState = LockedBox(
+            LiveOCRWebSocketFrameState(
+                totalFrameCount: totalFrameCount,
+                totalActiveDecodeSeconds: totalActiveDecodeSeconds,
+                firstFrameLatencySeconds: firstFrameLatencySeconds,
+                frameSize: frameSize,
+                lastSubscribedSymbol: lastSubscribedSymbol
+            )
+        )
 
         defer {
-            totalFrameCount = localTotalFrameCount
-            totalActiveDecodeSeconds = localTotalActiveDecodeSeconds
-            firstFrameLatencySeconds = localFirstFrameLatencySeconds
-            frameSize = localFrameSize
-            lastSubscribedSymbol = localLastSubscribedSymbol
+            let snapshot = frameState.snapshot()
+            totalFrameCount = snapshot.totalFrameCount
+            totalActiveDecodeSeconds = snapshot.totalActiveDecodeSeconds
+            firstFrameLatencySeconds = snapshot.firstFrameLatencySeconds
+            frameSize = snapshot.frameSize
+            lastSubscribedSymbol = snapshot.lastSubscribedSymbol
         }
 
         if loggingEnabled {
@@ -624,145 +623,67 @@ final class LiveOCRSessionController: @unchecked Sendable {
                 throw LiveOCRSessionCancellation.cancelled
             }
 
-            frameStateLock.lock()
-            defer { frameStateLock.unlock() }
-
-            if localFirstFrameLatencySeconds == nil {
-                localFirstFrameLatencySeconds = Date().timeIntervalSince(sessionStart)
-            }
-
-            self.fulfillPendingFrameSnapshotIfNeeded(
-                frame: frame,
-                seedURL: seedURL,
-                sessionID: sessionID
-            )
-
-            let adjustedRuntimeConfig = self.runtimeConfigSnapshot()?.adjustedForFrameSize(
-                width: frame.width,
-                height: frame.height,
-                displayID: 0
-            )
-            let shouldProcessOCR = self.shouldProcessLiveOCRFrame(
-                frame: frame,
-                firstPresentationTimeSeconds: &firstPresentationTimeSeconds,
-                firstOCRWallTimestamp: &firstOCRWallTimestamp
-            )
-            if shouldProcessOCR {
-                pipeline.process(frame, runtimeConfig: adjustedRuntimeConfig)
-            } else {
-                skippedStaleOCRFrameCount += 1
-                if loggingEnabled,
-                   skippedStaleOCRFrameCount == 1 ||
-                   skippedStaleOCRFrameCount - lastSkippedStaleOCRLogCount >= 300 {
-                    lastSkippedStaleOCRLogCount = skippedStaleOCRFrameCount
-                    print("[live-session] dropped_stale_ocr_frames count=\(skippedStaleOCRFrameCount)")
-                }
-            }
-
-            localTotalFrameCount += 1
-            localFrameSize = frame.sizeSummary
-            if let presentationTimeSeconds = frame.presentationTimeSeconds {
-                lastPresentationTimeSeconds = presentationTimeSeconds
-                if let firstPresentationTimeSeconds {
-                    localTotalActiveDecodeSeconds = max(
-                        localTotalActiveDecodeSeconds,
-                        presentationTimeSeconds - firstPresentationTimeSeconds
-                    )
-                }
-            } else {
-                localTotalActiveDecodeSeconds += self.frameDuration(
-                    nominalFrameRate: frame.nominalFrameRate,
-                    frameCount: 1
+            let statusToPublish = frameState.withValue { state -> LiveOCRSessionStatusSnapshot? in
+                state.recordFirstFrameLatencyIfNeeded(sessionStart: sessionStart)
+                self.fulfillPendingFrameSnapshotIfNeeded(
+                    frame: frame,
+                    seedURL: seedURL,
+                    sessionID: sessionID
                 )
-            }
 
-            if let status = self.latestStatusSnapshot(for: sessionID),
-               let symbol = status.lastSubscribedSymbol {
-                localLastSubscribedSymbol = symbol
-            }
+                let adjustedRuntimeConfig = self.runtimeConfigSnapshot()?.adjustedForFrameSize(
+                    width: frame.width,
+                    height: frame.height,
+                    displayID: 0
+                )
+                if state.shouldProcessLiveOCRFrame(
+                    frame: frame,
+                    maximumBacklogSeconds: Self.maximumLiveOCRBacklogSeconds
+                ) {
+                    pipeline.process(frame, runtimeConfig: adjustedRuntimeConfig)
+                } else if loggingEnabled, let skippedCount = state.recordSkippedStaleOCRFrameIfLoggable() {
+                    print("[live-session] dropped_stale_ocr_frames count=\(skippedCount)")
+                }
 
-            let shouldPublish = localTotalFrameCount == 1 ||
-                localTotalFrameCount.isMultiple(of: 30) ||
-                Date().timeIntervalSince(lastStatusPublish) >= 0.5
+                state.recordDecodedFrame(frame)
 
-            if shouldPublish {
-                lastStatusPublish = Date()
-                let effectiveFPS = localTotalActiveDecodeSeconds > 0
-                    ? Double(localTotalFrameCount) / localTotalActiveDecodeSeconds
-                    : nil
-                let snapshot = self.makeStatus(
+                if let status = self.latestStatusSnapshot(for: sessionID),
+                   let symbol = status.lastSubscribedSymbol {
+                    state.lastSubscribedSymbol = symbol
+                }
+
+                guard state.shouldPublishStatus(now: Date()) else {
+                    return nil
+                }
+
+                return self.makeStatus(
                     state: .live,
                     seedURLText: seedURL.absoluteString,
-                    fps: effectiveFPS,
-                    frameSize: localFrameSize,
-                    firstFrameLatencySeconds: localFirstFrameLatencySeconds,
-                    lastSubscribedSymbol: localLastSubscribedSymbol,
+                    fps: state.effectiveFPS,
+                    frameSize: state.frameSize,
+                    firstFrameLatencySeconds: state.firstFrameLatencySeconds,
+                    lastSubscribedSymbol: state.lastSubscribedSymbol,
                     messageOverride: nil
                 )
-                self.publishStatus(snapshot)
+            }
+            if let statusToPublish {
+                self.publishStatus(statusToPublish)
             }
         }
 
         if loggingEnabled {
+            let firstBinarySeconds = formatOptionalSeconds(summary.firstBinaryElapsedSeconds)
+            let firstMediaSeconds = formatOptionalSeconds(summary.firstMediaElapsedSeconds)
+            let firstFrameSeconds = formatOptionalSeconds(summary.firstFrameElapsedSeconds)
             print(
                 "[live-session] websocket_decoded frames=\(summary.decodedFrameCount) " +
-                "first_binary_seconds=\(formatOptionalSeconds(summary.firstBinaryElapsedSeconds)) " +
-                "first_media_seconds=\(formatOptionalSeconds(summary.firstMediaElapsedSeconds)) " +
-                "first_frame_seconds=\(formatOptionalSeconds(summary.firstFrameElapsedSeconds)) " +
+                "first_binary_seconds=\(firstBinarySeconds) " +
+                "first_media_seconds=\(firstMediaSeconds) " +
+                "first_frame_seconds=\(firstFrameSeconds) " +
                 "bytes=\(summary.binaryByteCount)"
             )
         }
 
-        _ = lastPresentationTimeSeconds
-    }
-
-    private func shouldProcessLiveOCRFrame(
-        frame: VideoFrame,
-        firstPresentationTimeSeconds: inout Double?,
-        firstOCRWallTimestamp: inout CFAbsoluteTime?
-    ) -> Bool {
-        guard let presentationTimeSeconds = frame.presentationTimeSeconds else {
-            return true
-        }
-
-        if let firstPresentation = firstPresentationTimeSeconds,
-           presentationTimeSeconds < firstPresentation {
-            resetLiveOCRClock(
-                presentationTimeSeconds: presentationTimeSeconds,
-                firstPresentationTimeSeconds: &firstPresentationTimeSeconds,
-                firstOCRWallTimestamp: &firstOCRWallTimestamp
-            )
-            return true
-        }
-
-        if firstPresentationTimeSeconds == nil || firstOCRWallTimestamp == nil {
-            resetLiveOCRClock(
-                presentationTimeSeconds: presentationTimeSeconds,
-                firstPresentationTimeSeconds: &firstPresentationTimeSeconds,
-                firstOCRWallTimestamp: &firstOCRWallTimestamp
-            )
-            return true
-        }
-
-        guard let firstPresentation = firstPresentationTimeSeconds,
-              let firstWallTimestamp = firstOCRWallTimestamp
-        else {
-            return true
-        }
-
-        let mediaElapsedSeconds = presentationTimeSeconds - firstPresentation
-        let wallElapsedSeconds = CFAbsoluteTimeGetCurrent() - firstWallTimestamp
-        let backlogSeconds = wallElapsedSeconds - mediaElapsedSeconds
-        return backlogSeconds <= Self.maximumLiveOCRBacklogSeconds
-    }
-
-    private func resetLiveOCRClock(
-        presentationTimeSeconds: Double,
-        firstPresentationTimeSeconds: inout Double?,
-        firstOCRWallTimestamp: inout CFAbsoluteTime?
-    ) {
-        firstPresentationTimeSeconds = presentationTimeSeconds
-        firstOCRWallTimestamp = CFAbsoluteTimeGetCurrent()
     }
 
     private func handlePipelineEvent(_ event: OCRPipelineEvent, sessionID: UUID) {
@@ -992,6 +913,126 @@ final class LiveOCRSessionController: @unchecked Sendable {
 
     private func formatOptionalSeconds(_ value: Double?) -> String {
         value.map { String(format: "%.2f", $0) } ?? "nil"
+    }
+}
+
+private struct LiveOCRWebSocketFrameState {
+    var totalFrameCount: Int
+    var totalActiveDecodeSeconds: Double
+    var firstFrameLatencySeconds: Double?
+    var frameSize: String?
+    var lastSubscribedSymbol: String?
+
+    private var firstPresentationTimeSeconds: Double?
+    private var firstOCRWallTimestamp: CFAbsoluteTime?
+    private var skippedStaleOCRFrameCount = 0
+    private var lastSkippedStaleOCRLogCount = 0
+    private var lastStatusPublish = Date.distantPast
+
+    init(
+        totalFrameCount: Int,
+        totalActiveDecodeSeconds: Double,
+        firstFrameLatencySeconds: Double?,
+        frameSize: String?,
+        lastSubscribedSymbol: String?
+    ) {
+        self.totalFrameCount = totalFrameCount
+        self.totalActiveDecodeSeconds = totalActiveDecodeSeconds
+        self.firstFrameLatencySeconds = firstFrameLatencySeconds
+        self.frameSize = frameSize
+        self.lastSubscribedSymbol = lastSubscribedSymbol
+    }
+
+    mutating func recordFirstFrameLatencyIfNeeded(sessionStart: Date) {
+        if firstFrameLatencySeconds == nil {
+            firstFrameLatencySeconds = Date().timeIntervalSince(sessionStart)
+        }
+    }
+
+    mutating func shouldProcessLiveOCRFrame(
+        frame: VideoFrame,
+        maximumBacklogSeconds: TimeInterval
+    ) -> Bool {
+        guard let presentationTimeSeconds = frame.presentationTimeSeconds else {
+            return true
+        }
+
+        if let firstPresentationTimeSeconds,
+           presentationTimeSeconds < firstPresentationTimeSeconds {
+            resetOCRClock(presentationTimeSeconds: presentationTimeSeconds)
+            return true
+        }
+
+        if firstPresentationTimeSeconds == nil || firstOCRWallTimestamp == nil {
+            resetOCRClock(presentationTimeSeconds: presentationTimeSeconds)
+            return true
+        }
+
+        guard let firstPresentationTimeSeconds, let firstOCRWallTimestamp else {
+            return true
+        }
+
+        let mediaElapsedSeconds = presentationTimeSeconds - firstPresentationTimeSeconds
+        let wallElapsedSeconds = CFAbsoluteTimeGetCurrent() - firstOCRWallTimestamp
+        return wallElapsedSeconds - mediaElapsedSeconds <= maximumBacklogSeconds
+    }
+
+    mutating func recordSkippedStaleOCRFrameIfLoggable() -> Int? {
+        skippedStaleOCRFrameCount += 1
+        guard skippedStaleOCRFrameCount == 1 ||
+            skippedStaleOCRFrameCount - lastSkippedStaleOCRLogCount >= 300
+        else {
+            return nil
+        }
+
+        lastSkippedStaleOCRLogCount = skippedStaleOCRFrameCount
+        return skippedStaleOCRFrameCount
+    }
+
+    mutating func recordDecodedFrame(_ frame: VideoFrame) {
+        totalFrameCount += 1
+        frameSize = frame.sizeSummary
+        if let presentationTimeSeconds = frame.presentationTimeSeconds,
+           let firstPresentationTimeSeconds {
+            totalActiveDecodeSeconds = max(
+                totalActiveDecodeSeconds,
+                presentationTimeSeconds - firstPresentationTimeSeconds
+            )
+        } else {
+            totalActiveDecodeSeconds += Self.frameDuration(
+                nominalFrameRate: frame.nominalFrameRate,
+                frameCount: 1
+            )
+        }
+    }
+
+    mutating func shouldPublishStatus(now: Date) -> Bool {
+        let shouldPublish = totalFrameCount == 1 ||
+            totalFrameCount.isMultiple(of: 30) ||
+            now.timeIntervalSince(lastStatusPublish) >= 0.5
+        if shouldPublish {
+            lastStatusPublish = now
+        }
+        return shouldPublish
+    }
+
+    var effectiveFPS: Double? {
+        totalActiveDecodeSeconds > 0 ? Double(totalFrameCount) / totalActiveDecodeSeconds : nil
+    }
+
+    private mutating func resetOCRClock(presentationTimeSeconds: Double) {
+        firstPresentationTimeSeconds = presentationTimeSeconds
+        firstOCRWallTimestamp = CFAbsoluteTimeGetCurrent()
+    }
+
+    private static func frameDuration(nominalFrameRate: Double?, frameCount: Int) -> Double {
+        if let nominalFrameRate, nominalFrameRate > 0 {
+            return 1 / nominalFrameRate
+        }
+        if frameCount > 0 {
+            return 1 / 30
+        }
+        return 0
     }
 }
 

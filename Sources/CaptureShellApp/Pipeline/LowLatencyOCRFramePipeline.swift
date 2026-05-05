@@ -146,6 +146,26 @@ private final class AsyncPixelBufferBox: @unchecked Sendable {
     }
 }
 
+private struct FrameObservationDraft {
+    let frameNumber: Int
+    let mediaTime: Double?
+    var symbol: OCRTradingSymbolObservation?
+    var manualCell: OCRTradingManualCellObservation?
+
+    var hasContent: Bool {
+        symbol != nil || manualCell != nil
+    }
+
+    func makeObservation() -> OCRTradingFrameObservation {
+        OCRTradingFrameObservation(
+            frameNumber: frameNumber,
+            mediaTime: mediaTime,
+            symbol: symbol,
+            manualCell: manualCell
+        )
+    }
+}
+
 private final class PipelineStateLockAccessGuard: @unchecked Sendable {
     #if DEBUG
     private var ownerThreadID: UInt64?
@@ -199,19 +219,23 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
     private let preprocessor: OCRRegionPreprocessor
     private let loggingEnabled: Bool
     private let unchangedLogCadence: Int
+    private let manualCellRearmConfirmationFrames: Int
+    private let manualCellTriggerConfirmationFrames: Int
     private let manualSymbolSamplingIntervalFrames: Int
     private let manualSymbolFreshOCRIntervalSeconds: CFAbsoluteTime
+    private let manualSymbolTriggerConfirmationFrames: Int
     private let asyncSymbolRecognitionEnabled: Bool
     private let manualCellRecognizer: any OCRTextRecognizing
     private let manualSymbolRecognizer: any OCRTextRecognizing
+    private let legacyMessageSender: any TradingMessageSending
     private let beep: @Sendable () -> Void
     private let eventHandler: OCRPipelineEventHandler?
     private let frameObservationHandler: OCRTradingFrameObservationHandler?
     private let triggerHandlingMode: OCRTriggerHandlingMode
     private let stateLock = NSRecursiveLock()
     private let stateLockAccessGuard = PipelineStateLockAccessGuard()
-    private let triggerStateMachine: TradingTriggerStateMachine
-    private let triggerDispatcher: TriggerDispatcher
+    private var triggerStateMachine: TradingTriggerStateMachine?
+    private var triggerDispatcher: TriggerDispatcher?
     private let symbolRecognitionQueue = DispatchQueue(label: "capture-shell.symbol-ocr", qos: .userInitiated)
     private let timeProvider: @Sendable () -> CFAbsoluteTime
 
@@ -221,6 +245,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
     private var symbolGeneration: UInt64 = 0
     private var deferredSymbolReplay: DeferredSymbolReplay?
     private var lastManualSymbolFreshOCRTimestamp: CFAbsoluteTime?
+    private var activeFrameObservationDraft: FrameObservationDraft?
 
     init(
         loggingEnabled: Bool = true,
@@ -258,14 +283,12 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         preprocessor = OCRRegionPreprocessor(ciContext: ciContext)
         self.loggingEnabled = loggingEnabled
         self.unchangedLogCadence = max(1, unchangedLogCadence)
+        self.manualCellRearmConfirmationFrames = manualCellRearmConfirmationFrames
+        self.manualCellTriggerConfirmationFrames = manualCellTriggerConfirmationFrames
         self.manualSymbolSamplingIntervalFrames = max(1, manualSymbolSamplingIntervalFrames)
         self.manualSymbolFreshOCRIntervalSeconds = max(0.1, manualSymbolFreshOCRIntervalSeconds)
+        self.manualSymbolTriggerConfirmationFrames = manualSymbolTriggerConfirmationFrames
         self.timeProvider = timeProvider
-        triggerStateMachine = TradingTriggerStateMachine(
-            manualCellRearmConfirmationFrames: manualCellRearmConfirmationFrames,
-            manualCellTriggerConfirmationFrames: manualCellTriggerConfirmationFrames,
-            manualSymbolTriggerConfirmationFrames: manualSymbolTriggerConfirmationFrames
-        )
         manualCellRecognizer = recognizer
         if let symbolRecognizer {
             manualSymbolRecognizer = symbolRecognizer
@@ -281,11 +304,42 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
                 recognizer is FontTemplateTextRecognizer ||
                 manualSymbolRecognizer is FontTemplateTextRecognizer
         }
+        self.legacyMessageSender = messageSender
         self.beep = beep
         self.eventHandler = eventHandler
         self.frameObservationHandler = frameObservationHandler
         self.triggerHandlingMode = triggerHandlingMode
-        triggerDispatcher = TriggerDispatcher(
+
+        if triggerHandlingMode == .legacyDispatcher {
+            let stateMachine = TradingTriggerStateMachine(
+                manualCellRearmConfirmationFrames: manualCellRearmConfirmationFrames,
+                manualCellTriggerConfirmationFrames: manualCellTriggerConfirmationFrames,
+                manualSymbolTriggerConfirmationFrames: manualSymbolTriggerConfirmationFrames
+            )
+            triggerStateMachine = stateMachine
+            triggerDispatcher = Self.makeTriggerDispatcher(
+                stateLock: stateLock,
+                stateLockAccessGuard: stateLockAccessGuard,
+                loggingEnabled: loggingEnabled,
+                messageSender: messageSender,
+                eventHandler: eventHandler,
+                triggerStateMachine: stateMachine
+            )
+        } else {
+            triggerStateMachine = nil
+            triggerDispatcher = nil
+        }
+    }
+
+    private static func makeTriggerDispatcher(
+        stateLock: NSRecursiveLock,
+        stateLockAccessGuard: PipelineStateLockAccessGuard,
+        loggingEnabled: Bool,
+        messageSender: any TradingMessageSending,
+        eventHandler: OCRPipelineEventHandler?,
+        triggerStateMachine: TradingTriggerStateMachine
+    ) -> TriggerDispatcher {
+        TriggerDispatcher(
             withPipelineState: { [stateLock, stateLockAccessGuard] action in
                 stateLock.lock()
                 stateLockAccessGuard.didLock()
@@ -310,11 +364,12 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
             frameCount = 0
             didLogBackend = false
             regionTrackers.removeAll(keepingCapacity: true)
-            triggerDispatcher.reset()
+            triggerDispatcher?.reset()
             symbolGeneration &+= 1
             deferredSymbolReplay = nil
             lastManualSymbolFreshOCRTimestamp = nil
-            triggerStateMachine.reset()
+            activeFrameObservationDraft = nil
+            triggerStateMachine?.reset()
         }
     }
 
@@ -322,6 +377,10 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         withStateLock {
             frameCount += 1
             let frameIngressTimestamp = timeProvider()
+            beginFrameObservation(frameNumber: frameCount, mediaTime: frame.presentationTimeSeconds)
+            defer {
+                flushActiveFrameObservation()
+            }
 
             guard let runtimeConfig else {
                 if shouldLog(count: frameCount, cadence: 120) {
@@ -341,7 +400,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
                 regionTrackers.removeValue(forKey: .manualSymbolCell)
                 deferredSymbolReplay = nil
                 lastManualSymbolFreshOCRTimestamp = nil
-                triggerStateMachine.clearManualSymbolState()
+                triggerStateMachine?.clearManualSymbolState()
                 emitSymbolObservation(
                     frameNumber: frameCount,
                     presentationTimeSeconds: frame.presentationTimeSeconds,
@@ -855,15 +914,15 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
     ) {
         switch region {
         case .manualCell:
-            frameObservationHandler?(OCRTradingFrameObservation(
+            emitManualCellObservation(
                 frameNumber: frameNumber,
-                mediaTime: presentationTimeSeconds,
-                manualCell: OCRTradingManualCellObservation(
+                presentationTimeSeconds: presentationTimeSeconds,
+                observation: OCRTradingManualCellObservation(
                     rawText: recognition.rawText,
                     normalizedText: recognition.normalizedText,
                     confidence: recognition.confidence
                 )
-            ))
+            )
         case .manualSymbolCell:
             emitSymbolObservation(
                 frameNumber: frameNumber,
@@ -882,9 +941,9 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         recognition: OCRRecognitionResult?,
         recognitionState: OCRTradingRecognitionState
     ) {
-        frameObservationHandler?(OCRTradingFrameObservation(
+        emitFrameObservationComponent(
             frameNumber: frameNumber,
-            mediaTime: presentationTimeSeconds,
+            presentationTimeSeconds: presentationTimeSeconds,
             symbol: OCRTradingSymbolObservation(
                 fingerprint: fingerprint,
                 recognition: recognition.map {
@@ -896,7 +955,72 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
                 },
                 recognitionState: recognitionState
             )
-        ))
+        )
+    }
+
+    private func emitManualCellObservation(
+        frameNumber: Int,
+        presentationTimeSeconds: Double?,
+        observation: OCRTradingManualCellObservation
+    ) {
+        emitFrameObservationComponent(
+            frameNumber: frameNumber,
+            presentationTimeSeconds: presentationTimeSeconds,
+            manualCell: observation
+        )
+    }
+
+    private func beginFrameObservation(frameNumber: Int, mediaTime: Double?) {
+        activeFrameObservationDraft = FrameObservationDraft(
+            frameNumber: frameNumber,
+            mediaTime: mediaTime,
+            symbol: nil,
+            manualCell: nil
+        )
+    }
+
+    private func emitFrameObservationComponent(
+        frameNumber: Int,
+        presentationTimeSeconds: Double?,
+        symbol: OCRTradingSymbolObservation? = nil,
+        manualCell: OCRTradingManualCellObservation? = nil
+    ) {
+        guard
+            activeFrameObservationDraft?.frameNumber == frameNumber,
+            activeFrameObservationDraft?.mediaTime == presentationTimeSeconds
+        else {
+            emitFrameObservationNow(
+                OCRTradingFrameObservation(
+                    frameNumber: frameNumber,
+                    mediaTime: presentationTimeSeconds,
+                    symbol: symbol,
+                    manualCell: manualCell
+                )
+            )
+            return
+        }
+
+        if let symbol {
+            activeFrameObservationDraft?.symbol = symbol
+        }
+        if let manualCell {
+            activeFrameObservationDraft?.manualCell = manualCell
+        }
+    }
+
+    private func flushActiveFrameObservation() {
+        guard let draft = activeFrameObservationDraft else {
+            return
+        }
+        activeFrameObservationDraft = nil
+        guard draft.hasContent else {
+            return
+        }
+        emitFrameObservationNow(draft.makeObservation())
+    }
+
+    private func emitFrameObservationNow(_ observation: OCRTradingFrameObservation) {
+        frameObservationHandler?(observation)
     }
 
     private func handleManualCellBehavior(
@@ -905,6 +1029,10 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         timings: TriggerStageTimings?,
         shouldLogEvaluation: Bool
     ) {
+        guard let triggerStateMachine, let triggerDispatcher else {
+            return
+        }
+
         let triggerEvaluationStart = CFAbsoluteTimeGetCurrent()
         let evaluation = triggerStateMachine.evaluateManualCell(
             normalizedText: recognition.normalizedText,
@@ -980,6 +1108,10 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         timings: TriggerStageTimings?,
         shouldLogEvaluation: Bool
     ) {
+        guard let triggerStateMachine, let triggerDispatcher else {
+            return
+        }
+
         let triggerEvaluationStart = CFAbsoluteTimeGetCurrent()
         let evaluation = triggerStateMachine.evaluateManualSymbol(
             normalizedText: recognition.normalizedText,
@@ -1054,6 +1186,27 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         text.replacingOccurrences(of: "\"", with: "\\\"")
     }
 
+    private func ensureLegacyTriggerHandlingForTesting() {
+        guard triggerStateMachine == nil || triggerDispatcher == nil else {
+            return
+        }
+
+        let stateMachine = TradingTriggerStateMachine(
+            manualCellRearmConfirmationFrames: manualCellRearmConfirmationFrames,
+            manualCellTriggerConfirmationFrames: manualCellTriggerConfirmationFrames,
+            manualSymbolTriggerConfirmationFrames: manualSymbolTriggerConfirmationFrames
+        )
+        triggerStateMachine = stateMachine
+        triggerDispatcher = Self.makeTriggerDispatcher(
+            stateLock: stateLock,
+            stateLockAccessGuard: stateLockAccessGuard,
+            loggingEnabled: loggingEnabled,
+            messageSender: legacyMessageSender,
+            eventHandler: eventHandler,
+            triggerStateMachine: stateMachine
+        )
+    }
+
     // Deterministic test-only trigger path that bypasses OCR/capture.
     func processTriggerEventForTesting(
         region: OCRRegionKind,
@@ -1062,6 +1215,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
         confidence: Double
     ) {
         withStateLock {
+            ensureLegacyTriggerHandlingForTesting()
             frameCount += 1
             let recognition = OCRRecognitionResult(
                 rawText: rawText,

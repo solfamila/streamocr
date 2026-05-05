@@ -36,6 +36,19 @@ enum OCRTradingCommandResult: Equatable, Sendable {
             false
         }
     }
+
+    var resultDescription: String {
+        switch self {
+        case .submitted:
+            return "Command submitted."
+        case let .intentionallyIgnored(reason),
+             let .retryableRejected(reason),
+             let .failed(reason),
+             let .cancelled(reason),
+             let .staleIgnored(reason):
+            return reason
+        }
+    }
 }
 
 struct OCRTradingPendingCommand: Equatable, Sendable {
@@ -43,10 +56,38 @@ struct OCRTradingPendingCommand: Equatable, Sendable {
     let previousSymbol: String?
 }
 
+struct OCRTradingEffects: Equatable, RandomAccessCollection, Sendable {
+    typealias Element = OCRTradingCommand
+    typealias Index = Array<OCRTradingCommand>.Index
+
+    var commandsToStart: [OCRTradingCommand] = []
+    var commandIDsToCancel: [OCRTradingCommandID] = []
+
+    static let none = OCRTradingEffects()
+
+    var startIndex: Index { commandsToStart.startIndex }
+    var endIndex: Index { commandsToStart.endIndex }
+
+    subscript(position: Index) -> OCRTradingCommand {
+        commandsToStart[position]
+    }
+
+    mutating func append(command: OCRTradingCommand) {
+        commandsToStart.append(command)
+    }
+
+    mutating func appendCancel(_ commandID: OCRTradingCommandID) {
+        commandIDsToCancel.append(commandID)
+    }
+
+    mutating func appendCancels(_ commandIDs: [OCRTradingCommandID]) {
+        commandIDsToCancel.append(contentsOf: commandIDs)
+    }
+}
+
 enum OCRTradingEvent {
     case sessionStarted(OCRTradingSessionGeneration)
     case sessionStopping(reason: String)
     case frame(OCRTradingFrameObservation)
     case commandCompleted(OCRTradingCommandID, OCRTradingCommandResult)
-    case brokerSnapshot(TradingDashboardSnapshot)
 }
