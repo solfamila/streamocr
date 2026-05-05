@@ -2003,7 +2003,8 @@ struct TriggerPipelineVerificationHarnessTests {
             symbolRecognizer: recognizer,
             asyncSymbolRecognitionEnabled: false,
             messageSender: sender,
-            beep: {}
+            beep: {},
+            triggerHandlingMode: .legacyDispatcher
         )
         let pixelBuffer = makeSolidPixelBuffer(width: 48, height: 48, fillValue: 0)
         let runtimeConfig = CaptureRuntimeConfig(
@@ -2045,7 +2046,8 @@ struct TriggerPipelineVerificationHarnessTests {
             symbolRecognizer: recognizer,
             asyncSymbolRecognitionEnabled: true,
             messageSender: sender,
-            beep: {}
+            beep: {},
+            triggerHandlingMode: .legacyDispatcher
         )
         let pixelBuffer = makeSolidPixelBuffer(width: 48, height: 48, fillValue: 0)
         let runtimeConfig = CaptureRuntimeConfig(
@@ -2085,7 +2087,8 @@ struct TriggerPipelineVerificationHarnessTests {
             manualSymbolTriggerConfirmationFrames: 1,
             messageSender: sender,
             beep: {},
-            eventHandler: eventCollector.handle(_:)
+            eventHandler: eventCollector.handle(_:),
+            triggerHandlingMode: .legacyDispatcher
         )
 
         pipeline.processTriggerEventForTesting(
@@ -2147,7 +2150,8 @@ struct TriggerPipelineVerificationHarnessTests {
             symbolRecognizer: recognizer,
             messageSender: sender,
             beep: {},
-            eventHandler: eventCollector.handle(_:)
+            eventHandler: eventCollector.handle(_:),
+            triggerHandlingMode: .legacyDispatcher
         )
         let pixelBuffer = makeSolidPixelBuffer(width: 48, height: 48, fillValue: 0)
         let runtimeConfig = CaptureRuntimeConfig(
@@ -2192,7 +2196,8 @@ struct TriggerPipelineVerificationHarnessTests {
             symbolRecognizer: recognizer,
             messageSender: sender,
             beep: {},
-            eventHandler: eventCollector.handle(_:)
+            eventHandler: eventCollector.handle(_:),
+            triggerHandlingMode: .legacyDispatcher
         )
         let pixelBuffer = makeSolidPixelBuffer(width: 48, height: 48, fillValue: 0)
         let runtimeConfig = CaptureRuntimeConfig(
@@ -2240,6 +2245,7 @@ struct TriggerPipelineVerificationHarnessTests {
             messageSender: sender,
             beep: {},
             eventHandler: eventCollector.handle(_:),
+            triggerHandlingMode: .legacyDispatcher,
             timeProvider: clock.current
         )
         let pixelBuffer = makeSolidPixelBuffer(width: 48, height: 48, fillValue: 0)
@@ -2311,6 +2317,7 @@ struct TriggerPipelineVerificationHarnessTests {
             asyncSymbolRecognitionEnabled: false,
             messageSender: sender,
             beep: {},
+            triggerHandlingMode: .legacyDispatcher,
             timeProvider: clock.current
         )
         let pixelBuffer = makeSolidPixelBuffer(width: 48, height: 48, fillValue: 0)
@@ -2905,13 +2912,54 @@ struct OCRFingerprintPolicyTests {
         let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
         let pointer = baseAddress?.assumingMemoryBound(to: UInt8.self)
         pointer?[bytesPerRow + 8] = 11
+        pointer?[bytesPerRow + 9] = 11
+        pointer?[bytesPerRow + 10] = 11
         CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
 
         let second = OCRFingerprintPolicy.fingerprint(pixelBuffer: pixelBuffer)
         #expect(first != second)
     }
 
-    private func makePixelBuffer(fillValue: UInt8) -> CVPixelBuffer {
+    @Test
+    func fingerprintIgnoresTinySinglePixelNoiseInLargerROIs() {
+        let pixelBuffer = makePixelBuffer(width: 64, height: 64, fillValue: 90)
+        let first = OCRFingerprintPolicy.fingerprint(pixelBuffer: pixelBuffer)
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let pointer = baseAddress?.assumingMemoryBound(to: UInt8.self)
+        pointer?[bytesPerRow * 17 + 23 * 4] = 11
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+
+        let second = OCRFingerprintPolicy.fingerprint(pixelBuffer: pixelBuffer)
+        #expect(first == second)
+    }
+
+    @Test
+    func fingerprintChangesForCellLevelContentChanges() {
+        let pixelBuffer = makePixelBuffer(width: 64, height: 64, fillValue: 40)
+        let first = OCRFingerprintPolicy.fingerprint(pixelBuffer: pixelBuffer)
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let pointer = baseAddress?.assumingMemoryBound(to: UInt8.self)
+        for y in 16..<32 {
+            let row = pointer?.advanced(by: y * bytesPerRow)
+            for x in 16..<32 {
+                row?[x * 4] = 240
+                row?[x * 4 + 1] = 240
+                row?[x * 4 + 2] = 240
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+
+        let second = OCRFingerprintPolicy.fingerprint(pixelBuffer: pixelBuffer)
+        #expect(first != second)
+    }
+
+    private func makePixelBuffer(width: Int = 16, height: Int = 16, fillValue: UInt8) -> CVPixelBuffer {
         var pixelBuffer: CVPixelBuffer?
         let attributes: [CFString: Any] = [
             kCVPixelBufferCGImageCompatibilityKey: true,
@@ -2921,8 +2969,8 @@ struct OCRFingerprintPolicyTests {
 
         let status = CVPixelBufferCreate(
             kCFAllocatorDefault,
-            16,
-            16,
+            width,
+            height,
             kCVPixelFormatType_32BGRA,
             attributes as CFDictionary,
             &pixelBuffer

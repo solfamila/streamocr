@@ -80,12 +80,20 @@ final class OfflineVideoAnalyzer {
     ) throws -> OfflineAnalysisResult {
         let runtimeConfig = try RuntimeConfigFileIO.load(from: runtimeConfigURL)
         let eventCollector = PipelineEventCollector()
+        let tradingRuntime = OCRTradingCoordinatorRuntime(
+            coordinator: .liveTradingDefaults(),
+            executor: OCRTradingDryRunCommandExecutor(),
+            eventHandler: eventCollector.handle(_:)
+        )
+        tradingRuntime.beginSession(1)
         let pipeline = LowLatencyOCRFramePipeline(
             loggingEnabled: false,
             recognizer: recognizer,
-            messageSender: DiscardingTradingMessageSender(),
+            asyncSymbolRecognitionEnabled: false,
             beep: {},
-            eventHandler: eventCollector.handle(_:)
+            eventHandler: eventCollector.handle(_:),
+            frameObservationHandler: tradingRuntime.handle(_:),
+            triggerHandlingMode: .frameObservationsOnly
         )
 
         var adjustedRuntimeConfigCache: [String: CaptureRuntimeConfig] = [:]
@@ -112,6 +120,7 @@ final class OfflineVideoAnalyzer {
             }
         }
 
+        _ = tradingRuntime.waitForPendingCommands(timeout: 2)
         let collectedEvents = eventCollector.snapshotWithAnalysisTime()
         let allEvents = collectedEvents.map(\.event)
         let recognitionEvents = allEvents.filter { $0.kind == .recognition }

@@ -76,10 +76,11 @@ audio track automatically. If `--live-metadata-json` is omitted but
 `--record-video` is set, a sibling `*.metadata.json` file is written automatically.
 There are three live OCR paths in the app:
 - CLI `--live-analyze`: dry-run analysis / JSON / optional recording only
-- Trading GUI live stream: routes OCR `BUY` / `SUBSCRIBE` directly into the
-  in-process `TradingRuntimeManager`
-- Display capture window: routes ScreenCaptureKit OCR directly into the same
-  in-process runtime
+- Trading GUI live stream: routes OCR observations through the central
+  `OCRTradingCoordinator`, then executes typed `BUY` / `SELL` / `SUBSCRIBE`
+  commands directly against the in-process `TradingRuntimeManager`
+- Display capture window: routes ScreenCaptureKit OCR through the same
+  coordinator/executor path
 
 The trading GUI also has a separate **Start Recording** / **Stop Recording**
 button under the live URL controls. It records the current live URL with the same
@@ -99,7 +100,7 @@ first safe numeric decrease emits `sell_triggered` and routes a close-long
 near-ties are rejected as `?`, so they do not size BUY orders, rearm BUY, or
 trigger SELL.
 When a confirmed symbol change commits, manual-cell BUY/SELL state is cleared
-and any pending BUY/SELL transport for the prior symbol is made stale, so
+and any pending BUY/SELL command for the prior symbol generation is made stale, so
 position peaks cannot bleed from one ticker into the next. Real trading
 BUY/SELL automation requires a committed OCR symbol and is suppressed while a
 symbol refresh or subscribe transition is still pending; after the new symbol
@@ -112,9 +113,10 @@ Stopping live OCR moves the GUI through a stopping/draining state until pending
 OCR trading tasks finish or time out. Stop prevents new or not-yet-submitted OCR
 actions; it cannot cancel an order after the app has already crossed into
 `submitBuyAsync`.
-Display capture uses the same OCR automation sender. Stopping capture cancels
+Display capture uses the same OCR trading coordinator. Stopping capture cancels
 pending OCR actions for that capture session, drains them before reporting fully
-stopped, and starts the next capture session with a fresh sender generation.
+stopped, and starts the next capture session with a fresh coordinator/session
+generation.
 
 Both live and offline result JSON now include `buySignalTimings`, which lists
 each `buy_triggered` event with the media `presentationTimeSeconds` and the
@@ -156,6 +158,10 @@ That means extra actual events are allowed, but expected events still need to
 appear in order. Field-level matching is still partial, so fixtures can stay
 tight or loose depending on which fields they specify.
 
+The live GUI and display-capture trading path uses typed OCR trading commands
+internally. JSON remains the CLI/result/fixture format and a compatibility
+boundary for the older legacy trigger dispatcher path.
+
 ## OCR Design
 
 The recognizer renders Core Text glyph templates, binarizes the selected ROI,
@@ -172,11 +178,14 @@ get from the raw read to a ticker, that candidate is rejected instead of being
 laundered into a plausible symbol.
 
 The pipeline still fingerprints each ROI so unchanged frames avoid repeated OCR
-work. If the numeric cell or sampled symbol cell is unchanged, the cached
-recognition is replayed into the trigger state machine so multi-frame
-confirmation still works without rerunning OCR. Symbol OCR also forces a fresh
-read at least every 10 seconds, even when the symbol-cell fingerprint looks
-unchanged, so a stale ticker cannot persist indefinitely because of cache replay.
+work. In the GUI live/display paths, the symbol ROI is fingerprinted every
+frame; if that fingerprint changes, manual BUY/SELL evaluation is suppressed
+immediately until symbol OCR confirms or revalidates the ticker. If the numeric
+cell or sampled symbol cell is unchanged, cached recognition can still feed the
+active trigger/coordinator path so multi-frame confirmation works without
+rerunning OCR. Symbol OCR also forces a fresh read at least every 10 seconds,
+even when the symbol-cell fingerprint looks unchanged, so a stale ticker cannot
+persist indefinitely because of cache replay.
 Confirmed high-confidence symbol changes can subscribe immediately; changed
 symbols below the confidence floor are suppressed instead of being treated as a
 new ticker.

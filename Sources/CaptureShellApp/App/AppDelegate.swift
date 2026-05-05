@@ -39,14 +39,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return self.currentOCRAutomationTradingConfiguration()
         }
     )
-    private lazy var captureController = DisplayCaptureController(
-        permissionManager: ScreenRecordingPermissionManager(),
-        timingLogger: FrameTimingLogger(),
-        pipeline: LowLatencyOCRFramePipeline(
-            messageSender: displayCaptureMessageSender
-        ),
-        messageSender: displayCaptureMessageSender
+    private lazy var displayOCRTradingRuntime = OCRTradingCoordinatorRuntime(
+        coordinator: .liveTradingDefaults(),
+        executor: displayCaptureMessageSender
     )
+    private lazy var captureController: DisplayCaptureController = {
+        let runtime = displayOCRTradingRuntime
+        return DisplayCaptureController(
+            permissionManager: ScreenRecordingPermissionManager(),
+            timingLogger: FrameTimingLogger(),
+            pipeline: LowLatencyOCRFramePipeline(
+                frameObservationHandler: { observation in
+                    runtime.handle(observation)
+                },
+                triggerHandlingMode: .frameObservationsOnly
+            ),
+            ocrTradingRuntime: runtime
+        )
+    }()
 
     private let runtimeConfigStore = RuntimeConfigStore()
     private let roiSelector = ROISelector()

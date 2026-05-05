@@ -57,13 +57,20 @@ final class LiveStreamAnalyzer {
         let pollInterval = 1 / max(1, pollFPS)
         let runtimeConfig = try runtimeConfigURL.map { try RuntimeConfigFileIO.load(from: $0) }
         let eventCollector = PipelineEventCollector()
-        let messageSender: any TradingMessageSending = DiscardingTradingMessageSender()
+        let tradingRuntime = OCRTradingCoordinatorRuntime(
+            coordinator: .liveTradingDefaults(),
+            executor: OCRTradingDryRunCommandExecutor(),
+            eventHandler: eventCollector.handle(_:)
+        )
+        tradingRuntime.beginSession(1)
         let pipeline = LowLatencyOCRFramePipeline(
             loggingEnabled: loggingEnabled,
             recognizer: FontTemplateTextRecognizer(),
-            messageSender: messageSender,
+            asyncSymbolRecognitionEnabled: false,
             beep: {},
-            eventHandler: eventCollector.handle(_:)
+            eventHandler: eventCollector.handle(_:),
+            frameObservationHandler: tradingRuntime.handle(_:),
+            triggerHandlingMode: .frameObservationsOnly
         )
 
         var frameCount = 0
@@ -116,7 +123,7 @@ final class LiveStreamAnalyzer {
                     analysisStart: start,
                     loggingEnabled: loggingEnabled,
                     eventCollector: eventCollector,
-                    messageSender: messageSender,
+                    tradingRuntime: tradingRuntime,
                     pipeline: pipeline,
                     captureCoordinator: captureCoordinator,
                     metadataURL: metadataURL
@@ -142,7 +149,7 @@ final class LiveStreamAnalyzer {
                     analysisStart: start,
                     loggingEnabled: loggingEnabled,
                     eventCollector: eventCollector,
-                    messageSender: messageSender,
+                    tradingRuntime: tradingRuntime,
                     pipeline: pipeline,
                     captureCoordinator: captureCoordinator,
                     metadataURL: metadataURL
@@ -229,7 +236,7 @@ final class LiveStreamAnalyzer {
             frameCount: frameCount,
             frameSize: frameSize,
             eventCollector: eventCollector,
-            messageSender: messageSender,
+            tradingRuntime: tradingRuntime,
             captureCoordinator: captureCoordinator,
             loggingEnabled: loggingEnabled
         )
@@ -266,7 +273,7 @@ final class LiveStreamAnalyzer {
         analysisStart: Date,
         loggingEnabled: Bool,
         eventCollector: PipelineEventCollector,
-        messageSender: any TradingMessageSending,
+        tradingRuntime: OCRTradingCoordinatorRuntime,
         pipeline: LowLatencyOCRFramePipeline,
         captureCoordinator: LiveMediaCaptureCoordinator?,
         metadataURL: URL?
@@ -334,7 +341,7 @@ final class LiveStreamAnalyzer {
             frameCount: frameCount,
             frameSize: frameSize,
             eventCollector: eventCollector,
-            messageSender: messageSender,
+            tradingRuntime: tradingRuntime,
             captureCoordinator: captureCoordinator,
             loggingEnabled: loggingEnabled
         )
@@ -351,7 +358,7 @@ final class LiveStreamAnalyzer {
         analysisStart: Date,
         loggingEnabled: Bool,
         eventCollector: PipelineEventCollector,
-        messageSender: any TradingMessageSending,
+        tradingRuntime: OCRTradingCoordinatorRuntime,
         pipeline: LowLatencyOCRFramePipeline,
         captureCoordinator: LiveMediaCaptureCoordinator?,
         metadataURL: URL?
@@ -515,7 +522,7 @@ final class LiveStreamAnalyzer {
             frameCount: frameCount,
             frameSize: frameSize,
             eventCollector: eventCollector,
-            messageSender: messageSender,
+            tradingRuntime: tradingRuntime,
             captureCoordinator: captureCoordinator,
             loggingEnabled: loggingEnabled
         )
@@ -534,11 +541,11 @@ final class LiveStreamAnalyzer {
         frameCount: Int,
         frameSize: String,
         eventCollector: PipelineEventCollector,
-        messageSender: any TradingMessageSending,
+        tradingRuntime: OCRTradingCoordinatorRuntime,
         captureCoordinator: LiveMediaCaptureCoordinator?,
         loggingEnabled: Bool
     ) throws -> LiveStreamAnalysisResult {
-        let didFlushPendingMessages = messageSender.waitForPendingMessages(timeout: 2)
+        let didFlushPendingMessages = tradingRuntime.waitForPendingCommands(timeout: 2)
         if loggingEnabled, !didFlushPendingMessages {
             print("[live] timed_out_waiting_for_transport_callbacks timeout_seconds=2.00")
         }

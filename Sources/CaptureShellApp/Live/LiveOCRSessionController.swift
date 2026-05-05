@@ -76,7 +76,8 @@ final class LiveOCRSessionController: @unchecked Sendable {
     private var stoppingSessionID: UUID?
     private var activeRuntimeConfig: CaptureRuntimeConfig?
     private var buyQuantityRatio = 0.5
-    private var activeMessageSender: OCRAutomationTradingMessageSender?
+    private var activeTradingRuntime: OCRTradingCoordinatorRuntime?
+    private var nextTradingSessionGeneration: OCRTradingSessionGeneration = 0
     private var pendingFrameSnapshotRequest: PendingFrameSnapshotRequest?
 
     init(
@@ -128,7 +129,10 @@ final class LiveOCRSessionController: @unchecked Sendable {
         }
 
         let sessionID = UUID()
+        let tradingSessionGeneration: OCRTradingSessionGeneration
         stateLock.lock()
+        nextTradingSessionGeneration &+= 1
+        tradingSessionGeneration = nextTradingSessionGeneration
         activeSessionID = sessionID
         stoppingSessionID = nil
         stateLock.unlock()
@@ -146,7 +150,12 @@ final class LiveOCRSessionController: @unchecked Sendable {
         )
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.runSession(sessionID: sessionID, seedURL: seedURL, loggingEnabled: loggingEnabled)
+            self?.runSession(
+                sessionID: sessionID,
+                tradingSessionGeneration: tradingSessionGeneration,
+                seedURL: seedURL,
+                loggingEnabled: loggingEnabled
+            )
         }
     }
 
@@ -156,12 +165,12 @@ final class LiveOCRSessionController: @unchecked Sendable {
             stateLock.unlock()
             return
         }
-        let messageSender = activeMessageSender
+        let tradingRuntime = activeTradingRuntime
         let currentStatus = latestStatus
         activeSessionID = nil
         stoppingSessionID = sessionID
         stateLock.unlock()
-        messageSender?.cancelPendingMessages(reason: "Live OCR stopped before pending trading actions completed.")
+        tradingRuntime?.stop(reason: "Live OCR stopped before pending trading actions completed.")
         publishStatus(
             makeStatus(
                 state: .stopping,
@@ -226,7 +235,12 @@ final class LiveOCRSessionController: @unchecked Sendable {
         }()
     }
 
-    private func runSession(sessionID: UUID, seedURL: URL, loggingEnabled: Bool) {
+    private func runSession(
+        sessionID: UUID,
+        tradingSessionGeneration: OCRTradingSessionGeneration,
+        seedURL: URL,
+        loggingEnabled: Bool
+    ) {
         let sessionStart = Date()
         let temporaryDirectory = temporaryDirectoryProvider(sessionID)
 
@@ -261,29 +275,37 @@ final class LiveOCRSessionController: @unchecked Sendable {
                 )
             }
         )
+        let tradingRuntime = OCRTradingCoordinatorRuntime(
+            coordinator: .liveTradingDefaults(),
+            executor: messageSender,
+            eventHandler: { [weak self] event in
+                self?.handlePipelineEvent(event, sessionID: sessionID)
+            }
+        )
         stateLock.lock()
         if activeSessionID == sessionID {
-            activeMessageSender = messageSender
+            activeTradingRuntime = tradingRuntime
         }
         stateLock.unlock()
+        tradingRuntime.beginSession(tradingSessionGeneration)
 
         defer {
-            let flushed = messageSender.waitForPendingMessages(timeout: 2)
+            let flushed = tradingRuntime.waitForPendingCommands(timeout: 2)
             if loggingEnabled, !flushed {
                 print("[live-session] pending_trading_actions_did_not_flush_before_exit")
             }
 
-            finishSessionExit(sessionID: sessionID, messageSender: messageSender)
+            finishSessionExit(sessionID: sessionID, tradingRuntime: tradingRuntime)
         }
 
         let pipeline = LowLatencyOCRFramePipeline(
             loggingEnabled: loggingEnabled,
             recognizer: FontTemplateTextRecognizer(),
-            messageSender: messageSender,
             beep: {},
-            eventHandler: { [weak self] event in
-                self?.handlePipelineEvent(event, sessionID: sessionID)
-            }
+            frameObservationHandler: { observation in
+                tradingRuntime.handle(observation)
+            },
+            triggerHandlingMode: .frameObservationsOnly
         )
 
         var totalFrameCount = 0
@@ -796,12 +818,12 @@ final class LiveOCRSessionController: @unchecked Sendable {
         publishStatus(status)
     }
 
-    private func finishSessionExit(sessionID: UUID, messageSender: OCRAutomationTradingMessageSender) {
+    private func finishSessionExit(sessionID: UUID, tradingRuntime: OCRTradingCoordinatorRuntime) {
         let shouldPublishOff: Bool
 
         stateLock.lock()
-        if activeMessageSender === messageSender {
-            activeMessageSender = nil
+        if activeTradingRuntime === tradingRuntime {
+            activeTradingRuntime = nil
         }
         if stoppingSessionID == sessionID {
             stoppingSessionID = nil

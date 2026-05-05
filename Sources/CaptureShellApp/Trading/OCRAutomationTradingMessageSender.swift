@@ -11,7 +11,7 @@ private enum OCRActionRejectionDisposition {
     case retryable(String)
 }
 
-final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked Sendable {
+final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTradingCommandExecuting, @unchecked Sendable {
     private let manager: TradingRuntimeManager
     private let configurationProvider: @MainActor () -> OCRAutomationTradingConfiguration
     private let lock = NSLock()
@@ -34,11 +34,60 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
     var reportsTransportOutcomes: Bool { false }
     var requiresCommittedOCRSymbolForManualCellTrades: Bool { true }
 
+    func beginCommandSession() {
+        beginMessageSession()
+    }
+
     func beginMessageSession() {
         lock.lock()
         currentGeneration += 1
         cleanupCompletedCancelledGenerationsLocked()
         lock.unlock()
+    }
+
+    func execute(_ command: OCRTradingCommand) async -> OCRTradingCommandResult {
+        let generation = beginPendingOperation()
+        defer {
+            finishPendingOperation(generation: generation)
+        }
+
+        do {
+            if let cancellationReason = cancellationReasonSnapshot(for: generation) {
+                throw TradingMessageSendError.cancelled(reason: cancellationReason)
+            }
+
+            let outcome: TradingMessageSendOutcome
+            switch command.kind {
+            case .subscribe:
+                outcome = try await handleSubscribe(symbol: command.symbol, generation: generation)
+            case let .buy(ocrQuantity, _):
+                outcome = try await handleBuy(
+                    ocrQuantity: ocrQuantity,
+                    symbol: command.symbol,
+                    generation: generation
+                )
+            case let .sell(previousOCRQuantity, currentOCRQuantity):
+                outcome = try await handleSell(
+                    previousOCRQuantity: previousOCRQuantity,
+                    currentOCRQuantity: currentOCRQuantity,
+                    symbol: command.symbol,
+                    generation: generation
+                )
+            }
+
+            return Self.mapOutcome(outcome)
+        } catch {
+            return Self.mapError(error)
+        }
+    }
+
+    @discardableResult
+    func waitForPendingCommands(timeout: TimeInterval) -> Bool {
+        waitForPendingMessages(timeout: timeout)
+    }
+
+    func cancelPendingCommands(reason: String) {
+        cancelPendingMessages(reason: reason)
     }
 
     func send(
@@ -110,6 +159,26 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
             throw TradingRuntimeManagerError.actionFailed("Invalid subscribe symbol in OCR payload.")
         }
 
+        return try await handleSubscribe(symbol: normalized, generation: generation)
+    }
+
+    @MainActor
+    private func handleSell(payload: String, generation: Int) async throws -> TradingMessageSendOutcome {
+        let sellMessage = try TradingMessageContract.parseSellMessage(payload)
+        return try await handleSell(
+            previousOCRQuantity: sellMessage.previousOCRQuantity,
+            currentOCRQuantity: sellMessage.ocrQuantity,
+            symbol: sellMessage.symbol,
+            generation: generation
+        )
+    }
+
+    @MainActor
+    private func handleSubscribe(symbol: String, generation: Int) async throws -> TradingMessageSendOutcome {
+        guard let normalized = TradingMessageContract.normalizedOCRSymbol(symbol), normalized == symbol else {
+            throw TradingRuntimeManagerError.actionFailed("Invalid subscribe symbol in OCR command.")
+        }
+
         try throwIfCancelled(generation: generation)
         _ = try await manager.requestSubscriptionAsync(symbol: normalized, recalcQtyFromFirstAsk: false)
         await manager.appendMessageAsync("OCR subscribed to \(normalized)")
@@ -117,8 +186,17 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
     }
 
     @MainActor
-    private func handleSell(payload: String, generation: Int) async throws -> TradingMessageSendOutcome {
-        let sellMessage = try TradingMessageContract.parseSellMessage(payload)
+    private func handleSell(
+        previousOCRQuantity: Int?,
+        currentOCRQuantity: Int?,
+        symbol: String?,
+        generation: Int
+    ) async throws -> TradingMessageSendOutcome {
+        let sellMessage = OCRSellMessage(
+            ocrQuantity: currentOCRQuantity,
+            previousOCRQuantity: previousOCRQuantity,
+            symbol: symbol
+        )
         try throwIfCancelled(generation: generation)
         try throwIfActiveSymbolChanged(
             expectedSymbol: sellMessage.symbol,
@@ -199,16 +277,29 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
 
     @MainActor
     private func handleBuy(payload: String, generation: Int) async throws -> TradingMessageSendOutcome {
-        let configuration = configurationProvider()
         let buyMessage = try TradingMessageContract.parseBuyMessage(payload)
-        let quantityInput = resolvedBuyQuantity(
+        return try await handleBuy(
             ocrQuantity: buyMessage.ocrQuantity,
+            symbol: buyMessage.symbol,
+            generation: generation
+        )
+    }
+
+    @MainActor
+    private func handleBuy(
+        ocrQuantity: Int?,
+        symbol: String?,
+        generation: Int
+    ) async throws -> TradingMessageSendOutcome {
+        let configuration = configurationProvider()
+        let quantityInput = resolvedBuyQuantity(
+            ocrQuantity: ocrQuantity,
             ratio: configuration.buyQuantityRatio,
             fallbackQuantity: manager.dashboard.inputs.quantityInput
         )
 
         guard configuration.controllerArmed else {
-            print(disarmedBuyLogLine(ocrQuantity: buyMessage.ocrQuantity, ratio: configuration.buyQuantityRatio, quantityInput: quantityInput))
+            print(disarmedBuyLogLine(ocrQuantity: ocrQuantity, ratio: configuration.buyQuantityRatio, quantityInput: quantityInput))
             return .intentionallyIgnored(reason: "Controller trading is not armed.")
         }
 
@@ -216,7 +307,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
 
         let dashboard = manager.dashboard
         try throwIfActiveSymbolChanged(
-            expectedSymbol: buyMessage.symbol,
+            expectedSymbol: symbol,
             snapshot: dashboard,
             eventName: "BUY"
         )
@@ -225,13 +316,13 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
 
         let preSubmitDashboard = try await awaitBuyAvailability(quantityInput: quantityInput, generation: generation)
         try throwIfActiveSymbolChanged(
-            expectedSymbol: buyMessage.symbol,
+            expectedSymbol: symbol,
             snapshot: preSubmitDashboard,
             eventName: "BUY"
         )
         print(armedBuyAttemptLogLine(
             snapshot: preSubmitDashboard,
-            ocrQuantity: buyMessage.ocrQuantity,
+            ocrQuantity: ocrQuantity,
             ratio: configuration.buyQuantityRatio,
             quantityInput: quantityInput
         ))
@@ -241,7 +332,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
             let rejectionLine = rejectedBuyLogLine(
                 reason: reason,
                 snapshot: preSubmitDashboard,
-                ocrQuantity: buyMessage.ocrQuantity,
+                ocrQuantity: ocrQuantity,
                 ratio: configuration.buyQuantityRatio,
                 quantityInput: quantityInput
             )
@@ -257,7 +348,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
 
         try throwIfCancelled(generation: generation)
         try throwIfActiveSymbolChanged(
-            expectedSymbol: buyMessage.symbol,
+            expectedSymbol: symbol,
             snapshot: manager.dashboard,
             eventName: "BUY"
         )
@@ -265,7 +356,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         do {
             _ = try await manager.submitBuyAsync(
                 source: "OCR",
-                note: buyNote(ocrQuantity: buyMessage.ocrQuantity, ratio: configuration.buyQuantityRatio, quantityInput: quantityInput)
+                note: buyNote(ocrQuantity: ocrQuantity, ratio: configuration.buyQuantityRatio, quantityInput: quantityInput)
             )
         } catch {
             let postFailureDashboard = manager.dashboard
@@ -274,7 +365,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
                 let rejectionLine = rejectedBuyLogLine(
                     reason: consumedReason,
                     snapshot: postFailureDashboard,
-                    ocrQuantity: buyMessage.ocrQuantity,
+                    ocrQuantity: ocrQuantity,
                     ratio: configuration.buyQuantityRatio,
                     quantityInput: quantityInput
                 )
@@ -290,7 +381,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
             let failureLine = failedBuyLogLine(
                 error: error,
                 snapshot: postFailureDashboard,
-                ocrQuantity: buyMessage.ocrQuantity,
+                ocrQuantity: ocrQuantity,
                 ratio: configuration.buyQuantityRatio,
                 quantityInput: quantityInput
             )
@@ -299,8 +390,8 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
             throw error
         }
 
-        print(submittedBuyLogLine(ocrQuantity: buyMessage.ocrQuantity, ratio: configuration.buyQuantityRatio, quantityInput: quantityInput))
-        if let ocrQuantity = buyMessage.ocrQuantity {
+        print(submittedBuyLogLine(ocrQuantity: ocrQuantity, ratio: configuration.buyQuantityRatio, quantityInput: quantityInput))
+        if let ocrQuantity {
             await manager.appendMessageAsync(
                 String(
                     format: "OCR buy submitted: detected %.0f shares x %.4f -> %d shares",
@@ -312,6 +403,28 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
         }
 
         return .submitted
+    }
+
+    private static func mapOutcome(_ outcome: TradingMessageSendOutcome) -> OCRTradingCommandResult {
+        switch outcome {
+        case .submitted:
+            .submitted
+        case let .intentionallyIgnored(reason):
+            .intentionallyIgnored(reason: reason)
+        }
+    }
+
+    private static func mapError(_ error: any Error) -> OCRTradingCommandResult {
+        if let sendError = error as? TradingMessageSendError {
+            switch sendError {
+            case let .retryableRejection(reason):
+                return .retryableRejected(reason: reason)
+            case let .cancelled(reason):
+                return .cancelled(reason: reason)
+            }
+        }
+
+        return .failed(reason: error.localizedDescription)
     }
 
     private func resolvedBuyQuantity(ocrQuantity: Int?, ratio: Double, fallbackQuantity: Int) -> Int {
