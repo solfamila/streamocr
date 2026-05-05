@@ -159,9 +159,9 @@ That means extra actual events are allowed, but expected events still need to
 appear in order. Field-level matching is still partial, so fixtures can stay
 tight or loose depending on which fields they specify.
 
-The live GUI and display-capture trading path uses typed OCR trading commands
-internally. JSON remains the CLI/result/fixture format and a compatibility
-boundary for the older legacy trigger dispatcher path.
+The live GUI and display-capture trading paths use typed OCR trading commands
+internally. JSON remains the CLI/result/fixture format; runtime trading no
+longer routes through JSON message strings.
 The central `OCRTradingCoordinator` owns symbol/manual/session state and returns
 explicit effects: commands to start and command IDs to cancel. Retryable
 BUY/SELL rejections are cooled down in that reducer for one second, so an

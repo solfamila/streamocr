@@ -67,10 +67,8 @@ final class LiveStreamAnalyzer {
             loggingEnabled: loggingEnabled,
             recognizer: FontTemplateTextRecognizer(),
             asyncSymbolRecognitionEnabled: false,
-            beep: {},
             eventHandler: eventCollector.handle(_:),
-            frameObservationHandler: tradingRuntime.handle(_:),
-            triggerHandlingMode: .frameObservationsOnly
+            frameObservationHandler: tradingRuntime.handle(_:)
         )
 
         var frameCount = 0

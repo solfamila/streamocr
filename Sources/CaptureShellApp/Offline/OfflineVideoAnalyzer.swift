@@ -90,10 +90,8 @@ final class OfflineVideoAnalyzer {
             loggingEnabled: false,
             recognizer: recognizer,
             asyncSymbolRecognitionEnabled: false,
-            beep: {},
             eventHandler: eventCollector.handle(_:),
-            frameObservationHandler: tradingRuntime.handle(_:),
-            triggerHandlingMode: .frameObservationsOnly
+            frameObservationHandler: tradingRuntime.handle(_:)
         )
 
         var adjustedRuntimeConfigCache: [String: CaptureRuntimeConfig] = [:]

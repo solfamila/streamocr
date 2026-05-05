@@ -11,7 +11,26 @@ private enum OCRActionRejectionDisposition {
     case retryable(String)
 }
 
-final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTradingCommandExecuting, @unchecked Sendable {
+private enum OCRAutomationTradingOutcome: Equatable, Sendable {
+    case submitted
+    case intentionallyIgnored(reason: String)
+}
+
+private enum OCRAutomationTradingError: LocalizedError, Equatable, Sendable {
+    case retryableRejection(reason: String)
+    case cancelled(reason: String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .retryableRejection(reason):
+            reason
+        case let .cancelled(reason):
+            reason
+        }
+    }
+}
+
+final class OCRAutomationTradingMessageSender: OCRTradingCommandExecuting, @unchecked Sendable {
     private let manager: TradingRuntimeManager
     private let configurationProvider: @MainActor () -> OCRAutomationTradingConfiguration
     private let lock = NSLock()
@@ -32,14 +51,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
         self.configurationProvider = configurationProvider
     }
 
-    var reportsTransportOutcomes: Bool { false }
-    var requiresCommittedOCRSymbolForManualCellTrades: Bool { true }
-
     func beginCommandSession() {
-        beginMessageSession()
-    }
-
-    func beginMessageSession() {
         lock.lock()
         currentGeneration += 1
         cleanupCompletedCancelledGenerationsLocked()
@@ -54,10 +66,10 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
 
         do {
             if let cancellationReason = cancellationReasonSnapshot(for: generation, commandID: command.id) {
-                throw TradingMessageSendError.cancelled(reason: cancellationReason)
+                throw OCRAutomationTradingError.cancelled(reason: cancellationReason)
             }
 
-            let outcome: TradingMessageSendOutcome
+            let outcome: OCRAutomationTradingOutcome
             switch command.kind {
             case .subscribe:
                 outcome = try await handleSubscribe(
@@ -90,56 +102,6 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
 
     @discardableResult
     func waitForPendingCommands(timeout: TimeInterval) -> Bool {
-        waitForPendingMessages(timeout: timeout)
-    }
-
-    func cancelPendingCommands(reason: String) {
-        cancelPendingMessages(reason: reason)
-    }
-
-    func cancelPendingCommand(id: OCRTradingCommandID, reason: String) {
-        lock.lock()
-        cancellationReasonsByCommandID[id] = reason
-        lock.unlock()
-    }
-
-    func send(
-        _ payload: String,
-        event: String,
-        completion: @escaping @Sendable (Result<TradingMessageSendOutcome, any Error>) -> Void
-    ) {
-        let generation = beginPendingOperation()
-
-        Task { @MainActor [self] in
-            let result: Result<TradingMessageSendOutcome, any Error>
-
-            do {
-                if let cancellationReason = cancellationReasonSnapshot(for: generation) {
-                    result = .failure(TradingMessageSendError.cancelled(reason: cancellationReason))
-                } else {
-                    switch event {
-                    case "BUY":
-                        result = .success(try await handleBuy(payload: payload, generation: generation))
-                    case "SELL":
-                        result = .success(try await handleSell(payload: payload, generation: generation))
-                    case "SUBSCRIBE":
-                        try throwIfCancelled(generation: generation)
-                        result = .success(try await handleSubscribe(payload: payload, generation: generation))
-                    default:
-                        throw TradingRuntimeManagerError.actionFailed("Unsupported OCR automation event: \(event)")
-                    }
-                }
-            } catch {
-                result = .failure(error)
-            }
-
-            completion(result)
-            finishPendingOperation(generation: generation)
-        }
-    }
-
-    @discardableResult
-    func waitForPendingMessages(timeout: TimeInterval) -> Bool {
         let deadline = Date().addingTimeInterval(max(0, timeout))
         while Date() < deadline {
             if pendingOperationCount == 0 {
@@ -151,39 +113,16 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
         return pendingOperationCount == 0
     }
 
-    func cancelPendingMessages(reason: String) {
+    func cancelPendingCommands(reason: String) {
         lock.lock()
         cancellationReasonsByGeneration[currentGeneration] = reason
         lock.unlock()
     }
 
-    @MainActor
-    private func handleSubscribe(payload: String, generation: Int) async throws -> TradingMessageSendOutcome {
-        guard
-            let data = payload.data(using: .utf8),
-            let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let symbol = object["subscribe"] as? String,
-            !symbol.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else {
-            throw TradingRuntimeManagerError.actionFailed("Missing subscribe symbol in OCR payload.")
-        }
-
-        guard let normalized = TradingMessageContract.normalizedOCRSymbol(symbol), normalized == symbol else {
-            throw TradingRuntimeManagerError.actionFailed("Invalid subscribe symbol in OCR payload.")
-        }
-
-        return try await handleSubscribe(symbol: normalized, generation: generation)
-    }
-
-    @MainActor
-    private func handleSell(payload: String, generation: Int) async throws -> TradingMessageSendOutcome {
-        let sellMessage = try TradingMessageContract.parseSellMessage(payload)
-        return try await handleSell(
-            previousOCRQuantity: sellMessage.previousOCRQuantity,
-            currentOCRQuantity: sellMessage.ocrQuantity,
-            symbol: sellMessage.symbol,
-            generation: generation
-        )
+    func cancelPendingCommand(id: OCRTradingCommandID, reason: String) {
+        lock.lock()
+        cancellationReasonsByCommandID[id] = reason
+        lock.unlock()
     }
 
     @MainActor
@@ -191,7 +130,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
         symbol: String,
         generation: Int,
         commandID: OCRTradingCommandID? = nil
-    ) async throws -> TradingMessageSendOutcome {
+    ) async throws -> OCRAutomationTradingOutcome {
         guard let normalized = TradingMessageContract.normalizedOCRSymbol(symbol), normalized == symbol else {
             throw TradingRuntimeManagerError.actionFailed("Invalid subscribe symbol in OCR command.")
         }
@@ -209,7 +148,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
         symbol: String?,
         generation: Int,
         commandID: OCRTradingCommandID? = nil
-    ) async throws -> TradingMessageSendOutcome {
+    ) async throws -> OCRAutomationTradingOutcome {
         let sellMessage = OCRSellMessage(
             ocrQuantity: currentOCRQuantity,
             previousOCRQuantity: previousOCRQuantity,
@@ -243,7 +182,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
             case .intentionallyIgnored:
                 return .intentionallyIgnored(reason: reason)
             case .retryable:
-                throw TradingMessageSendError.retryableRejection(reason: reason)
+                throw OCRAutomationTradingError.retryableRejection(reason: reason)
             }
         }
 
@@ -274,7 +213,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
                 case .intentionallyIgnored:
                     return .intentionallyIgnored(reason: consumedReason)
                 case .retryable:
-                    throw TradingMessageSendError.retryableRejection(reason: consumedReason)
+                    throw OCRAutomationTradingError.retryableRejection(reason: consumedReason)
                 }
             }
 
@@ -294,22 +233,12 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
     }
 
     @MainActor
-    private func handleBuy(payload: String, generation: Int) async throws -> TradingMessageSendOutcome {
-        let buyMessage = try TradingMessageContract.parseBuyMessage(payload)
-        return try await handleBuy(
-            ocrQuantity: buyMessage.ocrQuantity,
-            symbol: buyMessage.symbol,
-            generation: generation
-        )
-    }
-
-    @MainActor
     private func handleBuy(
         ocrQuantity: Int?,
         symbol: String?,
         generation: Int,
         commandID: OCRTradingCommandID? = nil
-    ) async throws -> TradingMessageSendOutcome {
+    ) async throws -> OCRAutomationTradingOutcome {
         let configuration = configurationProvider()
         let quantityInput = resolvedBuyQuantity(
             ocrQuantity: ocrQuantity,
@@ -365,7 +294,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
             case .intentionallyIgnored:
                 return .intentionallyIgnored(reason: reason)
             case .retryable:
-                throw TradingMessageSendError.retryableRejection(reason: reason)
+                throw OCRAutomationTradingError.retryableRejection(reason: reason)
             }
         }
 
@@ -398,7 +327,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
                 case .intentionallyIgnored:
                     return .intentionallyIgnored(reason: consumedReason)
                 case .retryable:
-                    throw TradingMessageSendError.retryableRejection(reason: consumedReason)
+                    throw OCRAutomationTradingError.retryableRejection(reason: consumedReason)
                 }
             }
             let failureLine = failedBuyLogLine(
@@ -428,7 +357,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
         return .submitted
     }
 
-    private static func mapOutcome(_ outcome: TradingMessageSendOutcome) -> OCRTradingCommandResult {
+    private static func mapOutcome(_ outcome: OCRAutomationTradingOutcome) -> OCRTradingCommandResult {
         switch outcome {
         case .submitted:
             .submitted
@@ -438,7 +367,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
     }
 
     private static func mapError(_ error: any Error) -> OCRTradingCommandResult {
-        if let sendError = error as? TradingMessageSendError {
+        if let sendError = error as? OCRAutomationTradingError {
             switch sendError {
             case let .retryableRejection(reason):
                 return .retryableRejected(reason: reason)
@@ -648,7 +577,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
         error: any Error,
         snapshot: TradingDashboardSnapshot
     ) -> OCRActionRejectionDisposition? {
-        if let sendError = error as? TradingMessageSendError {
+        if let sendError = error as? OCRAutomationTradingError {
             switch sendError {
             case let .retryableRejection(reason):
                 return .retryable(reason)
@@ -678,7 +607,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
         error: any Error,
         snapshot: TradingDashboardSnapshot
     ) -> OCRActionRejectionDisposition? {
-        if let sendError = error as? TradingMessageSendError {
+        if let sendError = error as? OCRAutomationTradingError {
             switch sendError {
             case let .retryableRejection(reason):
                 return .retryable(reason)
@@ -907,7 +836,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
         commandID: OCRTradingCommandID? = nil
     ) throws {
         if let cancellationReason = cancellationReasonSnapshot(for: generation, commandID: commandID) {
-            throw TradingMessageSendError.cancelled(reason: cancellationReason)
+            throw OCRAutomationTradingError.cancelled(reason: cancellationReason)
         }
     }
 
@@ -923,7 +852,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, OCRTrading
         let activeSymbol = TradingMessageContract.normalizeSymbol(snapshot.inputs.subscribedSymbol)
         guard activeSymbol == expectedSymbol else {
             let displayedActiveSymbol = activeSymbol.isEmpty ? "<none>" : activeSymbol
-            throw TradingMessageSendError.cancelled(
+            throw OCRAutomationTradingError.cancelled(
                 reason: "OCR \(eventName) stale because active symbol changed from \(expectedSymbol) to \(displayedActiveSymbol)."
             )
         }

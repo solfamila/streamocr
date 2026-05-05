@@ -7,7 +7,6 @@ import Testing
 struct LowLatencyOCRFramePipelineObservationTests {
     @Test
     func symbolFingerprintChangeStartsOCRBetweenSamplingFrames() {
-        let sender = ObservationCapturingMessageSender()
         let recognizer = ObservationRegionAwareCountingTextRecognizer(
             results: [
                 .manualCell: OCRTextRecognition(rawText: "", confidence: 1.0),
@@ -17,18 +16,12 @@ struct LowLatencyOCRFramePipelineObservationTests {
         let observations = ObservationCapture()
         let pipeline = LowLatencyOCRFramePipeline(
             loggingEnabled: false,
-            manualCellRearmConfirmationFrames: 1,
-            manualCellTriggerConfirmationFrames: 1,
             manualSymbolSamplingIntervalFrames: 10_000,
             manualSymbolFreshOCRIntervalSeconds: 999,
-            manualSymbolTriggerConfirmationFrames: 1,
             recognizer: recognizer,
             symbolRecognizer: recognizer,
             asyncSymbolRecognitionEnabled: false,
-            messageSender: sender,
-            beep: {},
-            frameObservationHandler: observations.handle(_:),
-            triggerHandlingMode: .legacyDispatcher
+            frameObservationHandler: observations.handle(_:)
         )
         let runtimeConfig = observationRuntimeConfig(width: 48, height: 48)
 
@@ -53,14 +46,12 @@ struct LowLatencyOCRFramePipelineObservationTests {
         )
 
         #expect(recognizer.callCount(for: .manualSymbolCell) == 2)
-        #expect(sender.messages == [#"{"subscribe":"SKLZ"}"#, #"{"subscribe":"GLND"}"#])
         #expect(observations.symbolStates(forFrame: 2) == [.recognized])
         #expect(observations.recognizedSymbols(forFrame: 2) == ["GLND"])
     }
 
     @Test
     func unchangedSymbolBetweenSamplingFramesDoesNotReplayCachedRecognitionEveryFrame() {
-        let sender = ObservationCapturingMessageSender()
         let recognizer = ObservationRegionAwareCountingTextRecognizer(
             results: [
                 .manualCell: OCRTextRecognition(rawText: "", confidence: 1.0),
@@ -70,18 +61,12 @@ struct LowLatencyOCRFramePipelineObservationTests {
         let observations = ObservationCapture()
         let pipeline = LowLatencyOCRFramePipeline(
             loggingEnabled: false,
-            manualCellRearmConfirmationFrames: 1,
-            manualCellTriggerConfirmationFrames: 1,
             manualSymbolSamplingIntervalFrames: 10_000,
             manualSymbolFreshOCRIntervalSeconds: 999,
-            manualSymbolTriggerConfirmationFrames: 2,
             recognizer: recognizer,
             symbolRecognizer: recognizer,
             asyncSymbolRecognitionEnabled: false,
-            messageSender: sender,
-            beep: {},
-            frameObservationHandler: observations.handle(_:),
-            triggerHandlingMode: .legacyDispatcher
+            frameObservationHandler: observations.handle(_:)
         )
         let pixelBuffer = makeObservationSolidPixelBuffer(width: 48, height: 48, fillValue: 0)
         let runtimeConfig = observationRuntimeConfig(width: 48, height: 48)
@@ -102,7 +87,6 @@ struct LowLatencyOCRFramePipelineObservationTests {
         )
 
         #expect(recognizer.callCount(for: .manualSymbolCell) == 1)
-        #expect(sender.messages.isEmpty)
         #expect(observations.symbolStates(forFrame: 2) == [.unchanged])
         #expect(observations.recognizedSymbols(forFrame: 2).isEmpty)
     }
@@ -118,15 +102,10 @@ struct LowLatencyOCRFramePipelineObservationTests {
         let observations = ObservationCapture()
         let pipeline = LowLatencyOCRFramePipeline(
             loggingEnabled: false,
-            manualCellRearmConfirmationFrames: 1,
-            manualCellTriggerConfirmationFrames: 1,
-            manualSymbolTriggerConfirmationFrames: 1,
             recognizer: recognizer,
             symbolRecognizer: recognizer,
             asyncSymbolRecognitionEnabled: false,
-            beep: {},
-            frameObservationHandler: observations.handle(_:),
-            triggerHandlingMode: .frameObservationsOnly
+            frameObservationHandler: observations.handle(_:)
         )
         let runtimeConfig = CaptureRuntimeConfig(
             displayID: 0,
@@ -151,8 +130,7 @@ struct LowLatencyOCRFramePipelineObservationTests {
     }
 
     @Test
-    func observationsOnlyModeFeedsCoordinatorRuntimeWithoutLegacyDispatch() {
-        let legacySender = ObservationCapturingMessageSender()
+    func pipelineFeedsCoordinatorRuntimeWithFrameObservations() {
         let executor = ObservationImmediateCommandExecutor()
         let runtimeEvents = ObservationPipelineEventCapture()
         let runtime = OCRTradingCoordinatorRuntime(
@@ -168,18 +146,12 @@ struct LowLatencyOCRFramePipelineObservationTests {
         )
         let pipeline = LowLatencyOCRFramePipeline(
             loggingEnabled: false,
-            manualCellRearmConfirmationFrames: 1,
-            manualCellTriggerConfirmationFrames: 1,
             manualSymbolSamplingIntervalFrames: 10_000,
             manualSymbolFreshOCRIntervalSeconds: 999,
-            manualSymbolTriggerConfirmationFrames: 1,
             recognizer: recognizer,
             symbolRecognizer: recognizer,
             asyncSymbolRecognitionEnabled: false,
-            messageSender: legacySender,
-            beep: {},
-            frameObservationHandler: runtime.handle(_:),
-            triggerHandlingMode: .frameObservationsOnly
+            frameObservationHandler: runtime.handle(_:)
         )
         runtime.beginSession(1)
         let pixelBuffer = makeObservationSolidPixelBuffer(width: 48, height: 48, fillValue: 0)
@@ -209,7 +181,6 @@ struct LowLatencyOCRFramePipelineObservationTests {
                 runtime.stateSnapshot.manual.openPositionPeakValue == 10000
         }
 
-        #expect(legacySender.messages.isEmpty)
         #expect(executor.commandSnapshot.map(\.kind) == [
             .subscribe,
             .buy(ocrQuantity: 10000, submittedQuantity: 10000)
@@ -218,8 +189,7 @@ struct LowLatencyOCRFramePipelineObservationTests {
     }
 
     @Test
-    func defaultModeEmitsObservationsWithoutLegacyDispatch() {
-        let legacySender = ObservationCapturingMessageSender()
+    func defaultModeEmitsFrameObservations() {
         let observations = ObservationCapture()
         let recognizer = ObservationRegionAwareCountingTextRecognizer(
             results: [
@@ -229,14 +199,9 @@ struct LowLatencyOCRFramePipelineObservationTests {
         )
         let pipeline = LowLatencyOCRFramePipeline(
             loggingEnabled: false,
-            manualCellRearmConfirmationFrames: 1,
-            manualCellTriggerConfirmationFrames: 1,
-            manualSymbolTriggerConfirmationFrames: 1,
             recognizer: recognizer,
             symbolRecognizer: recognizer,
             asyncSymbolRecognitionEnabled: false,
-            messageSender: legacySender,
-            beep: {},
             frameObservationHandler: observations.handle(_:)
         )
 
@@ -245,7 +210,6 @@ struct LowLatencyOCRFramePipelineObservationTests {
             runtimeConfig: observationRuntimeConfig(width: 48, height: 48)
         )
 
-        #expect(legacySender.messages.isEmpty)
         #expect(observations.recognizedSymbols(forFrame: 1) == ["PLRZ"])
         #expect(observations.fullObservations(forFrame: 1).contains { observation in
             observation.symbol?.recognitionState == .recognized &&
@@ -254,24 +218,17 @@ struct LowLatencyOCRFramePipelineObservationTests {
     }
 
     @Test
-    func observationsOnlyModeDoesNotLeakDeferredAsyncSymbolReplayToLegacyDispatcher() {
-        let legacySender = ObservationCapturingMessageSender()
+    func asyncSymbolReplayEmitsDeferredFrameObservation() {
         let observations = ObservationCapture()
         let recognizer = ObservationBlockingSymbolRecognizer(symbolText: "PLRZ")
         let pipeline = LowLatencyOCRFramePipeline(
             loggingEnabled: false,
-            manualCellRearmConfirmationFrames: 1,
-            manualCellTriggerConfirmationFrames: 1,
             manualSymbolSamplingIntervalFrames: 10_000,
             manualSymbolFreshOCRIntervalSeconds: 999,
-            manualSymbolTriggerConfirmationFrames: 1,
             recognizer: recognizer,
             symbolRecognizer: recognizer,
             asyncSymbolRecognitionEnabled: true,
-            messageSender: legacySender,
-            beep: {},
-            frameObservationHandler: observations.handle(_:),
-            triggerHandlingMode: .frameObservationsOnly
+            frameObservationHandler: observations.handle(_:)
         )
         let pixelBuffer = makeObservationSolidPixelBuffer(width: 48, height: 48, fillValue: 0)
         let runtimeConfig = observationRuntimeConfig(width: 48, height: 48)
@@ -297,7 +254,6 @@ struct LowLatencyOCRFramePipelineObservationTests {
         waitUntil {
             observations.recognizedSymbols(forFrame: 2) == ["PLRZ"]
         }
-        #expect(legacySender.messages.isEmpty)
     }
 
     private func waitUntil(
@@ -367,22 +323,6 @@ struct LowLatencyOCRFramePipelineObservationTests {
             lock.lock()
             events.append(event)
             lock.unlock()
-        }
-    }
-
-    private final class ObservationCapturingMessageSender: TradingMessageSending, @unchecked Sendable {
-        private let lock = NSLock()
-        private(set) var messages: [String] = []
-
-        func send(
-            _ payload: String,
-            event _: String,
-            completion: @escaping @Sendable (Result<TradingMessageSendOutcome, any Error>) -> Void
-        ) {
-            lock.lock()
-            messages.append(payload)
-            lock.unlock()
-            completion(.success(.submitted))
         }
     }
 

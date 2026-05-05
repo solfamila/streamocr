@@ -57,8 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             pipeline: LowLatencyOCRFramePipeline(
                 frameObservationHandler: { observation in
                     runtime.handle(observation)
-                },
-                triggerHandlingMode: .frameObservationsOnly
+                }
             ),
             ocrTradingRuntime: runtime
         )

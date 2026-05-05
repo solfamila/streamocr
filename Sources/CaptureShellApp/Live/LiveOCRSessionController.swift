@@ -302,11 +302,9 @@ final class LiveOCRSessionController: @unchecked Sendable {
         let pipeline = LowLatencyOCRFramePipeline(
             loggingEnabled: loggingEnabled,
             recognizer: FontTemplateTextRecognizer(),
-            beep: {},
             frameObservationHandler: { observation in
                 tradingRuntime.handle(observation)
-            },
-            triggerHandlingMode: .frameObservationsOnly
+            }
         )
 
         var totalFrameCount = 0
