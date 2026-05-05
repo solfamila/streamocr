@@ -1374,6 +1374,10 @@ final class TradingWindowController: NSWindowController, NSWindowDelegate, NSTab
     @objc
     private func toggleControllerArmed() {
         let nextArmed = !dashboard.panel.status.controllerArmed
+        var optimisticDashboard = dashboard
+        optimisticDashboard.panel.status.controllerArmed = nextArmed
+        optimisticDashboard.panel.risk.controllerArmed = nextArmed
+        updateDashboard(optimisticDashboard)
         Task { [weak self] in
             guard let self else { return }
             await manager.setControllerArmedAsync(nextArmed)

@@ -202,6 +202,7 @@ final class TradingRuntimeManager: @unchecked Sendable {
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
     private let bridgeQueue = DispatchQueue(label: "capture-shell.trading-runtime-bridge", qos: .userInitiated)
+    private let bridgeControlQueue = DispatchQueue(label: "capture-shell.trading-runtime-control", qos: .userInteractive)
     private var handle: OpaquePointer?
     private let dashboardRefreshStateLock = NSLock()
     private var dashboardRefreshInFlight = false
@@ -471,13 +472,13 @@ final class TradingRuntimeManager: @unchecked Sendable {
     }
 
     func setControllerArmedAsync(_ armed: Bool) async {
-        await performOnBridgeQueue {
+        await performOnBridgeControlQueue {
             self.setControllerArmed(armed)
         }
     }
 
     func setTradingKillSwitchAsync(_ enabled: Bool) async {
-        await performOnBridgeQueue {
+        await performOnBridgeControlQueue {
             self.setTradingKillSwitch(enabled)
         }
     }
@@ -846,6 +847,22 @@ private extension TradingRuntimeManager {
 
         await withCheckedContinuation { continuation in
             bridgeQueue.async {
+                operation()
+                continuation.resume()
+            }
+        }
+    }
+
+    func performOnBridgeControlQueue(
+        _ operation: @escaping @Sendable () -> Void
+    ) async {
+        if DispatchQueue.getSpecific(key: Self.bridgeQueueSpecificKey) == Self.bridgeQueueSpecificValue {
+            operation()
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            bridgeControlQueue.async {
                 operation()
                 continuation.resume()
             }
