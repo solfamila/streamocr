@@ -1763,20 +1763,14 @@ struct TriggerPipelineVerificationHarnessTests {
             normalizedText: "25000",
             confidence: 0.9
         )
-        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "", normalizedText: "", confidence: 0.9)
-        pipeline.processTriggerEventForTesting(
-            region: .manualCell,
-            rawText: "10000",
-            normalizedText: "10000",
-            confidence: 0.9
-        )
+        sender.succeedNext(matchingPayload: TradingMessageContract.buyMessage(ocrQuantity: 25000, symbol: "NEXR"))
 
         #expect(
             sender.messages == [
                 #"{"subscribe":"SPY"}"#,
                 TradingMessageContract.buyMessage(ocrQuantity: 30000, symbol: "SPY"),
                 #"{"subscribe":"NEXR"}"#,
-                TradingMessageContract.buyMessage(ocrQuantity: 10000, symbol: "NEXR")
+                TradingMessageContract.buyMessage(ocrQuantity: 25000, symbol: "NEXR")
             ]
         )
     }
@@ -1820,20 +1814,14 @@ struct TriggerPipelineVerificationHarnessTests {
             normalizedText: "9000",
             confidence: 0.9
         )
-        pipeline.processTriggerEventForTesting(region: .manualCell, rawText: "", normalizedText: "", confidence: 0.9)
-        pipeline.processTriggerEventForTesting(
-            region: .manualCell,
-            rawText: "5000",
-            normalizedText: "5000",
-            confidence: 0.9
-        )
+        sender.succeedNext(matchingPayload: TradingMessageContract.buyMessage(ocrQuantity: 9000, symbol: "NEXR"))
 
         #expect(
             sender.messages == [
                 #"{"subscribe":"SPY"}"#,
                 TradingMessageContract.buyMessage(ocrQuantity: 10000, symbol: "SPY"),
                 #"{"subscribe":"NEXR"}"#,
-                TradingMessageContract.buyMessage(ocrQuantity: 5000, symbol: "NEXR")
+                TradingMessageContract.buyMessage(ocrQuantity: 9000, symbol: "NEXR")
             ]
         )
     }
@@ -1899,6 +1887,190 @@ struct TriggerPipelineVerificationHarnessTests {
                 TradingMessageContract.sellMessage(ocrQuantity: 25000, previousOCRQuantity: 30000, symbol: "SPY"),
                 #"{"subscribe":"NEXR"}"#,
                 TradingMessageContract.buyMessage(ocrQuantity: 5000, symbol: "NEXR")
+            ]
+        )
+    }
+
+    @Test
+    func boundManualCellTradeRequiresCommittedOCRSymbol() {
+        let sender = ControlledTransportMessageSender()
+        sender.requiresCommittedOCRSymbolForManualCellTrades = true
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1,
+            manualSymbolTriggerConfirmationFrames: 1,
+            messageSender: sender,
+            beep: {}
+        )
+
+        pipeline.processTriggerEventForTesting(
+            region: .manualCell,
+            rawText: "10000",
+            normalizedText: "10000",
+            confidence: 0.9
+        )
+        #expect(sender.messages.isEmpty)
+
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "plrz",
+            normalizedText: "PLRZ",
+            confidence: 0.9
+        )
+        sender.succeedNext(matchingPayload: #"{"subscribe":"PLRZ"}"#)
+        pipeline.processTriggerEventForTesting(
+            region: .manualCell,
+            rawText: "10000",
+            normalizedText: "10000",
+            confidence: 0.9
+        )
+
+        #expect(
+            sender.messages == [
+                #"{"subscribe":"PLRZ"}"#,
+                TradingMessageContract.buyMessage(ocrQuantity: 10000, symbol: "PLRZ")
+            ]
+        )
+    }
+
+    @Test
+    func pendingSymbolSubscribeSuppressesOldSymbolManualCellTrades() {
+        let sender = ControlledTransportMessageSender()
+        sender.requiresCommittedOCRSymbolForManualCellTrades = true
+        let pipeline = LowLatencyOCRFramePipeline(
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1,
+            manualSymbolTriggerConfirmationFrames: 1,
+            messageSender: sender,
+            beep: {}
+        )
+
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "spy",
+            normalizedText: "SPY",
+            confidence: 0.9
+        )
+        sender.succeedNext(matchingPayload: #"{"subscribe":"SPY"}"#)
+        pipeline.processTriggerEventForTesting(
+            region: .manualSymbolCell,
+            rawText: "nexr",
+            normalizedText: "NEXR",
+            confidence: 0.9
+        )
+        pipeline.processTriggerEventForTesting(
+            region: .manualCell,
+            rawText: "10000",
+            normalizedText: "10000",
+            confidence: 0.9
+        )
+
+        #expect(sender.messages == [#"{"subscribe":"SPY"}"#, #"{"subscribe":"NEXR"}"#])
+
+        sender.succeedNext(matchingPayload: #"{"subscribe":"NEXR"}"#)
+        pipeline.processTriggerEventForTesting(
+            region: .manualCell,
+            rawText: "10000",
+            normalizedText: "10000",
+            confidence: 0.9
+        )
+
+        #expect(
+            sender.messages == [
+                #"{"subscribe":"SPY"}"#,
+                #"{"subscribe":"NEXR"}"#,
+                TradingMessageContract.buyMessage(ocrQuantity: 10000, symbol: "NEXR")
+            ]
+        )
+    }
+
+    @Test
+    func frameProcessesSymbolBeforeManualCellForBoundTrades() {
+        let sender = CapturingMessageSender()
+        sender.requiresCommittedOCRSymbolForManualCellTrades = true
+        let recognizer = RegionAwareCountingTextRecognizer(
+            results: [
+                .manualCell: OCRTextRecognition(rawText: "10000", confidence: 0.9),
+                .manualSymbolCell: OCRTextRecognition(rawText: "PLRZ", confidence: 0.9)
+            ]
+        )
+        let pipeline = LowLatencyOCRFramePipeline(
+            loggingEnabled: false,
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1,
+            manualSymbolTriggerConfirmationFrames: 1,
+            recognizer: recognizer,
+            symbolRecognizer: recognizer,
+            asyncSymbolRecognitionEnabled: false,
+            messageSender: sender,
+            beep: {}
+        )
+        let pixelBuffer = makeSolidPixelBuffer(width: 48, height: 48, fillValue: 0)
+        let runtimeConfig = CaptureRuntimeConfig(
+            displayID: 0,
+            displayWidth: 48,
+            displayHeight: 48,
+            baseROI: PixelRect(x: 0, y: 0, width: 48, height: 48),
+            manualCellROI: PixelRect(x: 0, y: 0, width: 48, height: 48),
+            symbolROI: PixelRect(x: 0, y: 0, width: 48, height: 48),
+            manualSymbolCellROI: PixelRect(x: 0, y: 0, width: 48, height: 48)
+        )
+
+        pipeline.process(VideoFrame(pixelBuffer: pixelBuffer), runtimeConfig: runtimeConfig)
+
+        #expect(
+            sender.messages == [
+                #"{"subscribe":"PLRZ"}"#,
+                TradingMessageContract.buyMessage(ocrQuantity: 10000, symbol: "PLRZ")
+            ]
+        )
+    }
+
+    @Test
+    func asyncSymbolRefreshDefersManualCellForBoundTrades() {
+        let sender = CapturingMessageSender()
+        sender.requiresCommittedOCRSymbolForManualCellTrades = true
+        let recognizer = RegionAwareCountingTextRecognizer(
+            results: [
+                .manualCell: OCRTextRecognition(rawText: "10000", confidence: 0.9),
+                .manualSymbolCell: OCRTextRecognition(rawText: "PLRZ", confidence: 0.9)
+            ]
+        )
+        let pipeline = LowLatencyOCRFramePipeline(
+            loggingEnabled: false,
+            manualCellRearmConfirmationFrames: 1,
+            manualCellTriggerConfirmationFrames: 1,
+            manualSymbolTriggerConfirmationFrames: 1,
+            recognizer: recognizer,
+            symbolRecognizer: recognizer,
+            asyncSymbolRecognitionEnabled: true,
+            messageSender: sender,
+            beep: {}
+        )
+        let pixelBuffer = makeSolidPixelBuffer(width: 48, height: 48, fillValue: 0)
+        let runtimeConfig = CaptureRuntimeConfig(
+            displayID: 0,
+            displayWidth: 48,
+            displayHeight: 48,
+            baseROI: PixelRect(x: 0, y: 0, width: 48, height: 48),
+            manualCellROI: PixelRect(x: 0, y: 0, width: 48, height: 48),
+            symbolROI: PixelRect(x: 0, y: 0, width: 48, height: 48),
+            manualSymbolCellROI: PixelRect(x: 0, y: 0, width: 48, height: 48)
+        )
+
+        pipeline.process(VideoFrame(pixelBuffer: pixelBuffer), runtimeConfig: runtimeConfig)
+
+        #expect(recognizer.callCount(for: .manualCell) == 0)
+        waitUntil(timeout: 1.0) {
+            sender.messages == [#"{"subscribe":"PLRZ"}"#]
+        }
+
+        pipeline.process(VideoFrame(pixelBuffer: pixelBuffer), runtimeConfig: runtimeConfig)
+
+        #expect(
+            sender.messages == [
+                #"{"subscribe":"PLRZ"}"#,
+                TradingMessageContract.buyMessage(ocrQuantity: 10000, symbol: "PLRZ")
             ]
         )
     }
@@ -2177,6 +2349,7 @@ struct TriggerPipelineVerificationHarnessTests {
     private final class CapturingMessageSender: TradingMessageSending, @unchecked Sendable {
         private let lock = NSLock()
         private(set) var messages: [String] = []
+        var requiresCommittedOCRSymbolForManualCellTrades = false
 
         func send(
             _ payload: String,
@@ -2217,6 +2390,7 @@ struct TriggerPipelineVerificationHarnessTests {
         private var pendingMessages: [PendingMessage] = []
 
         var reportsTransportOutcomes: Bool { true }
+        var requiresCommittedOCRSymbolForManualCellTrades = false
 
         private struct PendingMessage {
             let payload: String
@@ -2336,6 +2510,14 @@ struct TriggerPipelineVerificationHarnessTests {
 
     private enum TestTransportError: Error {
         case sendFailed
+    }
+
+    private func waitUntil(timeout: TimeInterval, condition: () -> Bool) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition(), Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        #expect(condition())
     }
 
     private func makeSolidPixelBuffer(width: Int, height: Int, fillValue: UInt8) -> CVPixelBuffer {

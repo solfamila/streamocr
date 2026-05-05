@@ -302,6 +302,10 @@ public:
         runtime_.syncGuiInputs(ui.quantityInput, ui.priceBuffer, ui.maxPositionDollars);
     }
 
+    void setQuantityInput(int quantityInput) {
+        updateQuantity(quantityInput);
+    }
+
     json dashboardJson() {
         const BridgeUIState currentUI = currentUIState();
         TradingViewModelInput input;
@@ -621,6 +625,16 @@ void TradingRuntimeBridgeSetUIInputs(
         maxPositionDollars,
         selectedTraceId
     );
+}
+
+void TradingRuntimeBridgeSetQuantityInput(
+    TradingRuntimeBridgeHandle* handle,
+    int quantityInput
+) {
+    if (handle == nullptr) {
+        return;
+    }
+    handle->impl.setQuantityInput(quantityInput);
 }
 
 char* TradingRuntimeBridgeCopyDashboardJSON(TradingRuntimeBridgeHandle* handle) {

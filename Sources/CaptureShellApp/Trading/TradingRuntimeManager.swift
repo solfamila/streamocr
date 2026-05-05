@@ -387,6 +387,18 @@ final class TradingRuntimeManager: @unchecked Sendable {
         selectedTraceId: UInt64
     ) {
         guard let handle else { return }
+        let sanitizedQuantity = max(1, quantityInput)
+        let sanitizedPriceBuffer = max(0, priceBuffer.isFinite ? priceBuffer : 0)
+        let sanitizedMaxPositionDollars = max(1000, maxPositionDollars.isFinite ? maxPositionDollars : 1000)
+        dashboard.inputs = TradingDashboardSnapshot.Inputs(
+            symbolInput: symbolInput,
+            subscribedSymbol: subscribedSymbol,
+            subscribed: subscribed,
+            quantityInput: sanitizedQuantity,
+            priceBuffer: sanitizedPriceBuffer,
+            maxPositionDollars: sanitizedMaxPositionDollars,
+            selectedTraceId: selectedTraceId
+        )
         symbolInput.withCString { symbolInputCString in
             subscribedSymbol.withCString { subscribedSymbolCString in
                 TradingRuntimeBridgeSetUIInputs(
@@ -394,13 +406,20 @@ final class TradingRuntimeManager: @unchecked Sendable {
                     symbolInputCString,
                     subscribedSymbolCString,
                     subscribed,
-                    CInt(quantityInput),
-                    priceBuffer,
-                    maxPositionDollars,
+                    CInt(sanitizedQuantity),
+                    sanitizedPriceBuffer,
+                    sanitizedMaxPositionDollars,
                     selectedTraceId
                 )
             }
         }
+    }
+
+    func setQuantityInput(_ quantityInput: Int) {
+        guard let handle else { return }
+        let sanitizedQuantity = max(1, quantityInput)
+        dashboard.inputs.quantityInput = sanitizedQuantity
+        TradingRuntimeBridgeSetQuantityInput(handle, CInt(sanitizedQuantity))
     }
 
     func refreshDashboard() {
@@ -882,8 +901,9 @@ private extension TradingRuntimeManager {
                 guard let self else { return }
                 switch nextSnapshotResult {
                 case let .success(snapshot):
-                    self.dashboard = snapshot
-                    self.onDashboardChanged?(snapshot)
+                    let mergedSnapshot = self.mergingLocalUserEditableInputs(into: snapshot)
+                    self.dashboard = mergedSnapshot
+                    self.onDashboardChanged?(mergedSnapshot)
                 case let .failure(error):
                     print("[trading] dashboard_refresh_failed error=\(error.localizedDescription)")
                 }
@@ -907,6 +927,15 @@ private extension TradingRuntimeManager {
             TradingRuntimeBridgeCopyDashboardJSON(handle),
             as: TradingDashboardSnapshot.self
         )
+    }
+
+    func mergingLocalUserEditableInputs(into snapshot: TradingDashboardSnapshot) -> TradingDashboardSnapshot {
+        var merged = snapshot
+        // Dashboard snapshots are produced asynchronously. A stale snapshot that was
+        // already in flight must not overwrite values the user just typed.
+        merged.inputs.priceBuffer = dashboard.inputs.priceBuffer
+        merged.inputs.maxPositionDollars = dashboard.inputs.maxPositionDollars
+        return merged
     }
 }
 

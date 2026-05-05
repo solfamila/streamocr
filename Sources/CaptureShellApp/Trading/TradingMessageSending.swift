@@ -35,6 +35,7 @@ enum TradingMessageSendError: LocalizedError, Equatable, Sendable {
 
 protocol TradingMessageSending: AnyObject, Sendable {
     var reportsTransportOutcomes: Bool { get }
+    var requiresCommittedOCRSymbolForManualCellTrades: Bool { get }
     func beginMessageSession()
     func send(
         _ payload: String,
@@ -48,6 +49,7 @@ protocol TradingMessageSending: AnyObject, Sendable {
 
 extension TradingMessageSending {
     var reportsTransportOutcomes: Bool { false }
+    var requiresCommittedOCRSymbolForManualCellTrades: Bool { false }
 
     func beginMessageSession() {}
 

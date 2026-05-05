@@ -33,6 +33,10 @@ void TradingRuntimeBridgeSetUIInputs(
     double maxPositionDollars,
     uint64_t selectedTraceId
 );
+void TradingRuntimeBridgeSetQuantityInput(
+    TradingRuntimeBridgeHandle* handle,
+    int quantityInput
+);
 
 char* TradingRuntimeBridgeCopyDashboardJSON(TradingRuntimeBridgeHandle* handle);
 char* TradingRuntimeBridgeCopyConnectionJSON(TradingRuntimeBridgeHandle* handle);

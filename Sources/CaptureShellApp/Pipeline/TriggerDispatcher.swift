@@ -135,6 +135,10 @@ final class TriggerDispatcher: @unchecked Sendable {
     func manualCellDispatchDecision(for evaluation: ManualCellTriggerEvaluation) -> TriggerDispatchDecision {
         assertPipelineStateHeld()
         if evaluation.shouldTriggerSell {
+            if let suppressionAction = manualCellSymbolSuppressionAction() {
+                return TriggerDispatchDecision(action: suppressionAction, event: nil)
+            }
+
             if let pendingSellTransport {
                 if pendingSellTransport.matches(
                     integerValue: evaluation.integerValue,
@@ -165,6 +169,10 @@ final class TriggerDispatcher: @unchecked Sendable {
         }
 
         if evaluation.shouldTriggerBuy {
+            if let suppressionAction = manualCellSymbolSuppressionAction() {
+                return TriggerDispatchDecision(action: suppressionAction, event: nil)
+            }
+
             if let pendingBuyTransport {
                 if pendingBuyTransport.matches(integerValue: evaluation.integerValue) {
                     return TriggerDispatchDecision(
@@ -204,6 +212,22 @@ final class TriggerDispatcher: @unchecked Sendable {
             action: "already_triggered_waiting_for_rearm",
             event: nil
         )
+    }
+
+    private func manualCellSymbolSuppressionAction() -> String? {
+        guard messageSender.requiresCommittedOCRSymbolForManualCellTrades else {
+            return nil
+        }
+
+        guard triggerStateMachine.currentManualSymbol() != nil else {
+            return "symbol_not_committed_suppressed"
+        }
+
+        if pendingSubscribeTransport != nil || triggerStateMachine.hasPendingManualSymbolChange() {
+            return "symbol_transition_pending_suppressed"
+        }
+
+        return nil
     }
 
     func subscribeDispatchDecision(for evaluation: ManualSymbolTriggerEvaluation) -> TriggerDispatchDecision {

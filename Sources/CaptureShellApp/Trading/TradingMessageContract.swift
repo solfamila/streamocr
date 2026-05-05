@@ -175,7 +175,12 @@ enum TradingMessageContract {
         guard let symbol else {
             return nil
         }
-        return normalizedOCRSymbol(symbol)
+
+        guard let normalized = normalizedOCRSymbol(symbol) else {
+            preconditionFailure("Refusing to build OCR trade payload with invalid bound symbol: \(symbol)")
+        }
+
+        return normalized
     }
 
     private static func optionalSymbolField(

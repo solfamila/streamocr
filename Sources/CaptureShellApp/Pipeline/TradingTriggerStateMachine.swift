@@ -183,6 +183,14 @@ final class TradingTriggerStateMachine {
         lastCommittedManualSymbol
     }
 
+    func hasPendingManualSymbolChange() -> Bool {
+        guard let pendingManualSymbol else {
+            return false
+        }
+
+        return pendingManualSymbol != lastCommittedManualSymbol
+    }
+
     func evaluateManualCell(normalizedText: String, confidence: Double = 1.0) -> ManualCellTriggerEvaluation {
         let integerValue = ManualCellIntegerPolicy.parseInteger(normalizedText)
         let isZeroOrEmpty = normalizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || integerValue == 0
@@ -342,7 +350,7 @@ final class TradingTriggerStateMachine {
     }
 
     func clearManualCellTradingStateForSymbolChange() {
-        manualCellIsArmed = false
+        manualCellIsArmed = true
         manualCellZeroLikeStreak = 0
         pendingManualCellIntegerValue = nil
         pendingManualCellConfirmationCount = 0

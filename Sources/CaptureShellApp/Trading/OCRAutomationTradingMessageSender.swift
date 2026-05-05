@@ -32,6 +32,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
     }
 
     var reportsTransportOutcomes: Bool { false }
+    var requiresCommittedOCRSymbolForManualCellTrades: Bool { true }
 
     func beginMessageSession() {
         lock.lock()
@@ -220,15 +221,7 @@ final class OCRAutomationTradingMessageSender: TradingMessageSending, @unchecked
             eventName: "BUY"
         )
 
-        manager.setUIInputs(
-            symbolInput: dashboard.inputs.symbolInput,
-            subscribedSymbol: dashboard.inputs.subscribedSymbol,
-            subscribed: dashboard.inputs.subscribed,
-            quantityInput: quantityInput,
-            priceBuffer: dashboard.inputs.priceBuffer,
-            maxPositionDollars: dashboard.inputs.maxPositionDollars,
-            selectedTraceId: dashboard.inputs.selectedTraceId
-        )
+        manager.setQuantityInput(quantityInput)
 
         let preSubmitDashboard = try await awaitBuyAvailability(quantityInput: quantityInput, generation: generation)
         try throwIfActiveSymbolChanged(

@@ -307,14 +307,7 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
                 triggerStateMachine.clearManualSymbolState()
             }
 
-            processRegion(
-                .manualCell,
-                sourcePixelBuffer: sourcePixelBuffer,
-                runtimeConfig: runtimeConfig,
-                frameIngressTimestamp: frameIngressTimestamp,
-                presentationTimeSeconds: frame.presentationTimeSeconds
-            )
-
+            var shouldDeferManualCellForSymbolRefresh = false
             if runtimeConfig.manualSymbolCellROI != nil {
                 let symbolFreshnessTimestamp = frame.presentationTimeSeconds ?? frameIngressTimestamp
                 let symbolSamplingDecision = manualSymbolSamplingDecision(now: symbolFreshnessTimestamp)
@@ -331,8 +324,32 @@ final class LowLatencyOCRFramePipeline: FramePipeline, @unchecked Sendable {
                         lastManualSymbolFreshOCRTimestamp = symbolFreshnessTimestamp
                     }
                 }
+                shouldDeferManualCellForSymbolRefresh = isManualSymbolRecognitionPending()
             }
+
+            if shouldDeferManualCellForSymbolRefresh {
+                if loggingEnabled && shouldLog(count: frameCount, cadence: unchangedLogCadence) {
+                    print("[ocr] frame=\(frameCount) region=\(OCRRegionKind.manualCell.rawValue) gate=symbol_ocr_pending skip_ocr=true")
+                }
+                return
+            }
+
+            processRegion(
+                .manualCell,
+                sourcePixelBuffer: sourcePixelBuffer,
+                runtimeConfig: runtimeConfig,
+                frameIngressTimestamp: frameIngressTimestamp,
+                presentationTimeSeconds: frame.presentationTimeSeconds
+            )
         }
+    }
+
+    private func isManualSymbolRecognitionPending() -> Bool {
+        guard let tracker = regionTrackers[.manualSymbolCell] else {
+            return false
+        }
+
+        return tracker.lastFingerprint != nil && tracker.lastRecognition == nil
     }
 
     private func manualSymbolSamplingDecision(now: CFAbsoluteTime) -> (shouldProcess: Bool, forceFreshOCR: Bool) {

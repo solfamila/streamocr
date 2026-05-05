@@ -13,6 +13,7 @@ struct OCRRegionTracker: Sendable {
 
     mutating func markChanged(fingerprint: UInt64) {
         lastFingerprint = fingerprint
+        lastRecognition = nil
         unchangedStreak = 0
     }
 

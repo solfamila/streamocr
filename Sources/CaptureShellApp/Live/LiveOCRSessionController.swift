@@ -60,6 +60,8 @@ private enum LiveOCRSessionCancellation: Error {
 }
 
 final class LiveOCRSessionController: @unchecked Sendable {
+    private static let maximumLiveOCRBacklogSeconds = 0.75
+
     var onStatusChanged: ((LiveOCRSessionStatusSnapshot) -> Void)?
 
     private let manager: TradingRuntimeManager
@@ -568,8 +570,11 @@ final class LiveOCRSessionController: @unchecked Sendable {
         var localFrameSize = frameSize
         var localLastSubscribedSymbol = lastSubscribedSymbol
         var firstPresentationTimeSeconds: Double?
+        var firstOCRWallTimestamp: CFAbsoluteTime?
         var lastPresentationTimeSeconds: Double?
         var lastStatusPublish = Date.distantPast
+        var skippedStaleOCRFrameCount = 0
+        var lastSkippedStaleOCRLogCount = 0
         let frameStateLock = NSLock()
 
         defer {
@@ -615,12 +620,26 @@ final class LiveOCRSessionController: @unchecked Sendable {
                 height: frame.height,
                 displayID: 0
             )
-            pipeline.process(frame, runtimeConfig: adjustedRuntimeConfig)
+            let shouldProcessOCR = self.shouldProcessLiveOCRFrame(
+                frame: frame,
+                firstPresentationTimeSeconds: &firstPresentationTimeSeconds,
+                firstOCRWallTimestamp: &firstOCRWallTimestamp
+            )
+            if shouldProcessOCR {
+                pipeline.process(frame, runtimeConfig: adjustedRuntimeConfig)
+            } else {
+                skippedStaleOCRFrameCount += 1
+                if loggingEnabled,
+                   skippedStaleOCRFrameCount == 1 ||
+                   skippedStaleOCRFrameCount - lastSkippedStaleOCRLogCount >= 300 {
+                    lastSkippedStaleOCRLogCount = skippedStaleOCRFrameCount
+                    print("[live-session] dropped_stale_ocr_frames count=\(skippedStaleOCRFrameCount)")
+                }
+            }
 
             localTotalFrameCount += 1
             localFrameSize = frame.sizeSummary
             if let presentationTimeSeconds = frame.presentationTimeSeconds {
-                firstPresentationTimeSeconds = firstPresentationTimeSeconds ?? presentationTimeSeconds
                 lastPresentationTimeSeconds = presentationTimeSeconds
                 if let firstPresentationTimeSeconds {
                     localTotalActiveDecodeSeconds = max(
@@ -673,6 +692,55 @@ final class LiveOCRSessionController: @unchecked Sendable {
         }
 
         _ = lastPresentationTimeSeconds
+    }
+
+    private func shouldProcessLiveOCRFrame(
+        frame: VideoFrame,
+        firstPresentationTimeSeconds: inout Double?,
+        firstOCRWallTimestamp: inout CFAbsoluteTime?
+    ) -> Bool {
+        guard let presentationTimeSeconds = frame.presentationTimeSeconds else {
+            return true
+        }
+
+        if let firstPresentation = firstPresentationTimeSeconds,
+           presentationTimeSeconds < firstPresentation {
+            resetLiveOCRClock(
+                presentationTimeSeconds: presentationTimeSeconds,
+                firstPresentationTimeSeconds: &firstPresentationTimeSeconds,
+                firstOCRWallTimestamp: &firstOCRWallTimestamp
+            )
+            return true
+        }
+
+        if firstPresentationTimeSeconds == nil || firstOCRWallTimestamp == nil {
+            resetLiveOCRClock(
+                presentationTimeSeconds: presentationTimeSeconds,
+                firstPresentationTimeSeconds: &firstPresentationTimeSeconds,
+                firstOCRWallTimestamp: &firstOCRWallTimestamp
+            )
+            return true
+        }
+
+        guard let firstPresentation = firstPresentationTimeSeconds,
+              let firstWallTimestamp = firstOCRWallTimestamp
+        else {
+            return true
+        }
+
+        let mediaElapsedSeconds = presentationTimeSeconds - firstPresentation
+        let wallElapsedSeconds = CFAbsoluteTimeGetCurrent() - firstWallTimestamp
+        let backlogSeconds = wallElapsedSeconds - mediaElapsedSeconds
+        return backlogSeconds <= Self.maximumLiveOCRBacklogSeconds
+    }
+
+    private func resetLiveOCRClock(
+        presentationTimeSeconds: Double,
+        firstPresentationTimeSeconds: inout Double?,
+        firstOCRWallTimestamp: inout CFAbsoluteTime?
+    ) {
+        firstPresentationTimeSeconds = presentationTimeSeconds
+        firstOCRWallTimestamp = CFAbsoluteTimeGetCurrent()
     }
 
     private func handlePipelineEvent(_ event: OCRPipelineEvent, sessionID: UUID) {

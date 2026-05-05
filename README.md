@@ -100,7 +100,11 @@ near-ties are rejected as `?`, so they do not size BUY orders, rearm BUY, or
 trigger SELL.
 When a confirmed symbol change commits, manual-cell BUY/SELL state is cleared
 and any pending BUY/SELL transport for the prior symbol is made stale, so
-position peaks cannot bleed from one ticker into the next.
+position peaks cannot bleed from one ticker into the next. Real trading
+BUY/SELL automation requires a committed OCR symbol and is suppressed while a
+symbol refresh or subscribe transition is still pending; after the new symbol
+commits, the numeric cell is re-armed and must pass the normal confirmation
+threshold before a new-symbol BUY can fire.
 SELL detection also requires a minimum numeric OCR confidence and ignores
 implausible dropped-digit decreases, such as a five-digit position briefly
 reading as a much smaller four-digit number.
