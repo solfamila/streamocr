@@ -217,7 +217,7 @@ struct OCRTradingCoordinatorTests {
     }
 
     @Test
-    func lowConfidenceAlternateSymbolAfterFingerprintChangeDoesNotBecomeCandidate() throws {
+    func repeatedLowConfidenceAlternateSymbolCanSubscribeAfterExtraConfirmations() throws {
         var coordinator = OCRTradingCoordinator(manualSymbolTriggerConfirmationFrames: 1)
         _ = coordinator.reduce(.sessionStarted(1))
 
@@ -243,10 +243,53 @@ struct OCRTradingCoordinatorTests {
         )))
 
         #expect(lowConfidenceAlternate.isEmpty)
-        #expect(coordinator.state.symbol == .uncertain(
+        #expect(coordinator.state.symbol == .candidate(
+            symbol: "PLPZ",
+            confirmations: 1,
+            required: 4,
             previous: previousWorld("PLRZ", generation: 1, fingerprint: 100),
-            reason: .lowConfidenceChangedSymbol
+            fingerprint: 200
         ))
+
+        for frameNumber in 4...5 {
+            let confirmation = coordinator.reduce(.frame(OCRTradingFrameObservation(
+                frameNumber: frameNumber,
+                symbol: symbol("PLPZ", fingerprint: 200, confidence: 0.77)
+            )))
+            #expect(confirmation.isEmpty)
+        }
+
+        let subscribe = try #require(coordinator.reduce(.frame(OCRTradingFrameObservation(
+            frameNumber: 6,
+            symbol: symbol("PLPZ", fingerprint: 200, confidence: 0.77)
+        ))).first)
+        #expect(subscribe.kind == .subscribe)
+        #expect(subscribe.symbol == "PLPZ")
+    }
+
+    @Test
+    func previousSymbolRecoveryDuringCandidateRestoresStableWorld() throws {
+        var coordinator = OCRTradingCoordinator(manualSymbolTriggerConfirmationFrames: 1)
+        _ = coordinator.reduce(.sessionStarted(1))
+
+        let initialSubscribe = try #require(coordinator.reduce(.frame(OCRTradingFrameObservation(
+            frameNumber: 1,
+            symbol: symbol("PLRZ", fingerprint: 100)
+        ))).first)
+        _ = coordinator.reduce(.commandCompleted(initialSubscribe.id, .submitted))
+
+        _ = coordinator.reduce(.frame(OCRTradingFrameObservation(
+            frameNumber: 2,
+            symbol: OCRTradingSymbolObservation(
+                fingerprint: 200,
+                recognitionState: .changedFingerprintPendingOCR
+            )
+        )))
+        _ = coordinator.reduce(.frame(OCRTradingFrameObservation(
+            frameNumber: 3,
+            symbol: symbol("PLPZ", fingerprint: 200, confidence: 0.77),
+            manualCell: manualCell("10000")
+        )))
 
         let previousSymbolRecovered = coordinator.reduce(.frame(OCRTradingFrameObservation(
             frameNumber: 4,

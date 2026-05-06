@@ -1063,7 +1063,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
                     let liveStatus = self.liveSessionController.currentStatusSnapshot()
                     if liveStatus.isRunning {
-                        return try self.liveSessionController.captureCurrentFrameSnapshot()
+                        do {
+                            return try self.liveSessionController.captureCurrentFrameSnapshot(timeoutSeconds: 1)
+                        } catch LiveOCRSessionControllerError.noActiveLiveFrame {
+                            // Fall back to a direct stream snapshot below.
+                        } catch LiveOCRSessionControllerError.timedOutWaitingForLiveFrame {
+                            // The live decoder can be between frames/backlogged; ROI setup should still work.
+                        }
                     }
 
                     return try LiveStreamFrameSnapshotter().captureSnapshot(seedURL: seedURL)

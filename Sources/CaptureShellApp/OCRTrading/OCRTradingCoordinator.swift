@@ -7,6 +7,8 @@ struct OCRTradingCoordinator: Sendable {
     private let manualCellSellMinimumConfidence: Double
     private let manualSymbolTriggerConfirmationFrames: Int
     private let manualSymbolChangedSymbolMinimumConfidence: Double
+    private let manualSymbolLowConfidenceChangedSymbolMinimumConfidence: Double
+    private let manualSymbolLowConfidenceTriggerConfirmationFrames: Int
     private let retryableCommandCooldownSeconds: Double
     private let timeProvider: @Sendable () -> Double
 
@@ -17,6 +19,8 @@ struct OCRTradingCoordinator: Sendable {
         manualCellSellMinimumConfidence: Double = 0.70,
         manualSymbolTriggerConfirmationFrames: Int = 1,
         manualSymbolChangedSymbolMinimumConfidence: Double = 0.80,
+        manualSymbolLowConfidenceChangedSymbolMinimumConfidence: Double = 0.50,
+        manualSymbolLowConfidenceTriggerConfirmationFrames: Int = 4,
         retryableCommandCooldownSeconds: Double = 1.0,
         timeProvider: @escaping @Sendable () -> Double = { Date().timeIntervalSinceReferenceDate }
     ) {
@@ -28,6 +32,14 @@ struct OCRTradingCoordinator: Sendable {
         self.manualSymbolChangedSymbolMinimumConfidence = min(
             max(0, manualSymbolChangedSymbolMinimumConfidence),
             1
+        )
+        self.manualSymbolLowConfidenceChangedSymbolMinimumConfidence = min(
+            max(0, manualSymbolLowConfidenceChangedSymbolMinimumConfidence),
+            self.manualSymbolChangedSymbolMinimumConfidence
+        )
+        self.manualSymbolLowConfidenceTriggerConfirmationFrames = max(
+            self.manualSymbolTriggerConfirmationFrames,
+            manualSymbolLowConfidenceTriggerConfirmationFrames
         )
         self.retryableCommandCooldownSeconds = max(0, retryableCommandCooldownSeconds)
         self.timeProvider = timeProvider
@@ -184,27 +196,14 @@ struct OCRTradingCoordinator: Sendable {
                 return
             }
 
-            guard recognition.confidence >= manualSymbolChangedSymbolMinimumConfidence else {
-                state.symbol = .uncertain(
-                    previous: OCRTradingPreviousSymbolWorld(
-                        symbol: symbol,
-                        generation: generation,
-                        fingerprint: fingerprint
-                    ),
-                    reason: .lowConfidenceChangedSymbol
-                )
-                state.symbolStableSinceFrame = nil
-                effects.appendCancels(cancelManualCommands(reason: "Symbol changed with low confidence."))
-                return
-            }
-
-            setSymbolCandidate(
+            setRecognizedChangedSymbolCandidate(
                 normalizedSymbol,
                 previous: OCRTradingPreviousSymbolWorld(
                     symbol: symbol,
                     generation: generation,
                     fingerprint: fingerprint
                 ),
+                confidence: recognition.confidence,
                 fingerprint: observation.fingerprint,
                 frame: frame,
                 effects: &effects
@@ -227,10 +226,18 @@ struct OCRTradingCoordinator: Sendable {
                         fingerprint: observation.fingerprint
                     )
                 }
+            } else if let previous, normalizedSymbol == previous.symbol {
+                effects.appendCancels(cancelManualCommands(reason: "Previous symbol was restored."))
+                restorePreviousSymbolWorld(
+                    previous,
+                    fingerprint: observation.fingerprint,
+                    frameNumber: frame.frameNumber
+                )
             } else {
-                setSymbolCandidate(
+                setRecognizedChangedSymbolCandidate(
                     normalizedSymbol,
                     previous: previous,
+                    confidence: recognition.confidence,
                     fingerprint: observation.fingerprint,
                     frame: frame,
                     effects: &effects
@@ -244,15 +251,10 @@ struct OCRTradingCoordinator: Sendable {
                     frameNumber: frame.frameNumber
                 )
             } else {
-                if previous != nil, recognition.confidence < manualSymbolChangedSymbolMinimumConfidence {
-                    state.symbol = .uncertain(previous: previous, reason: .lowConfidenceChangedSymbol)
-                    state.symbolStableSinceFrame = nil
-                    return
-                }
-
-                setSymbolCandidate(
+                setRecognizedChangedSymbolCandidate(
                     normalizedSymbol,
                     previous: previous,
+                    confidence: recognition.confidence,
                     fingerprint: observation.fingerprint,
                     frame: frame,
                     effects: &effects
@@ -288,19 +290,10 @@ struct OCRTradingCoordinator: Sendable {
                 return
             }
 
-            if cancellation.previousSymbolWorld != nil,
-               recognition.confidence < manualSymbolChangedSymbolMinimumConfidence {
-                state.symbol = .uncertain(
-                    previous: cancellation.previousSymbolWorld,
-                    reason: .lowConfidenceChangedSymbol
-                )
-                state.symbolStableSinceFrame = nil
-                return
-            }
-
-            setSymbolCandidate(
+            setRecognizedChangedSymbolCandidate(
                 normalizedSymbol,
                 previous: cancellation.previousSymbolWorld,
+                confidence: recognition.confidence,
                 fingerprint: observation.fingerprint,
                 frame: frame,
                 effects: &effects
@@ -308,18 +301,52 @@ struct OCRTradingCoordinator: Sendable {
         }
     }
 
+    private mutating func setRecognizedChangedSymbolCandidate(
+        _ symbol: String,
+        previous: OCRTradingPreviousSymbolWorld?,
+        confidence: Double,
+        fingerprint: UInt64?,
+        frame: OCRTradingFrameObservation,
+        effects: inout OCRTradingEffects
+    ) {
+        let requiredConfirmations: Int
+        if previous == nil || confidence >= manualSymbolChangedSymbolMinimumConfidence {
+            requiredConfirmations = manualSymbolTriggerConfirmationFrames
+        } else if confidence >= manualSymbolLowConfidenceChangedSymbolMinimumConfidence {
+            requiredConfirmations = manualSymbolLowConfidenceTriggerConfirmationFrames
+        } else {
+            state.symbol = .uncertain(previous: previous, reason: .lowConfidenceChangedSymbol)
+            state.symbolStableSinceFrame = nil
+            if previous != nil {
+                effects.appendCancels(cancelManualCommands(reason: "Symbol changed with low confidence."))
+            }
+            return
+        }
+
+        setSymbolCandidate(
+            symbol,
+            previous: previous,
+            fingerprint: fingerprint,
+            frame: frame,
+            effects: &effects,
+            requiredConfirmations: requiredConfirmations
+        )
+    }
+
     private mutating func setSymbolCandidate(
         _ symbol: String,
         previous: OCRTradingPreviousSymbolWorld?,
         fingerprint: UInt64?,
         frame: OCRTradingFrameObservation,
-        effects: inout OCRTradingEffects
+        effects: inout OCRTradingEffects,
+        requiredConfirmations: Int? = nil
     ) {
         if previous != nil {
             effects.appendCancels(cancelManualCommands(reason: "Symbol candidate changed."))
         }
 
-        if manualSymbolTriggerConfirmationFrames <= 1 {
+        let requiredConfirmations = max(1, requiredConfirmations ?? manualSymbolTriggerConfirmationFrames)
+        if requiredConfirmations <= 1 {
             effects.append(command: makeSubscribeCommand(
                 symbol: symbol,
                 previousSymbolWorld: previous,
@@ -331,7 +358,7 @@ struct OCRTradingCoordinator: Sendable {
         state.symbol = .candidate(
             symbol: symbol,
             confirmations: 1,
-            required: manualSymbolTriggerConfirmationFrames,
+            required: requiredConfirmations,
             previous: previous,
             fingerprint: fingerprint
         )

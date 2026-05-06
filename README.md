@@ -200,9 +200,10 @@ active trigger/coordinator path so multi-frame confirmation works without
 rerunning OCR. Symbol OCR also forces a fresh read at least every 10 seconds,
 even when the symbol-cell fingerprint looks unchanged, so a stale ticker cannot
 persist indefinitely because of cache replay.
-Confirmed high-confidence symbol changes can subscribe immediately; changed
-symbols below the confidence floor are suppressed instead of being treated as a
-new ticker.
+Confirmed high-confidence symbol changes use the normal confirmation cadence.
+Lower-confidence but still valid changed symbols are not ignored forever; they
+must repeat for extra confirmations before the coordinator trusts them as a new
+ticker. Extremely low-confidence or invalid changed symbols remain suppressed.
 
 In live JSON results, `playbackURL` is the actual URL used by the active live
 decoder. With the direct decoder path, that is usually the resolved
