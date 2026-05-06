@@ -205,8 +205,10 @@ final class OCRTradingCoordinatorRuntime: @unchecked Sendable {
         }
 
         switch result {
-        case .submitted, .intentionallyIgnored:
+        case .submitted:
             return "\(prefix)_transport_succeeded"
+        case .intentionallyIgnored:
+            return "\(prefix)_intentionally_ignored"
         case .retryableRejected, .failed, .cancelled, .staleIgnored:
             return "\(prefix)_transport_failed"
         }

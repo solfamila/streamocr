@@ -94,6 +94,9 @@ in the runtime, and OCR `BUY` uses the configured OCR buy ratio to size the
 order (`ocr shares * ratio`, rounded down, minimum 1 share). A live OCR `BUY`
 is only actually submitted when controller trading is armed. When disarmed, the
 signal is intentionally ignored instead of placing a delayed order later.
+Ignored OCR actions still consume the trigger state, but their terminal event is
+reported as `buy_intentionally_ignored` / `sell_intentionally_ignored` rather
+than as a transport success.
 After a submitted OCR `BUY`, the numeric position cell is tracked as an
 open-position high-water mark. Rising or flat OCR quantities are ignored; the
 first safe numeric decrease emits `sell_triggered` and routes a close-long

@@ -196,6 +196,42 @@ struct OCRTradingCoordinatorRuntimeTests {
     }
 
     @Test
+    func intentionallyIgnoredCommandEmitsTruthfulOutcomeEvent() {
+        let executor = RuntimeControllableExecutor()
+        let events = RuntimeEventCapture()
+        let runtime = OCRTradingCoordinatorRuntime(
+            coordinator: OCRTradingCoordinator(manualSymbolTriggerConfirmationFrames: 1),
+            executor: executor,
+            eventHandler: events.handle(_:),
+            emitsTransportOutcomes: true
+        )
+
+        runtime.beginSession(1)
+        runtime.handle(OCRTradingFrameObservation(
+            frameNumber: 1,
+            symbol: symbol("PLRZ", fingerprint: 10)
+        ))
+        waitUntil { executor.pendingCommands.count == 1 }
+        executor.completeNext(.submitted)
+        waitUntil { events.actions.contains("subscribe_transport_succeeded") }
+
+        runtime.handle(OCRTradingFrameObservation(
+            frameNumber: 2,
+            manualCell: manualCell("10000")
+        ))
+        waitUntil { executor.pendingCommands.count == 2 }
+        executor.completeNext(.intentionallyIgnored(reason: "Controller trading is not armed."))
+        waitUntil { events.actions.contains("buy_intentionally_ignored") }
+
+        #expect(events.actions == [
+            "subscribe_triggered",
+            "subscribe_transport_succeeded",
+            "buy_triggered",
+            "buy_intentionally_ignored"
+        ])
+    }
+
+    @Test
     func waitForPendingCommandsWaitsForRuntimeCompletion() {
         let executor = RuntimeControllableExecutor()
         let runtime = OCRTradingCoordinatorRuntime(
