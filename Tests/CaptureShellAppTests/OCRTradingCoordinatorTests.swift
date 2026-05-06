@@ -343,6 +343,66 @@ struct OCRTradingCoordinatorTests {
     }
 
     @Test
+    func retryableSellFailureSurvivesZeroLikeBuyRearm() throws {
+        let clock = TestClock(now: 100)
+        var coordinator = OCRTradingCoordinator(
+            manualCellRearmConfirmationFrames: 3,
+            manualSymbolTriggerConfirmationFrames: 1,
+            retryableCommandCooldownSeconds: 1.0,
+            timeProvider: { clock.now }
+        )
+        _ = coordinator.reduce(.sessionStarted(1))
+
+        let subscribe = try #require(coordinator.reduce(.frame(OCRTradingFrameObservation(
+            frameNumber: 1,
+            symbol: symbol("PLRZ", fingerprint: 42)
+        ))).first)
+        _ = coordinator.reduce(.commandCompleted(subscribe.id, .submitted))
+
+        let buy = try #require(coordinator.reduce(.frame(OCRTradingFrameObservation(
+            frameNumber: 2,
+            manualCell: manualCell("10000")
+        ))).first)
+        _ = coordinator.reduce(.commandCompleted(buy.id, .submitted))
+
+        let sell = try #require(coordinator.reduce(.frame(OCRTradingFrameObservation(
+            frameNumber: 3,
+            manualCell: manualCell("0")
+        ))).first)
+        #expect(sell.kind == .sell(previousOCRQuantity: 10000, currentOCRQuantity: 0))
+        _ = coordinator.reduce(.commandCompleted(sell.id, .retryableRejected(reason: "Close is not currently available.")))
+
+        #expect(coordinator.state.manual.openPositionPeakValue == 10000)
+
+        let coolingDownAfterZeroRearm = [
+            coordinator.reduce(.frame(OCRTradingFrameObservation(frameNumber: 4, manualCell: manualCell("0")))),
+            coordinator.reduce(.frame(OCRTradingFrameObservation(frameNumber: 5, manualCell: manualCell("0")))),
+            coordinator.reduce(.frame(OCRTradingFrameObservation(frameNumber: 6, manualCell: manualCell("0"))))
+        ]
+        #expect(coolingDownAfterZeroRearm[0].isEmpty)
+        #expect(coolingDownAfterZeroRearm[1].isEmpty)
+        #expect(coolingDownAfterZeroRearm[2].isEmpty)
+        #expect(coordinator.state.manual.isArmed)
+        #expect(coordinator.state.manual.openPositionPeakValue == 10000)
+
+        let unresolvedOpenPositionDoesNotBuyAgain = coordinator.reduce(.frame(OCRTradingFrameObservation(
+            frameNumber: 7,
+            manualCell: manualCell("12000")
+        )))
+        #expect(unresolvedOpenPositionDoesNotBuyAgain.isEmpty)
+        #expect(coordinator.state.manual.openPositionPeakValue == 12000)
+
+        clock.advance(by: 1.1)
+        let retriedSell = try #require(coordinator.reduce(.frame(OCRTradingFrameObservation(
+            frameNumber: 8,
+            manualCell: manualCell("0")
+        ))).first)
+
+        #expect(retriedSell.id != sell.id)
+        #expect(retriedSell.kind == .sell(previousOCRQuantity: 12000, currentOCRQuantity: 0))
+    }
+
+    @Test
     func sessionGenerationChangeCancelsPendingCommands() throws {
         var coordinator = OCRTradingCoordinator(manualSymbolTriggerConfirmationFrames: 1)
         _ = coordinator.reduce(.sessionStarted(1))

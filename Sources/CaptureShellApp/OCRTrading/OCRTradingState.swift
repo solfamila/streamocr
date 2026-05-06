@@ -119,6 +119,14 @@ struct OCRTradingManualPositionState: Equatable, Sendable {
         sellWasTriggered = false
         lastText = nil
     }
+
+    mutating func rearmBuyForCurrentSymbolGeneration() {
+        isArmed = true
+        zeroLikeStreak = 0
+        pendingIntegerValue = nil
+        pendingConfirmationCount = 0
+        lastText = nil
+    }
 }
 
 enum OCRTradingRetryKind: Equatable, Hashable, Sendable {

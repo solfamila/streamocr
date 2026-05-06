@@ -365,12 +365,13 @@ struct OCRTradingCoordinator: Sendable {
 
         let shouldTriggerBuy =
             state.manual.isArmed &&
+            state.manual.openPositionPeakValue == nil &&
             integerValue != nil &&
             !isZeroOrEmpty &&
             confirmationProgress >= manualCellTriggerConfirmationFrames
 
         if shouldRearm {
-            state.manual.resetForSymbolGeneration(symbolGeneration)
+            state.manual.rearmBuyForCurrentSymbolGeneration()
         }
 
         if state.manual.lastText != text {
