@@ -53,7 +53,8 @@ enum OCRTradingCommandResult: Equatable, Sendable {
 
 struct OCRTradingPendingCommand: Equatable, Sendable {
     let command: OCRTradingCommand
-    let previousSymbol: String?
+    let previousSymbolWorld: OCRTradingPreviousSymbolWorld?
+    let symbolFingerprint: UInt64?
 }
 
 struct OCRTradingEffects: Equatable, RandomAccessCollection, Sendable {

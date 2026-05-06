@@ -135,9 +135,16 @@ struct OCRTradingCoordinator: Sendable {
         effects: inout OCRTradingEffects
     ) {
         switch state.symbol {
-        case let .stable(symbol, _, stableFingerprint):
+        case let .stable(symbol, generation, stableFingerprint):
             if fingerprint == nil || stableFingerprint == nil || fingerprint != stableFingerprint {
-                state.symbol = .uncertain(previous: symbol, reason: reason)
+                state.symbol = .uncertain(
+                    previous: OCRTradingPreviousSymbolWorld(
+                        symbol: symbol,
+                        generation: generation,
+                        fingerprint: stableFingerprint
+                    ),
+                    reason: reason
+                )
                 state.symbolStableSinceFrame = nil
                 effects.appendCancels(cancelManualCommands(reason: "Symbol became uncertain."))
             }
@@ -146,7 +153,7 @@ struct OCRTradingCoordinator: Sendable {
                 commandID: commandID,
                 reason: "Symbol changed before subscribe completed."
             )
-            state.symbol = .uncertain(previous: cancellation.previousSymbol, reason: reason)
+            state.symbol = .uncertain(previous: cancellation.previousSymbolWorld, reason: reason)
             state.symbolStableSinceFrame = nil
             effects.appendCancels(cancellation.cancelledIDs)
         case .unknown, .candidate, .uncertain:
@@ -167,7 +174,7 @@ struct OCRTradingCoordinator: Sendable {
         }
 
         switch state.symbol {
-        case let .stable(symbol, generation, _):
+        case let .stable(symbol, generation, fingerprint):
             if normalizedSymbol == symbol {
                 state.symbol = .stable(
                     symbol: symbol,
@@ -178,7 +185,14 @@ struct OCRTradingCoordinator: Sendable {
             }
 
             guard recognition.confidence >= manualSymbolChangedSymbolMinimumConfidence else {
-                state.symbol = .uncertain(previous: symbol, reason: .lowConfidenceChangedSymbol)
+                state.symbol = .uncertain(
+                    previous: OCRTradingPreviousSymbolWorld(
+                        symbol: symbol,
+                        generation: generation,
+                        fingerprint: fingerprint
+                    ),
+                    reason: .lowConfidenceChangedSymbol
+                )
                 state.symbolStableSinceFrame = nil
                 effects.appendCancels(cancelManualCommands(reason: "Symbol changed with low confidence."))
                 return
@@ -186,7 +200,11 @@ struct OCRTradingCoordinator: Sendable {
 
             setSymbolCandidate(
                 normalizedSymbol,
-                previous: symbol,
+                previous: OCRTradingPreviousSymbolWorld(
+                    symbol: symbol,
+                    generation: generation,
+                    fingerprint: fingerprint
+                ),
                 fingerprint: observation.fingerprint,
                 frame: frame,
                 effects: &effects
@@ -197,6 +215,7 @@ struct OCRTradingCoordinator: Sendable {
                 if nextConfirmations >= required {
                     effects.append(command: makeSubscribeCommand(
                         symbol: normalizedSymbol,
+                        previousSymbolWorld: previous,
                         frame: frame
                     ))
                 } else {
@@ -218,14 +237,12 @@ struct OCRTradingCoordinator: Sendable {
                 )
             }
         case let .uncertain(previous, _):
-            if let previous, normalizedSymbol == previous {
-                let generation = max(1, state.nextSymbolGeneration - 1)
-                state.symbol = .stable(
-                    symbol: normalizedSymbol,
-                    generation: generation,
-                    fingerprint: observation.fingerprint
+            if let previous, normalizedSymbol == previous.symbol {
+                restorePreviousSymbolWorld(
+                    previous,
+                    fingerprint: observation.fingerprint,
+                    frameNumber: frame.frameNumber
                 )
-                state.symbolStableSinceFrame = frame.frameNumber
             } else {
                 if previous != nil, recognition.confidence < manualSymbolChangedSymbolMinimumConfidence {
                     state.symbol = .uncertain(previous: previous, reason: .lowConfidenceChangedSymbol)
@@ -260,10 +277,21 @@ struct OCRTradingCoordinator: Sendable {
             )
             effects.appendCancels(cancellation.cancelledIDs)
 
-            if cancellation.previousSymbol != nil,
+            if let previous = cancellation.previousSymbolWorld,
+               normalizedSymbol == previous.symbol {
+                effects.appendCancels(cancelManualCommands(reason: "Previous symbol was restored."))
+                restorePreviousSymbolWorld(
+                    previous,
+                    fingerprint: observation.fingerprint,
+                    frameNumber: frame.frameNumber
+                )
+                return
+            }
+
+            if cancellation.previousSymbolWorld != nil,
                recognition.confidence < manualSymbolChangedSymbolMinimumConfidence {
                 state.symbol = .uncertain(
-                    previous: cancellation.previousSymbol,
+                    previous: cancellation.previousSymbolWorld,
                     reason: .lowConfidenceChangedSymbol
                 )
                 state.symbolStableSinceFrame = nil
@@ -272,7 +300,7 @@ struct OCRTradingCoordinator: Sendable {
 
             setSymbolCandidate(
                 normalizedSymbol,
-                previous: cancellation.previousSymbol,
+                previous: cancellation.previousSymbolWorld,
                 fingerprint: observation.fingerprint,
                 frame: frame,
                 effects: &effects
@@ -282,7 +310,7 @@ struct OCRTradingCoordinator: Sendable {
 
     private mutating func setSymbolCandidate(
         _ symbol: String,
-        previous: String?,
+        previous: OCRTradingPreviousSymbolWorld?,
         fingerprint: UInt64?,
         frame: OCRTradingFrameObservation,
         effects: inout OCRTradingEffects
@@ -292,7 +320,11 @@ struct OCRTradingCoordinator: Sendable {
         }
 
         if manualSymbolTriggerConfirmationFrames <= 1 {
-            effects.append(command: makeSubscribeCommand(symbol: symbol, frame: frame))
+            effects.append(command: makeSubscribeCommand(
+                symbol: symbol,
+                previousSymbolWorld: previous,
+                frame: frame
+            ))
             return
         }
 
@@ -407,6 +439,7 @@ struct OCRTradingCoordinator: Sendable {
 
     private mutating func makeSubscribeCommand(
         symbol: String,
+        previousSymbolWorld: OCRTradingPreviousSymbolWorld?,
         frame: OCRTradingFrameObservation
     ) -> OCRTradingCommand {
         let generation = state.nextSymbolGeneration
@@ -415,7 +448,8 @@ struct OCRTradingCoordinator: Sendable {
             kind: .subscribe,
             symbol: symbol,
             symbolGeneration: generation,
-            previousSymbol: currentPreviousSymbol(),
+            previousSymbolWorld: previousSymbolWorld,
+            symbolFingerprint: frame.symbol?.fingerprint,
             frame: frame
         )
         state.symbol = .subscribing(
@@ -467,7 +501,8 @@ struct OCRTradingCoordinator: Sendable {
         kind: OCRTradingCommand.Kind,
         symbol: String,
         symbolGeneration: OCRTradingSymbolGeneration,
-        previousSymbol: String? = nil,
+        previousSymbolWorld: OCRTradingPreviousSymbolWorld? = nil,
+        symbolFingerprint: UInt64? = nil,
         frame: OCRTradingFrameObservation
     ) -> OCRTradingCommand {
         let command = OCRTradingCommand(
@@ -482,7 +517,8 @@ struct OCRTradingCoordinator: Sendable {
         state.nextCommandID += 1
         state.pendingCommands[command.id] = OCRTradingPendingCommand(
             command: command,
-            previousSymbol: previousSymbol
+            previousSymbolWorld: previousSymbolWorld,
+            symbolFingerprint: symbolFingerprint
         )
         return command
     }
@@ -513,7 +549,7 @@ struct OCRTradingCoordinator: Sendable {
         state.terminalResults[id] = result
         updateRetryableCooldown(for: command, result: result)
         if case .subscribe = command.kind, !result.commitsTradingState {
-            state.symbol = .uncertain(previous: pending.previousSymbol, reason: .ocrPending)
+            state.symbol = .uncertain(previous: pending.previousSymbolWorld, reason: .ocrPending)
             state.symbolStableSinceFrame = nil
         }
 
@@ -526,7 +562,7 @@ struct OCRTradingCoordinator: Sendable {
             state.symbol = .stable(
                 symbol: command.symbol,
                 generation: command.symbolGeneration,
-                fingerprint: nil
+                fingerprint: pending.symbolFingerprint
             )
             state.symbolStableSinceFrame = command.originatingFrame
             state.manual.resetForSymbolGeneration(command.symbolGeneration)
@@ -566,17 +602,17 @@ struct OCRTradingCoordinator: Sendable {
         }
     }
 
-    private func currentPreviousSymbol() -> String? {
-        switch state.symbol {
-        case let .stable(symbol, _, _):
-            return symbol
-        case let .uncertain(previous, _):
-            return previous
-        case let .candidate(_, _, _, previous, _):
-            return previous
-        case .unknown, .subscribing:
-            return nil
-        }
+    private mutating func restorePreviousSymbolWorld(
+        _ world: OCRTradingPreviousSymbolWorld,
+        fingerprint: UInt64?,
+        frameNumber: Int
+    ) {
+        state.symbol = .stable(
+            symbol: world.symbol,
+            generation: world.generation,
+            fingerprint: fingerprint ?? world.fingerprint
+        )
+        state.symbolStableSinceFrame = frameNumber
     }
 
     private func symbolWasStableBeforeFrame(_ frameNumber: Int) -> Bool {
@@ -627,13 +663,13 @@ struct OCRTradingCoordinator: Sendable {
     private mutating func cancelPendingSubscribe(
         commandID: OCRTradingCommandID,
         reason: String
-    ) -> (previousSymbol: String?, cancelledIDs: [OCRTradingCommandID]) {
+    ) -> (previousSymbolWorld: OCRTradingPreviousSymbolWorld?, cancelledIDs: [OCRTradingCommandID]) {
         guard let pending = state.pendingCommands.removeValue(forKey: commandID) else {
-            return (previousSymbol: nil, cancelledIDs: [])
+            return (previousSymbolWorld: nil, cancelledIDs: [])
         }
 
         state.terminalResults[commandID] = .cancelled(reason: reason)
-        return (previousSymbol: pending.previousSymbol, cancelledIDs: [commandID])
+        return (previousSymbolWorld: pending.previousSymbolWorld, cancelledIDs: [commandID])
     }
 
     private func hasPendingSubscribe(forDifferentSymbolThan symbol: String) -> Bool {

@@ -115,10 +115,16 @@ struct OCRTradingCoordinatorTests {
 
         #expect(uncertainty.commandIDsToCancel == [nexrSubscribe.id])
         #expect(coordinator.state.terminalResults[nexrSubscribe.id] == .cancelled(reason: "Symbol changed before subscribe completed."))
-        #expect(coordinator.state.symbol == .uncertain(previous: "SPY", reason: .fingerprintChanged))
+        #expect(coordinator.state.symbol == .uncertain(
+            previous: previousWorld("SPY", generation: 1, fingerprint: 10),
+            reason: .fingerprintChanged
+        ))
 
         _ = coordinator.reduce(.commandCompleted(nexrSubscribe.id, .submitted))
-        #expect(coordinator.state.symbol == .uncertain(previous: "SPY", reason: .fingerprintChanged))
+        #expect(coordinator.state.symbol == .uncertain(
+            previous: previousWorld("SPY", generation: 1, fingerprint: 10),
+            reason: .fingerprintChanged
+        ))
         #expect(coordinator.state.terminalResults[nexrSubscribe.id] == .cancelled(reason: "Symbol changed before subscribe completed."))
 
         let waiSubscribe = try #require(coordinator.reduce(.frame(OCRTradingFrameObservation(
@@ -127,6 +133,59 @@ struct OCRTradingCoordinatorTests {
         ))).first)
         #expect(waiSubscribe.kind == .subscribe)
         #expect(waiSubscribe.symbol == "WAI")
+    }
+
+    @Test
+    func returningPreviousSymbolCancelsPendingSubscribeAndRestoresPreviousGenerationAndPeak() throws {
+        var coordinator = OCRTradingCoordinator(manualSymbolTriggerConfirmationFrames: 1)
+        _ = coordinator.reduce(.sessionStarted(1))
+
+        let spySubscribe = try #require(coordinator.reduce(.frame(OCRTradingFrameObservation(
+            frameNumber: 1,
+            symbol: symbol("SPY", fingerprint: 10)
+        ))).first)
+        _ = coordinator.reduce(.commandCompleted(spySubscribe.id, .submitted))
+
+        let spyBuy = try #require(coordinator.reduce(.frame(OCRTradingFrameObservation(
+            frameNumber: 2,
+            manualCell: manualCell("10000")
+        ))).first)
+        _ = coordinator.reduce(.commandCompleted(spyBuy.id, .submitted))
+        _ = coordinator.reduce(.frame(OCRTradingFrameObservation(
+            frameNumber: 3,
+            manualCell: manualCell("30000")
+        )))
+        #expect(coordinator.state.manual.openPositionPeakValue == 30000)
+
+        let nexrSubscribe = try #require(coordinator.reduce(.frame(OCRTradingFrameObservation(
+            frameNumber: 4,
+            symbol: symbol("NEXR", fingerprint: 20)
+        ))).first)
+        #expect(nexrSubscribe.symbol == "NEXR")
+        #expect(nexrSubscribe.symbolGeneration == 2)
+
+        let restoredPrevious = coordinator.reduce(.frame(OCRTradingFrameObservation(
+            frameNumber: 5,
+            symbol: symbol("SPY", fingerprint: 10)
+        )))
+
+        #expect(restoredPrevious.isEmpty)
+        #expect(restoredPrevious.commandIDsToCancel == [nexrSubscribe.id])
+        #expect(coordinator.state.symbol == .stable(symbol: "SPY", generation: 1, fingerprint: 10))
+        #expect(coordinator.state.manual.symbolGeneration == 1)
+        #expect(coordinator.state.manual.openPositionPeakValue == 30000)
+
+        _ = coordinator.reduce(.commandCompleted(nexrSubscribe.id, .submitted))
+        #expect(coordinator.state.symbol == .stable(symbol: "SPY", generation: 1, fingerprint: 10))
+        #expect(coordinator.state.terminalResults[nexrSubscribe.id] == .cancelled(reason: "Symbol changed before subscribe completed."))
+
+        let sell = try #require(coordinator.reduce(.frame(OCRTradingFrameObservation(
+            frameNumber: 6,
+            manualCell: manualCell("25000")
+        ))).first)
+        #expect(sell.symbol == "SPY")
+        #expect(sell.symbolGeneration == 1)
+        #expect(sell.kind == .sell(previousOCRQuantity: 30000, currentOCRQuantity: 25000))
     }
 
     @Test
@@ -184,7 +243,10 @@ struct OCRTradingCoordinatorTests {
         )))
 
         #expect(lowConfidenceAlternate.isEmpty)
-        #expect(coordinator.state.symbol == .uncertain(previous: "PLRZ", reason: .lowConfidenceChangedSymbol))
+        #expect(coordinator.state.symbol == .uncertain(
+            previous: previousWorld("PLRZ", generation: 1, fingerprint: 100),
+            reason: .lowConfidenceChangedSymbol
+        ))
 
         let previousSymbolRecovered = coordinator.reduce(.frame(OCRTradingFrameObservation(
             frameNumber: 4,
@@ -519,6 +581,18 @@ struct OCRTradingCoordinatorTests {
             rawText: text,
             normalizedText: text,
             confidence: confidence
+        )
+    }
+
+    private func previousWorld(
+        _ symbol: String,
+        generation: OCRTradingSymbolGeneration,
+        fingerprint: UInt64?
+    ) -> OCRTradingPreviousSymbolWorld {
+        OCRTradingPreviousSymbolWorld(
+            symbol: symbol,
+            generation: generation,
+            fingerprint: fingerprint
         )
     }
 

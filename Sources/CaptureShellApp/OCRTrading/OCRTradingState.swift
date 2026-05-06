@@ -73,11 +73,23 @@ enum OCRTradingSymbolUncertaintyReason: Equatable, Sendable {
     case lowConfidenceChangedSymbol
 }
 
+struct OCRTradingPreviousSymbolWorld: Equatable, Sendable {
+    let symbol: String
+    let generation: OCRTradingSymbolGeneration
+    let fingerprint: UInt64?
+}
+
 enum OCRTradingSymbolState: Equatable, Sendable {
     case unknown
     case stable(symbol: String, generation: OCRTradingSymbolGeneration, fingerprint: UInt64?)
-    case uncertain(previous: String?, reason: OCRTradingSymbolUncertaintyReason)
-    case candidate(symbol: String, confirmations: Int, required: Int, previous: String?, fingerprint: UInt64?)
+    case uncertain(previous: OCRTradingPreviousSymbolWorld?, reason: OCRTradingSymbolUncertaintyReason)
+    case candidate(
+        symbol: String,
+        confirmations: Int,
+        required: Int,
+        previous: OCRTradingPreviousSymbolWorld?,
+        fingerprint: UInt64?
+    )
     case subscribing(symbol: String, generation: OCRTradingSymbolGeneration, commandID: OCRTradingCommandID)
 
     var stableSymbol: String? {
