@@ -103,6 +103,19 @@ struct OCRTradingCommandAuditEvent: Equatable, Sendable {
     let phase: Phase
     let command: OCRTradingCommand
     let result: OCRTradingCommandResult?
+    let coordinatorResult: OCRTradingCommandResult?
+
+    init(
+        phase: Phase,
+        command: OCRTradingCommand,
+        result: OCRTradingCommandResult?,
+        coordinatorResult: OCRTradingCommandResult? = nil
+    ) {
+        self.phase = phase
+        self.command = command
+        self.result = result
+        self.coordinatorResult = coordinatorResult
+    }
 }
 
 typealias OCRTradingCommandAuditEventHandler = @Sendable (OCRTradingCommandAuditEvent) -> Void

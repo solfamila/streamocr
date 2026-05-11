@@ -326,6 +326,9 @@ private struct CommandEventRecord: Encodable, Sendable {
     var originatingMediaTime: Double?
     var result: String?
     var reason: String?
+    var coordinatorResult: String?
+    var coordinatorReason: String?
+    var acceptedByCoordinator: Bool?
     var ocrQuantity: Int?
     var submittedQuantity: Int?
     var previousOCRQuantity: Int?
@@ -341,6 +344,13 @@ private struct CommandEventRecord: Encodable, Sendable {
         originatingMediaTime = event.command.originatingMediaTime
         result = event.result?.auditName
         reason = event.result?.resultDescription
+        coordinatorResult = event.coordinatorResult?.auditName
+        coordinatorReason = event.coordinatorResult?.resultDescription
+        if let result = event.result, let coordinatorResult = event.coordinatorResult {
+            acceptedByCoordinator = result == coordinatorResult
+        } else {
+            acceptedByCoordinator = nil
+        }
 
         switch event.command.kind {
         case .subscribe:

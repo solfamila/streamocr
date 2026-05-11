@@ -42,8 +42,8 @@ final class OCRTradingCoordinatorRuntime: @unchecked Sendable {
 
     func stop(reason: String) {
         let effects = reduce(.sessionStopping(reason: reason))
-        executor.cancelPendingCommands(reason: reason)
         apply(effects, observation: nil)
+        executor.cancelPendingCommands(reason: reason)
     }
 
     @discardableResult
@@ -71,10 +71,12 @@ final class OCRTradingCoordinatorRuntime: @unchecked Sendable {
     ) {
         for commandID in effects.commandIDsToCancel {
             if let command = commandSnapshot(commandID) {
+                let result = stateSnapshot.terminalResults[commandID]
                 commandAuditHandler?(OCRTradingCommandAuditEvent(
                     phase: .cancellationRequested,
                     command: command,
-                    result: stateSnapshot.terminalResults[commandID]
+                    result: result,
+                    coordinatorResult: result
                 ))
             }
             executor.cancelPendingCommand(id: commandID, reason: cancellationReason(for: commandID))
@@ -110,10 +112,12 @@ final class OCRTradingCoordinatorRuntime: @unchecked Sendable {
     ) {
         let triggerEvent: OCRPipelineEvent?
         let command: OCRTradingCommand?
+        let coordinatorResult: OCRTradingCommandResult?
         let shouldEmitTransportOutcome: Bool
         let effects: OCRTradingEffects
         lock.lock()
         effects = coordinator.reduce(.commandCompleted(commandID, result))
+        coordinatorResult = coordinator.state.terminalResults[commandID]
         triggerEvent = triggerEventsByCommandID.removeValue(forKey: commandID)
         command = commandsByCommandID.removeValue(forKey: commandID)
         shouldEmitTransportOutcome = emitsTransportOutcomes && triggerEvent != nil
@@ -126,7 +130,8 @@ final class OCRTradingCoordinatorRuntime: @unchecked Sendable {
             commandAuditHandler?(OCRTradingCommandAuditEvent(
                 phase: .completed,
                 command: command,
-                result: result
+                result: result,
+                coordinatorResult: coordinatorResult
             ))
         }
 

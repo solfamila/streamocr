@@ -59,7 +59,8 @@ struct OCRSessionAuditLoggerTests {
                     originatingFrame: 44,
                     originatingMediaTime: 12.566
                 ),
-                result: .intentionallyIgnored(reason: "Controller trading is not armed.")
+                result: .submitted,
+                coordinatorResult: .cancelled(reason: "Session stopped before completion.")
             ),
             source: "live"
         )
@@ -75,7 +76,10 @@ struct OCRSessionAuditLoggerTests {
         #expect(text.contains(#""commandID":7"#))
         #expect(text.contains(#""symbolGeneration":3"#))
         #expect(text.contains(#""sessionGeneration":2"#))
-        #expect(text.contains(#""result":"intentionally_ignored""#))
+        #expect(text.contains(#""result":"submitted""#))
+        #expect(text.contains(#""coordinatorResult":"cancelled""#))
+        #expect(text.contains(#""coordinatorReason":"Session stopped before completion.""#))
+        #expect(text.contains(#""acceptedByCoordinator":false"#))
     }
 
     @Test

@@ -308,15 +308,18 @@ struct OCRTradingCoordinatorRuntimeTests {
         #expect(audits.events.first?.command.sessionGeneration == 9)
         #expect(audits.events.first?.command.originatingFrame == 41)
         #expect(audits.events.last?.result == .submitted)
+        #expect(audits.events.last?.coordinatorResult == .submitted)
     }
 
     @Test
     func stopMarksPendingCommandsStaleBeforeExecutorCallbacksCanComplete() {
         let executor = RuntimeControllableExecutor()
         executor.resultOnCancel = .submitted
+        let audits = RuntimeCommandAuditCapture()
         let runtime = OCRTradingCoordinatorRuntime(
             coordinator: OCRTradingCoordinator(manualSymbolTriggerConfirmationFrames: 1),
-            executor: executor
+            executor: executor,
+            commandAuditHandler: audits.handle(_:)
         )
 
         runtime.beginSession(1)
@@ -331,6 +334,13 @@ struct OCRTradingCoordinatorRuntimeTests {
 
         #expect(runtime.stateSnapshot.symbol.stableSymbol == nil)
         #expect(runtime.stateSnapshot.terminalResults[1] == .cancelled(reason: "test stop"))
+
+        let phases = audits.events.map(\.phase)
+        #expect(phases == [.started, .cancellationRequested, .completed])
+        #expect(audits.events[1].result == .cancelled(reason: "test stop"))
+        #expect(audits.events[1].coordinatorResult == .cancelled(reason: "test stop"))
+        #expect(audits.events[2].result == .submitted)
+        #expect(audits.events[2].coordinatorResult == .cancelled(reason: "test stop"))
     }
 
     private func symbol(
@@ -454,12 +464,14 @@ struct OCRTradingCoordinatorRuntimeTests {
 
         func cancelPendingCommand(id: OCRTradingCommandID, reason: String) {
             let continuation: CheckedContinuation<OCRTradingCommandResult, Never>?
+            let result: OCRTradingCommandResult
             lock.lock()
             cancellationReasonsByCommandID[id] = reason
             cancelledCommandIDs.append(id)
             continuation = continuationsByCommandID.removeValue(forKey: id)
+            result = resultOnCancel ?? .cancelled(reason: reason)
             lock.unlock()
-            continuation?.resume(returning: .cancelled(reason: reason))
+            continuation?.resume(returning: result)
         }
 
         func cancelPendingCommands(reason _: String) {
