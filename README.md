@@ -88,6 +88,14 @@ button under the live URL controls. It records the current live URL with the sam
 native source recorder used by `--record-video`, independent of whether live OCR
 is running. GUI recordings are saved as timestamped MP4 files under
 `~/Movies/StreamOCR Recordings/`, with a sibling `*.metadata.json` file.
+Each GUI launch starts a fresh diagnostic session: old persisted runtime trade
+logs are deleted, old OCR audit JSONL files are removed, and a new
+`~/Library/Logs/StreamOCR/ocr-session-*.jsonl` file is created. That audit log
+captures live/display OCR recognitions, frame observations, trigger decisions,
+terminal command outcomes, and live status changes until the GUI shuts down. Use
+the GUI **Load Logs** button only when you intentionally want to replay persisted
+trade traces from a previous run; dashboard refresh no longer auto-replays old
+trace logs.
 
 In the trading GUI live-stream path, OCR `SUBSCRIBE` updates the active symbol
 in the runtime, and OCR `BUY` uses the configured OCR buy ratio to size the

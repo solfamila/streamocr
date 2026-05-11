@@ -9,6 +9,7 @@
 #include <sstream>
 #include <sys/file.h>
 #include <unistd.h>
+#include <utility>
 
 namespace {
 
@@ -107,11 +108,30 @@ bool tryAcquireControllerClaim(const std::string& claimKey,
 }
 
 void releaseControllerClaim(ControllerClaimLease& lease) {
-    if (lease.fd >= 0) {
-        ::flock(lease.fd, LOCK_UN);
-        ::close(lease.fd);
+    const int fd = lease.fd;
+    lease.fd = -1;
+    lease.key.clear();
+    lease.path.clear();
+
+    if (fd >= 0) {
+        ::flock(fd, LOCK_UN);
+        ::close(fd);
     }
-    lease = ControllerClaimLease{};
+}
+
+void transferControllerClaim(ControllerClaimLease& source, ControllerClaimLease& destination) {
+    if (&source == &destination) {
+        return;
+    }
+
+    releaseControllerClaim(destination);
+    destination.fd = source.fd;
+    destination.key = std::move(source.key);
+    destination.path = std::move(source.path);
+
+    source.fd = -1;
+    source.key.clear();
+    source.path.clear();
 }
 
 bool hasControllerClaim(const ControllerClaimLease& lease) {

@@ -63,6 +63,8 @@ final class LiveOCRSessionController: @unchecked Sendable {
     private static let maximumLiveOCRBacklogSeconds = 0.75
 
     var onStatusChanged: ((LiveOCRSessionStatusSnapshot) -> Void)?
+    var onPipelineEvent: OCRPipelineEventHandler?
+    var onFrameObservation: OCRTradingFrameObservationHandler?
 
     private let manager: TradingRuntimeManager
     private let temporaryDirectoryProvider: @Sendable (UUID) -> URL
@@ -302,7 +304,11 @@ final class LiveOCRSessionController: @unchecked Sendable {
         let pipeline = LowLatencyOCRFramePipeline(
             loggingEnabled: loggingEnabled,
             recognizer: FontTemplateTextRecognizer(),
-            frameObservationHandler: { observation in
+            eventHandler: { [weak self] event in
+                self?.onPipelineEvent?(event)
+            },
+            frameObservationHandler: { [weak self] observation in
+                self?.onFrameObservation?(observation)
                 tradingRuntime.handle(observation)
             }
         )
@@ -339,6 +345,9 @@ final class LiveOCRSessionController: @unchecked Sendable {
             } catch LiveOCRSessionCancellation.cancelled {
                 return
             } catch {
+                guard shouldContinue(sessionID: sessionID) else {
+                    return
+                }
                 if loggingEnabled {
                     print("[live-session] websocket_path_failed falling_back_to_source_chunks due_to=\"\(error.localizedDescription)\"")
                 }

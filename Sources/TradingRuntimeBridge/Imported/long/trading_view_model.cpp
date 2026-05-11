@@ -1,6 +1,5 @@
 #include "trading_view_model.h"
 
-#include "trace_exporter.h"
 #include "trading_ui_format.h"
 
 #include <algorithm>
@@ -36,10 +35,7 @@ TradingViewModel buildTradingViewModel(const TradingViewModelInput& input) {
                                          input.maxPositionDollars);
     model.orders = input.presentation.orders;
     model.traceItems = input.presentation.traceItems;
-    if (model.traceItems.empty()) {
-        model.traceItems = buildTradeTraceListItemsFromLog(150);
-        model.traceItemsFromReplayLog = !model.traceItems.empty();
-    }
+    model.traceItemsFromReplayLog = false;
 
     if (!model.traceItems.empty()) {
         const auto selectedIt = std::find_if(model.traceItems.begin(), model.traceItems.end(),
@@ -58,11 +54,7 @@ TradingViewModel buildTradingViewModel(const TradingViewModelInput& input) {
     } else {
         TradeTraceSnapshot snapshot = captureTradeTraceSnapshot(model.selectedTraceId);
         if (!snapshot.found) {
-            std::string replayError;
-            replayTradeTraceSnapshotFromLog(model.selectedTraceId, &snapshot, &replayError);
-            if (!snapshot.found && model.traceItemsFromReplayLog) {
-                model.traceDetailsText = replayError.empty() ? "Replay trace not available." : replayError;
-            }
+            model.traceDetailsText = "Trace details are not available in the current GUI session. Use Load Logs to explicitly replay persisted traces.";
         }
         if (model.traceDetailsText.empty()) {
             model.traceDetailsText = formatTradeTraceDetailsText(snapshot);

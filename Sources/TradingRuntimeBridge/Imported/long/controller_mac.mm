@@ -446,8 +446,7 @@ void postControllerMessage(const std::string& message) {
         }
 
         if (_lockedController == controller && hasControllerClaim(newClaim)) {
-            releaseControllerClaim(_lockedControllerClaim);
-            _lockedControllerClaim = std::move(newClaim);
+            transferControllerClaim(newClaim, _lockedControllerClaim);
         }
     }
     if (hasControllerClaim(newClaim)) {

@@ -54,10 +54,13 @@ final class NanocosmosWebSocketFrameSource {
         configuration.timeoutIntervalForResource = max(8, runSeconds + 6)
         let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
         let task = session.webSocketTask(with: webSocketURL)
+        var cancellationMonitor: DispatchSourceTimer?
 
         let decoder = FragmentedMP4VideoToolboxDecoder { frame in
             guard shouldContinue() else {
                 state.finish()
+                task.cancel(with: .goingAway, reason: nil)
+                session.invalidateAndCancel()
                 done.signal()
                 return
             }
@@ -78,9 +81,32 @@ final class NanocosmosWebSocketFrameSource {
         }
 
         task.resume()
+        cancellationMonitor = DispatchSource.makeTimerSource(
+            flags: [],
+            queue: DispatchQueue.global(qos: .userInitiated)
+        )
+        cancellationMonitor?.schedule(deadline: .now() + 0.05, repeating: 0.05)
+        cancellationMonitor?.setEventHandler {
+            guard !state.isFinished else {
+                cancellationMonitor?.cancel()
+                return
+            }
+            guard !shouldContinue() else {
+                return
+            }
+            state.finish()
+            task.cancel(with: .goingAway, reason: nil)
+            session.invalidateAndCancel()
+            delegate.cancelOpenWait()
+            done.signal()
+            cancellationMonitor?.cancel()
+        }
+        cancellationMonitor?.resume()
+
         guard delegate.waitForOpen(timeoutSeconds: min(8, max(2, runSeconds + 2))) else {
             task.cancel(with: .goingAway, reason: nil)
             session.invalidateAndCancel()
+            cancellationMonitor?.cancel()
             throw NanocosmosWebSocketFrameSourceError.openTimedOut(webSocketURL)
         }
 
@@ -145,6 +171,7 @@ final class NanocosmosWebSocketFrameSource {
 
         receiveNext()
         _ = done.wait(timeout: .now() + runSeconds + 12)
+        cancellationMonitor?.cancel()
         state.finish()
         task.cancel(with: .normalClosure, reason: nil)
         session.invalidateAndCancel()
@@ -233,6 +260,10 @@ private final class NanocosmosWebSocketFrameSourceDelegate: NSObject, URLSession
         lock.lock()
         defer { lock.unlock() }
         return didOpen
+    }
+
+    func cancelOpenWait() {
+        openSemaphore.signal()
     }
 
     func urlSession(

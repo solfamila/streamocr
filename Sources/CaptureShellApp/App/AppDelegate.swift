@@ -6,6 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let tradingRuntimeManager = TradingRuntimeManager()
     private let liveSessionController: LiveOCRSessionController
     private let recordingSessionController = LiveRecordingSessionController()
+    private let ocrAuditLogger = OCRSessionAuditLogger()
     private lazy var tradingWindowController = TradingWindowController(
         manager: tradingRuntimeManager,
         onOpenSetup: { [weak self] in
@@ -43,6 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         coordinator: .liveTradingDefaults(),
         executor: displayCaptureMessageSender,
         eventHandler: { [weak self] event in
+            self?.ocrAuditLogger.recordPipelineEvent(event, source: "display")
             Task { @MainActor [weak self] in
                 self?.handleDisplayOCRTradingEvent(event)
             }
@@ -55,7 +57,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             permissionManager: ScreenRecordingPermissionManager(),
             timingLogger: FrameTimingLogger(),
             pipeline: LowLatencyOCRFramePipeline(
-                frameObservationHandler: { observation in
+                eventHandler: { [weak self] event in
+                    self?.ocrAuditLogger.recordPipelineEvent(event, source: "display")
+                },
+                frameObservationHandler: { [weak self] observation in
+                    self?.ocrAuditLogger.recordFrameObservation(observation, source: "display")
                     runtime.handle(observation)
                 }
             ),
@@ -137,6 +143,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         bindTradingCallbacks()
         bindLiveSessionCallbacks()
         bindRecordingSessionCallbacks()
+        let freshSessionMessage = resetRuntimeLogsForFreshGUIStart()
 
         configPathLabel.stringValue = "Config file: \(runtimeConfigStore.configURL.path)"
         loadPersistedRuntimeConfigIfAvailable()
@@ -147,6 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         tradingWindowController.updateLiveStatus(liveSessionController.currentStatusSnapshot())
         tradingWindowController.updateRecordingStatus(recordingSessionController.currentStatusSnapshot())
         tradingWindowController.showWindowAndStart()
+        publishFreshSessionMessage(freshSessionMessage)
         applyStartupOverridesIfNeeded()
     }
 
@@ -170,6 +178,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             _ = liveSessionController.stopAndDrain(timeout: 3)
             _ = recordingSessionController.stopAndFinishSynchronously(timeout: 20)
             await tradingRuntimeManager.shutdownAsync()
+            ocrAuditLogger.recordLifecycle("termination_shutdown_completed")
 
             didCompleteTerminationShutdown = true
             isTerminationShutdownInProgress = false
@@ -507,10 +516,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else {
                 return
             }
+            ocrAuditLogger.recordLiveStatus(status, source: "live")
             tradingWindowController.updateLiveStatus(status)
             if window != nil {
                 updateSetupWindowSourceLabel()
             }
+        }
+        liveSessionController.onPipelineEvent = { [weak self] event in
+            self?.ocrAuditLogger.recordPipelineEvent(event, source: "live")
+        }
+        liveSessionController.onFrameObservation = { [weak self] observation in
+            self?.ocrAuditLogger.recordFrameObservation(observation, source: "live")
         }
         appliedRuntimeConfig = regionState.toPersistedConfig()
         liveSessionController.setRuntimeConfig(appliedRuntimeConfig)
@@ -688,6 +704,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             parts.append(String(format: "t %.3fs", presentationTimeSeconds))
         }
         return parts.joined(separator: " ")
+    }
+
+    private func resetRuntimeLogsForFreshGUIStart() -> String {
+        do {
+            let response = try tradingRuntimeManager.deletePersistentLogs()
+            if let error = response.error, !error.isEmpty {
+                let message = "Fresh GUI session started, but persisted trade logs could not be cleared: \(error). OCR audit log: \(ocrAuditLogger.logURL.path)"
+                ocrAuditLogger.recordMessage(message, source: "app")
+                return message
+            }
+
+            let traceText = response.deletedTradeTraceLog == true
+                ? "cleared old trade trace log"
+                : "no old trade trace log was present"
+            let message = "Fresh GUI session started; \(traceText). OCR audit log: \(ocrAuditLogger.logURL.path)"
+            ocrAuditLogger.recordMessage(message, source: "app")
+            return message
+        } catch {
+            let message = "Fresh GUI session started, but persisted trade logs could not be cleared: \(error.localizedDescription). OCR audit log: \(ocrAuditLogger.logURL.path)"
+            ocrAuditLogger.recordMessage(message, source: "app")
+            return message
+        }
+    }
+
+    private func publishFreshSessionMessage(_ message: String) {
+        print("[ocr-audit] \(message)")
+        Task { [weak tradingRuntimeManager] in
+            await tradingRuntimeManager?.appendMessageAsync(message)
+        }
     }
 
     private func loadPersistedRuntimeConfigIfAvailable() {
