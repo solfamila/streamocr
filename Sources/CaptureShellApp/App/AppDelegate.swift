@@ -49,6 +49,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.handleDisplayOCRTradingEvent(event)
             }
         },
+        commandAuditHandler: { [weak self] event in
+            self?.ocrAuditLogger.recordCommandAuditEvent(event, source: "display")
+        },
         emitsTransportOutcomes: true
     )
     private lazy var captureController: DisplayCaptureController = {
@@ -179,6 +182,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             _ = recordingSessionController.stopAndFinishSynchronously(timeout: 20)
             await tradingRuntimeManager.shutdownAsync()
             ocrAuditLogger.recordLifecycle("termination_shutdown_completed")
+            _ = ocrAuditLogger.flush(timeout: 2)
 
             didCompleteTerminationShutdown = true
             isTerminationShutdownInProgress = false
@@ -194,6 +198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         _ = liveSessionController.stopAndDrain(timeout: 2)
         _ = recordingSessionController.stopAndFinishSynchronously(timeout: 20)
+        _ = ocrAuditLogger.flush(timeout: 2)
     }
 
     @objc
@@ -527,6 +532,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         liveSessionController.onFrameObservation = { [weak self] observation in
             self?.ocrAuditLogger.recordFrameObservation(observation, source: "live")
+        }
+        liveSessionController.onCommandAuditEvent = { [weak self] event in
+            self?.ocrAuditLogger.recordCommandAuditEvent(event, source: "live")
         }
         appliedRuntimeConfig = regionState.toPersistedConfig()
         liveSessionController.setRuntimeConfig(appliedRuntimeConfig)

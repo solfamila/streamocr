@@ -65,6 +65,7 @@ final class LiveOCRSessionController: @unchecked Sendable {
     var onStatusChanged: ((LiveOCRSessionStatusSnapshot) -> Void)?
     var onPipelineEvent: OCRPipelineEventHandler?
     var onFrameObservation: OCRTradingFrameObservationHandler?
+    var onCommandAuditEvent: OCRTradingCommandAuditEventHandler?
 
     private let manager: TradingRuntimeManager
     private let temporaryDirectoryProvider: @Sendable (UUID) -> URL
@@ -281,7 +282,11 @@ final class LiveOCRSessionController: @unchecked Sendable {
             coordinator: .liveTradingDefaults(),
             executor: messageSender,
             eventHandler: { [weak self] event in
+                self?.onPipelineEvent?(event)
                 self?.handlePipelineEvent(event, sessionID: sessionID)
+            },
+            commandAuditHandler: { [weak self] event in
+                self?.onCommandAuditEvent?(event)
             },
             emitsTransportOutcomes: true
         )
@@ -698,7 +703,7 @@ final class LiveOCRSessionController: @unchecked Sendable {
             return
         }
 
-        guard event.action == "subscribe_triggered", let symbol = event.symbol else {
+        guard event.action == "subscribe_transport_succeeded", let symbol = event.symbol else {
             return
         }
 

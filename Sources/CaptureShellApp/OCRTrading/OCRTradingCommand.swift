@@ -92,3 +92,17 @@ enum OCRTradingEvent {
     case frame(OCRTradingFrameObservation)
     case commandCompleted(OCRTradingCommandID, OCRTradingCommandResult)
 }
+
+struct OCRTradingCommandAuditEvent: Equatable, Sendable {
+    enum Phase: String, Equatable, Sendable {
+        case started
+        case cancellationRequested = "cancellation_requested"
+        case completed
+    }
+
+    let phase: Phase
+    let command: OCRTradingCommand
+    let result: OCRTradingCommandResult?
+}
+
+typealias OCRTradingCommandAuditEventHandler = @Sendable (OCRTradingCommandAuditEvent) -> Void

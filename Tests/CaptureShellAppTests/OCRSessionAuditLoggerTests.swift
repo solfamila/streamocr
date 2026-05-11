@@ -15,6 +15,7 @@ struct OCRSessionAuditLoggerTests {
 
         let logger = OCRSessionAuditLogger(logDirectory: directory, deleteOldSessionLogs: true)
         #expect(!FileManager.default.fileExists(atPath: oldLog.path))
+        #expect(logger.logURL.lastPathComponent.contains("ocr-session-"))
 
         logger.recordPipelineEvent(
             OCRPipelineEvent(
@@ -46,12 +47,49 @@ struct OCRSessionAuditLoggerTests {
             ),
             source: "live"
         )
+        logger.recordCommandAuditEvent(
+            OCRTradingCommandAuditEvent(
+                phase: .completed,
+                command: OCRTradingCommand(
+                    id: 7,
+                    kind: .buy(ocrQuantity: 10000, submittedQuantity: 5000),
+                    symbol: "ODYS",
+                    symbolGeneration: 3,
+                    sessionGeneration: 2,
+                    originatingFrame: 44,
+                    originatingMediaTime: 12.566
+                ),
+                result: .intentionallyIgnored(reason: "Controller trading is not armed.")
+            ),
+            source: "live"
+        )
 
+        #expect(logger.flush(timeout: 1))
         let text = try String(contentsOf: logger.logURL, encoding: .utf8)
         #expect(text.contains(#""type":"pipeline_event""#))
         #expect(text.contains(#""symbol":"ODYS""#))
         #expect(text.contains(#""type":"frame_observation""#))
         #expect(text.contains(#""normalizedText":"LINK""#))
         #expect(text.contains(#""fingerprint":"0000000000001234""#))
+        #expect(text.contains(#""type":"command_event""#))
+        #expect(text.contains(#""commandID":7"#))
+        #expect(text.contains(#""symbolGeneration":3"#))
+        #expect(text.contains(#""sessionGeneration":2"#))
+        #expect(text.contains(#""result":"intentionally_ignored""#))
+    }
+
+    @Test
+    func loggerUsesUniqueSessionFilenamesInsideTheSameSecond() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ocr-audit-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let first = OCRSessionAuditLogger(logDirectory: directory, deleteOldSessionLogs: false)
+        let second = OCRSessionAuditLogger(logDirectory: directory, deleteOldSessionLogs: false)
+
+        #expect(first.logURL != second.logURL)
+        #expect(first.flush(timeout: 1))
+        #expect(second.flush(timeout: 1))
     }
 }

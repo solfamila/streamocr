@@ -4,20 +4,24 @@ final class OCRTradingCoordinatorRuntime: @unchecked Sendable {
     private let lock = NSLock()
     private let executor: any OCRTradingCommandExecuting
     private let eventHandler: OCRPipelineEventHandler?
+    private let commandAuditHandler: OCRTradingCommandAuditEventHandler?
     private let emitsTransportOutcomes: Bool
     private var coordinator: OCRTradingCoordinator
     private var triggerEventsByCommandID: [OCRTradingCommandID: OCRPipelineEvent] = [:]
+    private var commandsByCommandID: [OCRTradingCommandID: OCRTradingCommand] = [:]
     private var inFlightCommandCount = 0
 
     init(
         coordinator: OCRTradingCoordinator = OCRTradingCoordinator(),
         executor: any OCRTradingCommandExecuting,
         eventHandler: OCRPipelineEventHandler? = nil,
+        commandAuditHandler: OCRTradingCommandAuditEventHandler? = nil,
         emitsTransportOutcomes: Bool = false
     ) {
         self.coordinator = coordinator
         self.executor = executor
         self.eventHandler = eventHandler
+        self.commandAuditHandler = commandAuditHandler
         self.emitsTransportOutcomes = emitsTransportOutcomes
     }
 
@@ -66,6 +70,13 @@ final class OCRTradingCoordinatorRuntime: @unchecked Sendable {
         observation: OCRTradingFrameObservation?
     ) {
         for commandID in effects.commandIDsToCancel {
+            if let command = commandSnapshot(commandID) {
+                commandAuditHandler?(OCRTradingCommandAuditEvent(
+                    phase: .cancellationRequested,
+                    command: command,
+                    result: stateSnapshot.terminalResults[commandID]
+                ))
+            }
             executor.cancelPendingCommand(id: commandID, reason: cancellationReason(for: commandID))
         }
 
@@ -73,9 +84,15 @@ final class OCRTradingCoordinatorRuntime: @unchecked Sendable {
             let triggerEvent = makeTriggerEvent(command: command, observation: observation)
             lock.lock()
             triggerEventsByCommandID[command.id] = triggerEvent
+            commandsByCommandID[command.id] = command
             inFlightCommandCount += 1
             lock.unlock()
             eventHandler?(triggerEvent)
+            commandAuditHandler?(OCRTradingCommandAuditEvent(
+                phase: .started,
+                command: command,
+                result: nil
+            ))
 
             Task { [weak self] in
                 guard let self else {
@@ -92,16 +109,26 @@ final class OCRTradingCoordinatorRuntime: @unchecked Sendable {
         result: OCRTradingCommandResult
     ) {
         let triggerEvent: OCRPipelineEvent?
+        let command: OCRTradingCommand?
         let shouldEmitTransportOutcome: Bool
         let effects: OCRTradingEffects
         lock.lock()
         effects = coordinator.reduce(.commandCompleted(commandID, result))
         triggerEvent = triggerEventsByCommandID.removeValue(forKey: commandID)
+        command = commandsByCommandID.removeValue(forKey: commandID)
         shouldEmitTransportOutcome = emitsTransportOutcomes && triggerEvent != nil
         if !shouldEmitTransportOutcome {
             finishInFlightCommandLocked()
         }
         lock.unlock()
+
+        if let command {
+            commandAuditHandler?(OCRTradingCommandAuditEvent(
+                phase: .completed,
+                command: command,
+                result: result
+            ))
+        }
 
         if shouldEmitTransportOutcome, let triggerEvent {
             eventHandler?(transportOutcomeEvent(from: triggerEvent, result: result))
@@ -222,6 +249,12 @@ final class OCRTradingCoordinatorRuntime: @unchecked Sendable {
 
     private func finishInFlightCommandLocked() {
         inFlightCommandCount = max(0, inFlightCommandCount - 1)
+    }
+
+    private func commandSnapshot(_ commandID: OCRTradingCommandID) -> OCRTradingCommand? {
+        lock.lock()
+        defer { lock.unlock() }
+        return commandsByCommandID[commandID]
     }
 
     private func cancellationReason(for commandID: OCRTradingCommandID) -> String {

@@ -281,6 +281,36 @@ struct OCRTradingCoordinatorRuntimeTests {
     }
 
     @Test
+    func runtimeEmitsTypedCommandAuditEvents() {
+        let executor = RuntimeControllableExecutor()
+        let audits = RuntimeCommandAuditCapture()
+        let runtime = OCRTradingCoordinatorRuntime(
+            coordinator: OCRTradingCoordinator(manualSymbolTriggerConfirmationFrames: 1),
+            executor: executor,
+            commandAuditHandler: audits.handle(_:)
+        )
+
+        runtime.beginSession(9)
+        runtime.handle(OCRTradingFrameObservation(
+            frameNumber: 41,
+            mediaTime: 12.5,
+            symbol: symbol("ODYS", fingerprint: 10)
+        ))
+
+        waitUntil { executor.pendingCommands.count == 1 }
+        executor.completeNext(.submitted)
+        waitUntil { audits.events.count == 2 }
+
+        #expect(audits.events.map(\.phase) == [.started, .completed])
+        #expect(audits.events.map(\.command.id) == [1, 1])
+        #expect(audits.events.first?.command.symbol == "ODYS")
+        #expect(audits.events.first?.command.symbolGeneration == 1)
+        #expect(audits.events.first?.command.sessionGeneration == 9)
+        #expect(audits.events.first?.command.originatingFrame == 41)
+        #expect(audits.events.last?.result == .submitted)
+    }
+
+    @Test
     func stopMarksPendingCommandsStaleBeforeExecutorCallbacksCanComplete() {
         let executor = RuntimeControllableExecutor()
         executor.resultOnCancel = .submitted
@@ -375,6 +405,17 @@ struct OCRTradingCoordinatorRuntimeTests {
 
         func unblock() {
             unblockSemaphore.signal()
+        }
+    }
+
+    private final class RuntimeCommandAuditCapture: @unchecked Sendable {
+        private let lock = NSLock()
+        private(set) var events: [OCRTradingCommandAuditEvent] = []
+
+        func handle(_ event: OCRTradingCommandAuditEvent) {
+            lock.lock()
+            events.append(event)
+            lock.unlock()
         }
     }
 
